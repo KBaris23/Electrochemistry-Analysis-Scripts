@@ -35,7 +35,6 @@ st.set_page_config(
 st.markdown("""
 <style>
     .block-container { padding-top: 1.5rem; }
-    .stTabs [data-baseweb="tab"] { font-size: 0.9rem; }
     div[data-testid="stSidebarContent"] { font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -54,6 +53,8 @@ def cached_run_batch(
     min_peak_height_uA,
     min_start_voltage,
     scan_range,
+    compute_skew,
+    compute_wavelet_energy,
 ):
     return run_batch(
         folders=list(folders),
@@ -64,13 +65,15 @@ def cached_run_batch(
         min_peak_height_uA=min_peak_height_uA,
         min_start_voltage=min_start_voltage,
         scan_range=scan_range,
+        compute_skew=compute_skew,
+        compute_wavelet_energy=compute_wavelet_energy,
     )
 
 
 # ─────────────────────────────────────────────
 # Session state
 # ─────────────────────────────────────────────
-for k, v in dict(results=None, folders=[], run_count=0).items():
+for k, v in dict(results=None, last_results=None, folders=[], run_count=0).items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -164,6 +167,13 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("Performance")
+    compute_skew = st.checkbox("Compute skew metric", value=True)
+    compute_wavelet_energy = st.checkbox("Compute wavelet energy", value=True)
+    use_cache = st.checkbox("Use cached results", value=True, help="Disable to force a full re-run with progress.")
+
+    st.divider()
+
     # ── Channels ─────────────────────────────
     st.subheader("📡 Channels")
     channels_input = st.text_input(
@@ -233,10 +243,32 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 if run_clicked and folders and not folder_errors:
     st.session_state.folders = folders
-    with st.spinner("Running analysis… (first run may take a moment, subsequent runs are instant)"):
-        try:
-            results = cached_run_batch(
-                folders=tuple(folders),
+    try:
+        if use_cache:
+            with st.spinner("Running analysis… (first run may take a moment, cached runs are instant)"):
+                results = cached_run_batch(
+                    folders=tuple(folders),
+                    crop_range=(crop_min, crop_max),
+                    smooth_window=smooth_window,
+                    smooth_polyorder=smooth_polyorder,
+                    minima_search_window_V=minima_search_window,
+                    min_peak_height_uA=min_peak_height,
+                    min_start_voltage=min_start_voltage,
+                    scan_range=scan_range,
+                    compute_skew=compute_skew,
+                    compute_wavelet_energy=compute_wavelet_energy,
+                )
+        else:
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+
+            def _progress(done, total, name):
+                pct = int((done / max(total, 1)) * 100)
+                progress_bar.progress(pct)
+                progress_text.caption(f"Analyzing {done}/{total}: {name}")
+
+            results = run_batch(
+                folders=list(folders),
                 crop_range=(crop_min, crop_max),
                 smooth_window=smooth_window,
                 smooth_polyorder=smooth_polyorder,
@@ -244,12 +276,20 @@ if run_clicked and folders and not folder_errors:
                 min_peak_height_uA=min_peak_height,
                 min_start_voltage=min_start_voltage,
                 scan_range=scan_range,
+                compute_skew=compute_skew,
+                compute_wavelet_energy=compute_wavelet_energy,
+                progress_callback=_progress,
             )
-            st.session_state.results = results
-            st.session_state.run_count += 1
-        except Exception as e:
-            st.error(f"Analysis failed: {e}")
-            st.stop()
+            progress_bar.progress(100)
+            progress_text.caption("Analysis complete.")
+
+        st.session_state.results = results
+        if results:
+            st.session_state.last_results = results
+        st.session_state.run_count += 1
+    except Exception as e:
+        st.error(f"Analysis failed: {e}")
+        st.stop()
 
 
 # ─────────────────────────────────────────────
@@ -257,13 +297,25 @@ if run_clicked and folders and not folder_errors:
 # ─────────────────────────────────────────────
 results = st.session_state.get("results")
 if results is None:
-    st.info("👈 Configure parameters in the sidebar, then click **Run Analysis**.")
-    st.stop()
+    if st.session_state.get("last_results") is not None:
+        st.warning("Showing last successful results (current run returned nothing).")
+        results = st.session_state.last_results
+    else:
+        st.info("👈 Configure parameters in the sidebar, then click **Run Analysis**.")
+        st.stop()
+if len(results) == 0:
+    if st.session_state.get("last_results") is not None:
+        st.warning("No results returned. Showing last successful results.")
+        results = st.session_state.last_results
+    else:
+        st.warning("No results returned. Check folder paths and file naming pattern.")
+        st.stop()
 
 ok_results     = [r for r in results if r.get("status") == "OK"]
 failed_results = [r for r in results if r.get("status") == "FAILED"]
 all_channels   = sorted({r["channel"] for r in results})
 channels_display = channels_to_plot if channels_to_plot else all_channels
+ch_options = ["All channels"] + [f"Ch{ch}" for ch in channels_display]
 
 # ── Summary banner ────────────────────────────
 c1, c2, c3, c4 = st.columns(4)
@@ -277,15 +329,14 @@ st.divider()
 # ─────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────
-tab_overlays, tab_metrics, tab_drift, tab_failures, tab_table, tab_export = st.tabs([
-    "🌈 Overlays", "📊 Metrics", "📉 Drift", "⚠️ Failures", "🗂 Data Table", "💾 Export"
-])
+view = st.radio("View", ["Overlays", "Metrics", "Drift", "Failures", "Data Table", "Export"], horizontal=True)
+
 
 
 # ══════════════════════════════════════════════
 # TAB: Overlays
 # ══════════════════════════════════════════════
-with tab_overlays:
+if view == "Overlays":
     st.subheader("Overlaid traces per channel")
 
     ov_c1, ov_c2, ov_c3 = st.columns([2, 2, 1])
@@ -324,7 +375,7 @@ with tab_overlays:
 # ══════════════════════════════════════════════
 # TAB: Metrics
 # ══════════════════════════════════════════════
-with tab_metrics:
+if view == "Metrics":
     st.subheader("Metrics vs scan number")
 
     metric_cfg = {
@@ -333,6 +384,11 @@ with tab_metrics:
         "Skew":                     ("skew",             "Skew (corrected trace)"),
         "Wavelet energy":           ("wavelet_energy",   "Wavelet Energy (a.u.)"),
     }
+    if not compute_skew:
+        metric_cfg.pop("Skew", None)
+    if not compute_wavelet_energy:
+        metric_cfg.pop("Wavelet energy", None)
+
 
     m_c1, m_c2 = st.columns([3, 1])
     selected_metrics = m_c1.multiselect(
@@ -382,7 +438,7 @@ with tab_metrics:
 # ══════════════════════════════════════════════
 # TAB: Drift
 # ══════════════════════════════════════════════
-with tab_drift:
+if view == "Drift":
     st.subheader("Drift metrics (relative to each channel's first scan)")
     st.markdown(
         "Both metrics are computed **per channel** — the first valid scan for each channel "
@@ -397,6 +453,9 @@ with tab_drift:
         "Skew drift":             ("skew_drift",         "ΔSkew",
                                    "Change in corrected-trace asymmetry — sensitive to baseline shape changes."),
     }
+    if not compute_skew:
+        drift_options.pop("Skew drift", None)
+
     selected_drift = dr_c1.multiselect(
         "Drift metrics to display",
         options=list(drift_options.keys()),
@@ -445,7 +504,7 @@ with tab_drift:
 # ══════════════════════════════════════════════
 # TAB: Failures
 # ══════════════════════════════════════════════
-with tab_failures:
+if view == "Failures":
     st.subheader(f"Failed traces  ({len(failed_results)} total)")
 
     if not failed_results:
@@ -497,7 +556,7 @@ with tab_failures:
 # ══════════════════════════════════════════════
 # TAB: Data Table
 # ══════════════════════════════════════════════
-with tab_table:
+if view == "Data Table":
     st.subheader("Results table")
 
     scalar_keys = [
@@ -519,7 +578,7 @@ with tab_table:
 # ══════════════════════════════════════════════
 # TAB: Export
 # ══════════════════════════════════════════════
-with tab_export:
+if view == "Export":
     st.subheader("Export results")
 
     st.markdown("#### 📄 Results CSV")

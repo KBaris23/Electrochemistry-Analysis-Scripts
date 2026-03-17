@@ -28,10 +28,38 @@ def analyze_swv_file(
     smooth_polyorder: int = 2,
     minima_search_window_V: float = 0.12,
     min_peak_height_uA: Optional[float] = None,
+    compute_skew: bool = True,
+    compute_wavelet_energy: bool = True,
 ) -> dict:
     v_raw, i_raw = load_swv_csv(filepath, voltage_col=voltage_col, current_col=current_col)
     v_raw, i_raw = filter_finite(v_raw, i_raw)
 
+    return analyze_swv_arrays(
+        v_raw=v_raw,
+        i_raw=i_raw,
+        crop_range=crop_range,
+        smooth_window=smooth_window,
+        smooth_polyorder=smooth_polyorder,
+        minima_search_window_V=minima_search_window_V,
+        min_peak_height_uA=min_peak_height_uA,
+        compute_skew=compute_skew,
+        compute_wavelet_energy=compute_wavelet_energy,
+        file_path=filepath,
+    )
+
+
+def analyze_swv_arrays(
+    v_raw: np.ndarray,
+    i_raw: np.ndarray,
+    crop_range: Tuple[float, float] = (-0.6, -0.2),
+    smooth_window: int = 9,
+    smooth_polyorder: int = 2,
+    minima_search_window_V: float = 0.12,
+    min_peak_height_uA: Optional[float] = None,
+    compute_skew: bool = True,
+    compute_wavelet_energy: bool = True,
+    file_path: Optional[str] = None,
+) -> dict:
     mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
     v, i = v_raw[mask], i_raw[mask]
 
@@ -45,12 +73,17 @@ def analyze_swv_file(
     peak_height = float(y_corr[peak_idx])
 
     if min_peak_height_uA is not None and peak_height < float(min_peak_height_uA):
-        raise ValueError(f"Peak height {peak_height:.4g} µA below cutoff {min_peak_height_uA:.4g} µA")
+        raise ValueError(f"Peak height {peak_height:.4g} uA below cutoff {min_peak_height_uA:.4g} uA")
 
-    coeffs = pywt.wavedec(y_corr, "haar", level=3)
+    wavelet_energy = np.nan
+    if compute_wavelet_energy:
+        coeffs = pywt.wavedec(y_corr, "haar", level=3)
+        wavelet_energy = float(sum(np.sum(c**2) for c in coeffs))
+
+    skew_val = float(skew(y_corr)) if compute_skew else np.nan
 
     return {
-        "file_path": filepath,
+        "file_path": file_path,
         "voltage": v,
         "raw_current": i,
         "smoothed_current": i_smooth,
@@ -62,11 +95,10 @@ def analyze_swv_file(
         "peak_idx": peak_idx,
         "left_min_idx": int(corr["left_idx"]),
         "right_min_idx": int(corr["right_idx"]),
-        "skew": float(skew(y_corr)),
-        "wavelet_energy": float(sum(np.sum(c**2) for c in coeffs)),
+        "skew": skew_val,
+        "wavelet_energy": wavelet_energy,
         "status": "OK",
     }
-
 
 def partial_traces_for_failure(
     filepath: str,
@@ -83,6 +115,42 @@ def partial_traces_for_failure(
     try:
         v_raw, i_raw = load_swv_csv(filepath, voltage_col=voltage_col, current_col=current_col)
         v_raw, i_raw = filter_finite(v_raw, i_raw)
+        mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
+        v, i = v_raw[mask], i_raw[mask]
+        base.update(voltage=v, raw_current=i)
+
+        if len(v) < 5:
+            return {**base, "partial_error": "Too few points after cropping."}
+
+        i_smooth = apply_smoothing(i, smooth_window, smooth_polyorder) if smooth_window > 0 else i.copy()
+        base["smoothed_current"] = i_smooth
+
+        peak_idx = detect_dominant_peak(i_smooth)
+        corr = rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+        return {
+            **base,
+            "corrected_current": corr["y_corrected"],
+            "local_baseline": corr["local_baseline"],
+            "peak_idx": peak_idx,
+            "left_min_idx": int(corr["left_idx"]),
+            "right_min_idx": int(corr["right_idx"]),
+            "partial_error": None,
+        }
+    except Exception as e:
+        return {**base, "partial_error": str(e)}
+
+def partial_traces_for_failure_arrays(
+    v_raw: np.ndarray,
+    i_raw: np.ndarray,
+    crop_range: Tuple[float, float],
+    smooth_window: int,
+    smooth_polyorder: int,
+    minima_search_window_V: float,
+) -> dict:
+    base = dict(voltage=None, raw_current=None, smoothed_current=None,
+                corrected_current=None, local_baseline=None,
+                peak_idx=None, left_min_idx=None, right_min_idx=None)
+    try:
         mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
         v, i = v_raw[mask], i_raw[mask]
         base.update(voltage=v, raw_current=i)
@@ -148,6 +216,8 @@ def run_batch(
     min_peak_height_uA: Optional[float] = None,
     min_start_voltage: float = -0.6,
     scan_range: Optional[Tuple[int, int]] = None,
+    compute_skew: bool = True,
+    compute_wavelet_energy: bool = True,
     progress_callback=None,
 ) -> List[dict]:
     files = collect_swv_csvs_from_folders(folders)
@@ -206,24 +276,25 @@ def run_batch(
         )
 
         try:
-            r = analyze_swv_file(
-                f.path,
+            r = analyze_swv_arrays(
+                v_raw=v_check,
+                i_raw=i_check,
                 crop_range=crop_range,
-                voltage_col=voltage_col,
-                current_col=current_col,
                 smooth_window=smooth_window,
                 smooth_polyorder=smooth_polyorder,
                 minima_search_window_V=minima_search_window_V,
                 min_peak_height_uA=min_peak_height_uA,
+                compute_skew=compute_skew,
+                compute_wavelet_energy=compute_wavelet_energy,
+                file_path=f.path,
             )
             r.update(common)
             all_results.append(r)
 
         except Exception as e:
-            partial = partial_traces_for_failure(
-                f.path,
-                voltage_col=voltage_col,
-                current_col=current_col,
+            partial = partial_traces_for_failure_arrays(
+                v_raw=v_check,
+                i_raw=i_check,
                 crop_range=crop_range,
                 smooth_window=smooth_window,
                 smooth_polyorder=smooth_polyorder,

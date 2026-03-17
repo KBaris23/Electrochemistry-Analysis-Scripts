@@ -30,7 +30,6 @@ def collect_swv_csvs_from_folders(folders: List[str]) -> List[SWVFile]:
                 continue
             m = FILENAME_RE.match(fn)
             if not m:
-                print(f"NO MATCH: {fn}")  # <-- add this
                 continue
             ch = int(m.group("ch"))
             if int(m.group("ch2")) != ch:
