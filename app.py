@@ -5,6 +5,8 @@ Run with:  python -m streamlit run app.py
 
 import io
 import os
+import subprocess
+import sys
 import zipfile
 from typing import List, Optional, Tuple
 
@@ -21,6 +23,25 @@ from core import (
     plot_single_trace,
     run_batch,
 )
+
+
+def _pick_folder_windows() -> str:
+    """
+    Using Tk/Tcl dialogs inside the Streamlit process can trigger thread-related
+    crashes/errors (e.g., Tcl_AsyncDelete). Run the Tk dialog in a short-lived
+    subprocess instead.
+    """
+    code = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root=tk.Tk()\n"
+        "root.withdraw()\n"
+        "root.wm_attributes('-topmost', True)\n"
+        "p=filedialog.askdirectory(title='Select SWV data folder')\n"
+        "root.destroy()\n"
+        "print(p or '')\n"
+    )
+    return subprocess.check_output([sys.executable, "-c", code], text=True).strip()
 
 # ─────────────────────────────────────────────
 # Page config
@@ -88,30 +109,35 @@ with st.sidebar:
     # ── Folders ──────────────────────────────
     st.subheader("📁 Data Folders")
 
-    if st.button("📂  Browse for folder", use_container_width=True):
+    c1, c2 = st.columns(2)
+
+    if c1.button("📂  Browse (Windows)", use_container_width=True, disabled=not sys.platform.startswith("win")):
         try:
-            import threading
-            import tkinter as tk
-            from tkinter import filedialog
-
-            result = [None]
-
-            def _pick():
-                root = tk.Tk()
-                root.withdraw()
-                root.wm_attributes("-topmost", True)
-                result[0] = filedialog.askdirectory(title="Select SWV data folder")
-                root.destroy()
-
-            t = threading.Thread(target=_pick)
-            t.start()
-            t.join()
-
-            picked = result[0]
+            picked = _pick_folder_windows()
             if picked and picked not in st.session_state.folders:
                 st.session_state.folders.append(picked)
+        except subprocess.CalledProcessError as e:
+            st.error(f"Windows folder picker failed: {e}")
         except Exception as e:
-            st.error(f"Folder picker failed: {e}")
+            st.error(f"Windows folder picker failed: {e}")
+
+    if c2.button("📂  Browse (macOS)", use_container_width=True, disabled=sys.platform != "darwin"):
+        try:
+            # Use Finder's native picker via AppleScript (Tk dialogs can crash Streamlit on macOS).
+            script = 'POSIX path of (choose folder with prompt "Select SWV data folder")'
+            picked = subprocess.check_output(["osascript", "-e", script], text=True).strip()
+            if picked and picked not in st.session_state.folders:
+                st.session_state.folders.append(picked)
+        except FileNotFoundError:
+            st.error("macOS folder picker failed: `osascript` not found.")
+        except subprocess.CalledProcessError:
+            # User cancel returns a non-zero exit code.
+            st.info("Folder selection canceled.")
+        except Exception as e:
+            st.error(f"macOS folder picker failed: {e}")
+
+    if sys.platform == "darwin":
+        st.caption("macOS picker only works when Streamlit runs locally (not over SSH/remote server).")
 
     raw_folders = st.text_area(
         "Folders (one per line — or browse above)",
