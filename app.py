@@ -175,7 +175,7 @@ with st.sidebar:
 
     # ── Smoothing ─────────────────────────────
     st.subheader("🔧 Smoothing")
-    smooth_window    = st.slider("Savitzky-Golay window", min_value=3, max_value=31, value=9, step=2)
+    smooth_window    = st.slider("Savitzky-Golay window", min_value=3, max_value=31, value=15, step=2)
     smooth_polyorder = st.slider("Polynomial order", min_value=1, max_value=5, value=2)
 
     st.divider()
@@ -183,13 +183,13 @@ with st.sidebar:
     # ── Peak / baseline ───────────────────────
     st.subheader("📍 Peak / Baseline")
     minima_search_window = st.number_input(
-        "Minima search window (V)", value=0.12, step=0.01, format="%.3f",
+        "Minima search window (V)", value=0.30, step=0.01, format="%.3f",
         help="Voltage window either side of peak when searching for bracketing minima.",
     )
-    use_peak_cutoff = st.checkbox("Enforce min peak height", value=False)
+    use_peak_cutoff = st.checkbox("Enforce min peak height", value=True)
     min_peak_height = None
     if use_peak_cutoff:
-        min_peak_height = st.number_input("Min peak height (µA)", value=0.05, step=0.01, format="%.3f")
+        min_peak_height = st.number_input("Min peak height (µA)", value=0.001, step=0.001, format="%.3f")
 
     st.divider()
 
@@ -365,16 +365,25 @@ view = st.radio("View", ["Overlays", "Metrics", "Drift", "Failures", "Data Table
 if view == "Overlays":
     st.subheader("Overlaid traces per channel")
 
-    ov_c1, ov_c2, ov_c3 = st.columns([2, 2, 1])
-    trace_type   = ov_c1.radio("Trace type", ["Corrected", "Raw", "Smoothed"],
+    ov_c1, ov_c2, ov_c3, ov_c4, ov_c5 = st.columns([2, 2, 1, 1, 1])
+    trace_type   = ov_c1.radio("Trace type", ["Corrected", "Smoothed Corrected", "Raw", "Smoothed"],
                                 horizontal=True, key="overlay_type")
     cmap_name    = ov_c2.selectbox("Colour map",
                                    ["plasma", "viridis", "inferno", "magma", "cividis", "turbo"],
                                    key="overlay_cmap")
     show_anchors = ov_c3.checkbox("Show correction anchors", value=True,
                                   help="Dots mark the two bracketing-minima points used for baseline correction.")
+    show_peak_markers = ov_c4.checkbox("Show peak points", value=False,
+                                       help="Marks the detected peak on each displayed trace.")
+    show_baseline = ov_c5.checkbox("Show 0 baseline", value=True,
+                                   help="Draws a dashed horizontal zero-current reference line.")
 
-    key_map = {"Corrected": "corrected_current", "Raw": "raw_current", "Smoothed": "smoothed_current"}
+    key_map = {
+        "Corrected": "corrected_current",
+        "Smoothed Corrected": "smoothed_corrected_current",
+        "Raw": "raw_current",
+        "Smoothed": "smoothed_current",
+    }
     y_key = key_map[trace_type]
 
     for ch in channels_display:
@@ -390,6 +399,8 @@ if view == "Overlays":
                 ylabel="Current (µA)",
                 colormap_name=cmap_name,
                 show_anchors=show_anchors,
+                show_peak_markers=show_peak_markers,
+                show_zero_baseline=(show_baseline and y_key in ("corrected_current", "smoothed_corrected_current")),
             )
             if fig:
                 st.pyplot(fig)
@@ -554,9 +565,15 @@ if view == "Failures":
                     ("raw_current",       "Raw Current (µA)"),
                     ("smoothed_current",  "Smoothed Current (µA)"),
                     ("corrected_current", "Corrected Current (µA)"),
+                    ("smoothed_corrected_current", "Smoothed Corrected Current (µA)"),
                 ):
-                    fig = plot_failed_traces(to_plot, y_key=yk, ylabel=yl,
-                                             title=f"Ch{ch} — {yl}")
+                    fig = plot_failed_traces(
+                        to_plot, y_key=yk, ylabel=yl,
+                        title=f"Ch{ch} — {yl}",
+                        show_peak_markers=(yk != "raw_current"),
+                        show_zero_baseline=(yk in ("corrected_current", "smoothed_corrected_current")),
+                        show_local_baselines=(yk == "smoothed_current"),
+                    )
                     if fig:
                         st.pyplot(fig)
                         plt.close(fig)
@@ -570,7 +587,7 @@ if view == "Failures":
         chosen_label = st.selectbox("Pick a failed trace", list(fail_options_map.keys()))
         if chosen_label:
             chosen = fail_options_map[chosen_label]
-            st.caption(f"**Error:** {chosen.get('error','')}")
+            st.caption(f"Error: {chosen.get('error', '')}")
             if chosen.get("voltage") is not None:
                 fig = plot_single_trace(chosen)
                 st.pyplot(fig)
@@ -597,8 +614,43 @@ if view == "Data Table":
     ch_filter     = tf2.multiselect("Channel", sorted(df["channel"].dropna().unique().tolist()),
                                     default=sorted(df["channel"].dropna().unique().tolist()))
     mask = df["status"].isin(status_filter) & df["channel"].isin(ch_filter)
-    st.dataframe(df[mask].reset_index(drop=True), use_container_width=True, height=400)
+    filtered_df = df[mask].reset_index(drop=True)
+    filtered_results = [
+        r for r in results
+        if r.get("status") in status_filter and r.get("channel") in ch_filter
+    ]
+
+    st.dataframe(filtered_df, use_container_width=True, height=400)
     st.caption(f"{mask.sum()} rows shown")
+
+    st.divider()
+    st.markdown("#### Single-trace inspector")
+
+    if not filtered_results:
+        st.info("No measurements match the current filters.")
+    else:
+        measurement_options = {
+            f"Ch{r['channel']} · Scan {r['scan_number']} · {r.get('status', '')} · {r.get('file_name', '')}": r
+            for r in filtered_results
+        }
+        chosen_label = st.selectbox("Pick a measurement", list(measurement_options.keys()))
+        chosen = measurement_options[chosen_label]
+
+        meta_cols = st.columns(4)
+        meta_cols[0].caption(f"Channel: {chosen.get('channel', '')}")
+        meta_cols[1].caption(f"Scan: {chosen.get('scan_number', '')}")
+        meta_cols[2].caption(f"Status: {chosen.get('status', '')}")
+        meta_cols[3].caption(f"File: {chosen.get('file_name', '')}")
+
+        if chosen.get("error"):
+            st.caption(f"Error: {chosen.get('error')}")
+
+        if chosen.get("voltage") is not None:
+            fig = plot_single_trace(chosen)
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.warning("No trace data available for this measurement.")
 
 
 # ══════════════════════════════════════════════
@@ -662,7 +714,11 @@ if view == "Export":
                 ch_res = [r for r in ok_results if r["channel"] == ch]
                 if scan_range:
                     ch_res = [r for r in ch_res if scan_range[0] <= r["scan_number"] <= scan_range[1]]
-                for yk, lbl in (("corrected_current", "corrected"), ("raw_current", "raw")):
+                for yk, lbl in (
+                    ("corrected_current", "corrected"),
+                    ("smoothed_corrected_current", "smoothed_corrected"),
+                    ("raw_current", "raw"),
+                ):
                     fig = plot_overlaid_traces(ch_res, y_key=yk,
                                                title=f"Ch{ch} — {lbl}",
                                                show_anchors=(yk == "corrected_current"))

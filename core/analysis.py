@@ -26,7 +26,7 @@ def analyze_swv_file(
     current_col: Optional[str] = None,
     smooth_window: int = 9,
     smooth_polyorder: int = 2,
-    minima_search_window_V: float = 0.12,
+    minima_search_window_V: float = 0.30,
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -54,7 +54,7 @@ def analyze_swv_arrays(
     crop_range: Tuple[float, float] = (-0.6, -0.2),
     smooth_window: int = 9,
     smooth_polyorder: int = 2,
-    minima_search_window_V: float = 0.12,
+    minima_search_window_V: float = 0.30,
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -70,7 +70,9 @@ def analyze_swv_arrays(
     peak_idx = detect_dominant_peak(i_smooth)
     corr = rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
     y_corr = corr["y_corrected"]
-    peak_height = float(y_corr[peak_idx])
+    y_corr_smooth = apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+    peak_idx_corr = detect_dominant_peak(y_corr_smooth)    
+    peak_height = float(y_corr[peak_idx_corr])
 
     if min_peak_height_uA is not None and peak_height < float(min_peak_height_uA):
         raise ValueError(f"Peak height {peak_height:.4g} uA below cutoff {min_peak_height_uA:.4g} uA")
@@ -88,11 +90,13 @@ def analyze_swv_arrays(
         "raw_current": i,
         "smoothed_current": i_smooth,
         "corrected_current": y_corr,
+        "smoothed_corrected_current": y_corr_smooth,
         "local_baseline": corr["local_baseline"],
         "peak_voltage": float(v[peak_idx]),
         "peak_current": peak_height,
         "peak_current_raw": float(i[peak_idx]),
         "peak_idx": peak_idx,
+        "peak_idx_corr": peak_idx_corr,
         "left_min_idx": int(corr["left_idx"]),
         "right_min_idx": int(corr["right_idx"]),
         "skew": skew_val,
@@ -110,8 +114,9 @@ def partial_traces_for_failure(
     minima_search_window_V: float,
 ) -> dict:
     base = dict(voltage=None, raw_current=None, smoothed_current=None,
+                smoothed_corrected_current=None,
                 corrected_current=None, local_baseline=None,
-                peak_idx=None, left_min_idx=None, right_min_idx=None)
+                peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None)
     try:
         v_raw, i_raw = load_swv_csv(filepath, voltage_col=voltage_col, current_col=current_col)
         v_raw, i_raw = filter_finite(v_raw, i_raw)
@@ -127,11 +132,19 @@ def partial_traces_for_failure(
 
         peak_idx = detect_dominant_peak(i_smooth)
         corr = rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+        y_corr = corr["y_corrected"]
+        peak_idx_corr = detect_dominant_peak(
+            apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+        )
         return {
             **base,
-            "corrected_current": corr["y_corrected"],
+            "corrected_current": y_corr,
+            "smoothed_corrected_current": (
+                apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+            ),
             "local_baseline": corr["local_baseline"],
             "peak_idx": peak_idx,
+            "peak_idx_corr": peak_idx_corr,
             "left_min_idx": int(corr["left_idx"]),
             "right_min_idx": int(corr["right_idx"]),
             "partial_error": None,
@@ -148,8 +161,9 @@ def partial_traces_for_failure_arrays(
     minima_search_window_V: float,
 ) -> dict:
     base = dict(voltage=None, raw_current=None, smoothed_current=None,
+                smoothed_corrected_current=None,
                 corrected_current=None, local_baseline=None,
-                peak_idx=None, left_min_idx=None, right_min_idx=None)
+                peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None)
     try:
         mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
         v, i = v_raw[mask], i_raw[mask]
@@ -163,11 +177,19 @@ def partial_traces_for_failure_arrays(
 
         peak_idx = detect_dominant_peak(i_smooth)
         corr = rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+        y_corr = corr["y_corrected"]
+        peak_idx_corr = detect_dominant_peak(
+            apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+        )
         return {
             **base,
-            "corrected_current": corr["y_corrected"],
+            "corrected_current": y_corr,
+            "smoothed_corrected_current": (
+                apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+            ),
             "local_baseline": corr["local_baseline"],
             "peak_idx": peak_idx,
+            "peak_idx_corr": peak_idx_corr,
             "left_min_idx": int(corr["left_idx"]),
             "right_min_idx": int(corr["right_idx"]),
             "partial_error": None,
@@ -212,7 +234,7 @@ def run_batch(
     current_col: Optional[str] = None,
     smooth_window: int = 9,
     smooth_polyorder: int = 2,
-    minima_search_window_V: float = 0.12,
+    minima_search_window_V: float = 0.30,
     min_peak_height_uA: Optional[float] = None,
     min_start_voltage: float = -0.6,
     scan_range: Optional[Tuple[int, int]] = None,
@@ -311,8 +333,9 @@ def run_batch(
                 "error": str(e),
                 **{k: partial.get(k) for k in (
                     "voltage", "raw_current", "smoothed_current",
-                    "corrected_current", "local_baseline", "partial_error",
-                    "left_min_idx", "right_min_idx", "peak_idx",
+                    "corrected_current", "smoothed_corrected_current",
+                    "local_baseline", "partial_error",
+                    "left_min_idx", "right_min_idx", "peak_idx", "peak_idx_corr",
                 )},
             })
 

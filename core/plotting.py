@@ -17,17 +17,28 @@ def _cmap_fig(
     linewidth: float,
     alpha: float,
     show_anchors: bool = False,
+    show_peak_markers: bool = False,
+    show_zero_baseline: bool = False,
+    show_local_baselines: bool = False,
 ) -> plt.Figure:
     n = len(results)
     cmap = cm.get_cmap(colormap_name, max(n, 2))
     norm = Normalize(vmin=0, vmax=max(n - 1, 1))
 
     fig, ax = plt.subplots(figsize=(10, 5))
+    if show_zero_baseline:
+        ax.axhline(0, color="gray", lw=1.0, linestyle="--", alpha=0.8)
     for i, r in enumerate(results):
         if r.get(y_key) is None or r.get("voltage") is None:
             continue
         color = cmap(norm(i))
         ax.plot(r["voltage"], r[y_key], color=color, lw=linewidth, alpha=alpha)
+
+        if show_local_baselines and y_key == "smoothed_current" and r.get("local_baseline") is not None:
+            ax.plot(
+                r["voltage"], r["local_baseline"],
+                color=color, lw=1.0, linestyle="--", alpha=min(alpha + 0.1, 1.0),
+            )
 
         # Correction anchor dots — only meaningful on corrected traces
         if show_anchors and y_key == "corrected_current":
@@ -41,6 +52,17 @@ def _cmap_fig(
                         color=color, s=18, zorder=5,
                         edgecolors="white", linewidths=0.5,
                     )
+
+        if show_peak_markers:
+            v = r["voltage"]
+            y = r[y_key]
+            peak_idx = r.get("peak_idx")
+            if peak_idx is not None and 0 <= peak_idx < len(v):
+                ax.scatter(
+                    v[peak_idx], y[peak_idx],
+                    color=color, s=28, zorder=6,
+                    edgecolors="white", linewidths=0.8,
+                )
 
     sm = cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
@@ -78,12 +100,18 @@ def plot_overlaid_traces(
     linewidth: float = 0.9,
     alpha: float = 0.85,
     show_anchors: bool = False,
+    show_peak_markers: bool = False,
+    show_zero_baseline: bool = False,
+    show_local_baselines: bool = False,
 ) -> Optional[plt.Figure]:
     usable = [r for r in results if r.get(y_key) is not None and r.get("voltage") is not None]
     if not usable:
         return None
     return _cmap_fig(usable, y_key, title, ylabel, colormap_name, linewidth, alpha,
-                     show_anchors=show_anchors)
+                     show_anchors=show_anchors,
+                     show_peak_markers=show_peak_markers,
+                     show_zero_baseline=show_zero_baseline,
+                     show_local_baselines=show_local_baselines)
 
 
 def plot_failed_traces(
@@ -94,13 +122,19 @@ def plot_failed_traces(
     colormap_name: str = "Reds",
     linewidth: float = 0.9,
     alpha: float = 0.75,
+    show_peak_markers: bool = False,
+    show_zero_baseline: bool = False,
+    show_local_baselines: bool = False,
 ) -> Optional[plt.Figure]:
     usable = [r for r in failed_results if r.get(y_key) is not None and r.get("voltage") is not None]
     if not usable:
         return None
 
     fig = _cmap_fig(usable, y_key, f"{title}\n(n={len(usable)})", ylabel,
-                    colormap_name, linewidth, alpha)
+                    colormap_name, linewidth, alpha,
+                    show_peak_markers=show_peak_markers,
+                    show_zero_baseline=show_zero_baseline,
+                    show_local_baselines=show_local_baselines)
 
     counts: Dict[str, int] = {}
     for r in usable:
@@ -230,15 +264,15 @@ def plot_drift_vs_scan(
 
 
 def plot_single_trace(result: dict) -> plt.Figure:
-    """Detailed single-trace diagnostic: raw | smoothed + baseline | corrected."""
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
+    """Detailed single-trace diagnostic: raw | smoothed + baseline | corrected | smoothed corrected."""
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4), sharey=False)
     v = result["voltage"]
 
     for ax, key, label, color in zip(
         axes,
-        ["raw_current", "smoothed_current", "corrected_current"],
-        ["Raw", "Smoothed", "Corrected"],
-        ["steelblue", "darkorange", "seagreen"],
+        ["raw_current", "smoothed_current", "corrected_current", "smoothed_corrected_current"],
+        ["Raw", "Smoothed", "Corrected", "Smoothed Corrected"],
+        ["steelblue", "darkorange", "seagreen", "mediumpurple"],
     ):
         if result.get(key) is not None:
             ax.plot(v, result[key], color=color, lw=1.2)
@@ -259,8 +293,9 @@ def plot_single_trace(result: dict) -> plt.Figure:
                                    edgecolors="white", linewidths=0.8,
                                    label=marker_label)
 
-            if result.get("peak_idx") is not None:
-                pi = result["peak_idx"]
+            peak_idx_for_line = result.get("peak_idx_corr", result.get("peak_idx"))
+            if peak_idx_for_line is not None and 0 <= peak_idx_for_line < len(v):
+                pi = peak_idx_for_line
                 ax.axvline(v[pi], color="red", lw=0.8, linestyle=":")
 
             ax.set_title(label)
