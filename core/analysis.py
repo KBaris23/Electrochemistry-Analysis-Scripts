@@ -92,7 +92,8 @@ def analyze_swv_arrays(
         "corrected_current": y_corr,
         "smoothed_corrected_current": y_corr_smooth,
         "local_baseline": corr["local_baseline"],
-        "peak_voltage": float(v[peak_idx]),
+        # Use corrected-trace peak position for peak voltage (and drift downstream)
+        "peak_voltage": float(v[peak_idx_corr]),
         "peak_current": peak_height,
         "peak_current_raw": float(i[peak_idx]),
         "peak_idx": peak_idx,
