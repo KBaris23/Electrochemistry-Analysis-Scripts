@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pywt
@@ -93,6 +93,13 @@ def analyze_swv_arrays(
         wavelet_energy = float(sum(np.sum(c**2) for c in coeffs))
 
     skew_val = float(skew(y_corr)) if compute_skew else np.nan
+    peak_offset_norm = np.nan
+    if compute_skew:
+        v_left = float(v[left_idx])
+        v_right = float(v[right_idx])
+        denom = (v_right - v_left) / 2.0
+        if denom != 0:
+            peak_offset_norm = float((v[peak_idx_corr] - (v_left + v_right) / 2.0) / denom)
 
     return {
         "file_path": file_path,
@@ -114,67 +121,10 @@ def analyze_swv_arrays(
         "right_local_min_candidates": np.asarray(corr.get("right_local_min_candidates", []), dtype=int),
         "minima_mode": corr.get("minima_mode", "argmin_window"),
         "skew": skew_val,
+        "peak_offset_norm": peak_offset_norm,
         "wavelet_energy": wavelet_energy,
         "status": "OK",
     }
-
-def partial_traces_for_failure(
-    filepath: str,
-    voltage_col: str,
-    current_col: Optional[str],
-    crop_range: Tuple[float, float],
-    smooth_window: int,
-    smooth_polyorder: int,
-    minima_search_window_V: float,
-    use_prominent_minima: bool,
-) -> dict:
-    base = dict(voltage=None, raw_current=None, smoothed_current=None,
-                smoothed_corrected_current=None,
-                corrected_current=None, local_baseline=None,
-                peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None,
-                left_local_min_candidates=np.array([], dtype=int),
-                right_local_min_candidates=np.array([], dtype=int),
-                minima_mode=None)
-    try:
-        v_raw, i_raw = load_swv_csv(filepath, voltage_col=voltage_col, current_col=current_col)
-        v_raw, i_raw = filter_finite(v_raw, i_raw)
-        mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
-        v, i = v_raw[mask], i_raw[mask]
-        base.update(voltage=v, raw_current=i)
-
-        if len(v) < 5:
-            return {**base, "partial_error": "Too few points after cropping."}
-
-        i_smooth = apply_smoothing(i, smooth_window, smooth_polyorder) if smooth_window > 0 else i.copy()
-        base["smoothed_current"] = i_smooth
-
-        peak_idx = detect_dominant_peak(i_smooth)
-        corr = (
-            rotate_offset_using_prominent_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
-            if use_prominent_minima
-            else rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
-        )
-        y_corr = corr["y_corrected"]
-        y_corr_smooth = apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
-        left_idx, right_idx = int(corr["left_idx"]), int(corr["right_idx"])
-        segment = y_corr_smooth[left_idx:right_idx + 1]
-        peak_idx_corr = left_idx + detect_dominant_peak(segment, boundary_margin=0)
-        return {
-            **base,
-            "corrected_current": y_corr,
-            "smoothed_corrected_current": y_corr_smooth,
-            "local_baseline": corr["local_baseline"],
-            "peak_idx": peak_idx,
-            "peak_idx_corr": peak_idx_corr,
-            "left_min_idx": int(corr["left_idx"]),
-            "right_min_idx": int(corr["right_idx"]),
-            "left_local_min_candidates": np.asarray(corr.get("left_local_min_candidates", []), dtype=int),
-            "right_local_min_candidates": np.asarray(corr.get("right_local_min_candidates", []), dtype=int),
-            "minima_mode": corr.get("minima_mode", "argmin_window"),
-            "partial_error": None,
-        }
-    except Exception as e:
-        return {**base, "partial_error": str(e)}
 
 def partial_traces_for_failure_arrays(
     v_raw: np.ndarray,
@@ -238,8 +188,9 @@ def compute_drift_fields(all_results: List[dict]) -> List[dict]:
     Adds two drift fields to each result (in-place), computed per channel
     relative to each channel's first valid (OK) scan:
 
-      peak_voltage_drift  — peak_voltage  - reference peak_voltage  (V)
-      skew_drift          — skew          - reference skew
+      peak_voltage_drift           peak_voltage               - reference peak_voltage  (V)
+      skew_drift                   skew                       - reference skew
+      peak_offset_norm_drift        peak_offset_norm          - reference peak_offset_norm
     """
     ref: Dict[int, dict] = {}
 
@@ -251,6 +202,7 @@ def compute_drift_fields(all_results: List[dict]) -> List[dict]:
         if r.get("status") != "OK":
             r["peak_voltage_drift"] = np.nan
             r["skew_drift"] = np.nan
+            r["peak_offset_norm_drift"] = np.nan
             continue
 
         if ch not in ref:
@@ -258,6 +210,7 @@ def compute_drift_fields(all_results: List[dict]) -> List[dict]:
 
         r["peak_voltage_drift"] = r["peak_voltage"] - ref[ch]["peak_voltage"]
         r["skew_drift"]         = r["skew"]         - ref[ch]["skew"]
+        r["peak_offset_norm_drift"] = r["peak_offset_norm"] - ref[ch]["peak_offset_norm"]
 
     return all_results
 
@@ -366,6 +319,7 @@ def run_batch(
                 "peak_current_raw": np.nan,
                 "peak_voltage": np.nan,
                 "skew": np.nan,
+                "peak_offset_norm": np.nan,
                 "wavelet_energy": np.nan,
                 "status": "FAILED",
                 "error": str(e),

@@ -346,7 +346,7 @@ def plot_failed_traces(
 
         counts[key] = counts.get(key, 0) + 1
 
-    summary = "\n".join(f"{c}× {k}" for k, c in sorted(counts.items(), key=lambda kv: -kv[1])[:6])
+    summary = "\n".join(f"{c} {k}" for k, c in sorted(counts.items(), key=lambda kv: -kv[1])[:6])
 
     fig.axes[0].text(
 
