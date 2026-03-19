@@ -55,7 +55,8 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.5rem; }
+    /* Leave room below Streamlit's fixed top header so status/progress UI is not clipped. */
+    .block-container { padding-top: 3.5rem; }
     div[data-testid="stSidebarContent"] { font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -71,6 +72,7 @@ def cached_run_batch(
     smooth_window,
     smooth_polyorder,
     minima_search_window_V,
+    use_prominent_minima,
     min_peak_height_uA,
     min_start_voltage,
     scan_range,
@@ -83,6 +85,7 @@ def cached_run_batch(
         smooth_window=smooth_window,
         smooth_polyorder=smooth_polyorder,
         minima_search_window_V=minima_search_window_V,
+        use_prominent_minima=use_prominent_minima,
         min_peak_height_uA=min_peak_height_uA,
         min_start_voltage=min_start_voltage,
         scan_range=scan_range,
@@ -186,6 +189,11 @@ with st.sidebar:
         "Minima search window (V)", value=0.30, step=0.01, format="%.3f",
         help="Voltage window either side of peak when searching for bracketing minima.",
     )
+    use_prominent_minima = st.checkbox(
+        "Use prominent local minima for bracketing",
+        value=False,
+        help="Experimental comparison mode: uses peaks of the inverted smoothed signal and takes the most prominent local minimum on each side of the detected peak.",
+    )
     use_peak_cutoff = st.checkbox("Enforce min peak height", value=True)
     min_peak_height = None
     if use_peak_cutoff:
@@ -278,6 +286,7 @@ if run_clicked and folders and not folder_errors:
                     smooth_window=smooth_window,
                     smooth_polyorder=smooth_polyorder,
                     minima_search_window_V=minima_search_window,
+                    use_prominent_minima=use_prominent_minima,
                     min_peak_height_uA=min_peak_height,
                     min_start_voltage=min_start_voltage,
                     scan_range=scan_range,
@@ -299,6 +308,7 @@ if run_clicked and folders and not folder_errors:
                 smooth_window=smooth_window,
                 smooth_polyorder=smooth_polyorder,
                 minima_search_window_V=minima_search_window,
+                use_prominent_minima=use_prominent_minima,
                 min_peak_height_uA=min_peak_height,
                 min_start_voltage=min_start_voltage,
                 scan_range=scan_range,
@@ -573,6 +583,7 @@ if view == "Failures":
                         show_peak_markers=(yk != "raw_current"),
                         show_zero_baseline=(yk in ("corrected_current", "smoothed_corrected_current")),
                         show_local_baselines=(yk == "smoothed_current"),
+                        show_minima_candidates=(yk == "smoothed_current"),
                     )
                     if fig:
                         st.pyplot(fig)

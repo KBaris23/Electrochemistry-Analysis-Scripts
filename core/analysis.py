@@ -15,6 +15,7 @@ from .io import (
 from .processing import (
     apply_smoothing,
     detect_dominant_peak,
+    rotate_offset_using_prominent_bracketing_minima,
     rotate_offset_using_bracketing_minima,
 )
 
@@ -27,6 +28,7 @@ def analyze_swv_file(
     smooth_window: int = 9,
     smooth_polyorder: int = 2,
     minima_search_window_V: float = 0.30,
+    use_prominent_minima: bool = False,
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -41,6 +43,7 @@ def analyze_swv_file(
         smooth_window=smooth_window,
         smooth_polyorder=smooth_polyorder,
         minima_search_window_V=minima_search_window_V,
+        use_prominent_minima=use_prominent_minima,
         min_peak_height_uA=min_peak_height_uA,
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
@@ -55,6 +58,7 @@ def analyze_swv_arrays(
     smooth_window: int = 9,
     smooth_polyorder: int = 2,
     minima_search_window_V: float = 0.30,
+    use_prominent_minima: bool = False,
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -68,10 +72,16 @@ def analyze_swv_arrays(
 
     i_smooth = apply_smoothing(i, smooth_window, smooth_polyorder) if smooth_window > 0 else i.copy()
     peak_idx = detect_dominant_peak(i_smooth)
-    corr = rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+    corr = (
+        rotate_offset_using_prominent_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+        if use_prominent_minima
+        else rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+    )
     y_corr = corr["y_corrected"]
     y_corr_smooth = apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
-    peak_idx_corr = detect_dominant_peak(y_corr_smooth)    
+    left_idx, right_idx = int(corr["left_idx"]), int(corr["right_idx"])
+    segment = y_corr_smooth[left_idx:right_idx + 1]
+    peak_idx_corr = left_idx + detect_dominant_peak(segment, boundary_margin=0)
     peak_height = float(y_corr[peak_idx_corr])
 
     if min_peak_height_uA is not None and peak_height < float(min_peak_height_uA):
@@ -100,6 +110,9 @@ def analyze_swv_arrays(
         "peak_idx_corr": peak_idx_corr,
         "left_min_idx": int(corr["left_idx"]),
         "right_min_idx": int(corr["right_idx"]),
+        "left_local_min_candidates": np.asarray(corr.get("left_local_min_candidates", []), dtype=int),
+        "right_local_min_candidates": np.asarray(corr.get("right_local_min_candidates", []), dtype=int),
+        "minima_mode": corr.get("minima_mode", "argmin_window"),
         "skew": skew_val,
         "wavelet_energy": wavelet_energy,
         "status": "OK",
@@ -113,11 +126,15 @@ def partial_traces_for_failure(
     smooth_window: int,
     smooth_polyorder: int,
     minima_search_window_V: float,
+    use_prominent_minima: bool,
 ) -> dict:
     base = dict(voltage=None, raw_current=None, smoothed_current=None,
                 smoothed_corrected_current=None,
                 corrected_current=None, local_baseline=None,
-                peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None)
+                peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None,
+                left_local_min_candidates=np.array([], dtype=int),
+                right_local_min_candidates=np.array([], dtype=int),
+                minima_mode=None)
     try:
         v_raw, i_raw = load_swv_csv(filepath, voltage_col=voltage_col, current_col=current_col)
         v_raw, i_raw = filter_finite(v_raw, i_raw)
@@ -132,22 +149,28 @@ def partial_traces_for_failure(
         base["smoothed_current"] = i_smooth
 
         peak_idx = detect_dominant_peak(i_smooth)
-        corr = rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
-        y_corr = corr["y_corrected"]
-        peak_idx_corr = detect_dominant_peak(
-            apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+        corr = (
+            rotate_offset_using_prominent_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+            if use_prominent_minima
+            else rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
         )
+        y_corr = corr["y_corrected"]
+        y_corr_smooth = apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+        left_idx, right_idx = int(corr["left_idx"]), int(corr["right_idx"])
+        segment = y_corr_smooth[left_idx:right_idx + 1]
+        peak_idx_corr = left_idx + detect_dominant_peak(segment, boundary_margin=0)
         return {
             **base,
             "corrected_current": y_corr,
-            "smoothed_corrected_current": (
-                apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
-            ),
+            "smoothed_corrected_current": y_corr_smooth,
             "local_baseline": corr["local_baseline"],
             "peak_idx": peak_idx,
             "peak_idx_corr": peak_idx_corr,
             "left_min_idx": int(corr["left_idx"]),
             "right_min_idx": int(corr["right_idx"]),
+            "left_local_min_candidates": np.asarray(corr.get("left_local_min_candidates", []), dtype=int),
+            "right_local_min_candidates": np.asarray(corr.get("right_local_min_candidates", []), dtype=int),
+            "minima_mode": corr.get("minima_mode", "argmin_window"),
             "partial_error": None,
         }
     except Exception as e:
@@ -160,11 +183,15 @@ def partial_traces_for_failure_arrays(
     smooth_window: int,
     smooth_polyorder: int,
     minima_search_window_V: float,
+    use_prominent_minima: bool,
 ) -> dict:
     base = dict(voltage=None, raw_current=None, smoothed_current=None,
                 smoothed_corrected_current=None,
                 corrected_current=None, local_baseline=None,
-                peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None)
+                peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None,
+                left_local_min_candidates=np.array([], dtype=int),
+                right_local_min_candidates=np.array([], dtype=int),
+                minima_mode=None)
     try:
         mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
         v, i = v_raw[mask], i_raw[mask]
@@ -177,22 +204,29 @@ def partial_traces_for_failure_arrays(
         base["smoothed_current"] = i_smooth
 
         peak_idx = detect_dominant_peak(i_smooth)
-        corr = rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
-        y_corr = corr["y_corrected"]
-        peak_idx_corr = detect_dominant_peak(
-            apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+        corr = (
+            rotate_offset_using_prominent_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+            if use_prominent_minima
+            else rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
         )
+        y_corr = corr["y_corrected"]
+        y_corr_smooth = apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
+        left_idx, right_idx = int(corr["left_idx"]), int(corr["right_idx"])
+        segment = y_corr_smooth[left_idx:right_idx + 1]
+        peak_idx_corr = left_idx + detect_dominant_peak(segment, boundary_margin=0)
+
         return {
             **base,
             "corrected_current": y_corr,
-            "smoothed_corrected_current": (
-                apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
-            ),
+            "smoothed_corrected_current": y_corr_smooth,
             "local_baseline": corr["local_baseline"],
             "peak_idx": peak_idx,
             "peak_idx_corr": peak_idx_corr,
             "left_min_idx": int(corr["left_idx"]),
             "right_min_idx": int(corr["right_idx"]),
+            "left_local_min_candidates": np.asarray(corr.get("left_local_min_candidates", []), dtype=int),
+            "right_local_min_candidates": np.asarray(corr.get("right_local_min_candidates", []), dtype=int),
+            "minima_mode": corr.get("minima_mode", "argmin_window"),
             "partial_error": None,
         }
     except Exception as e:
@@ -236,6 +270,7 @@ def run_batch(
     smooth_window: int = 9,
     smooth_polyorder: int = 2,
     minima_search_window_V: float = 0.30,
+    use_prominent_minima: bool = False,
     min_peak_height_uA: Optional[float] = None,
     min_start_voltage: float = -0.6,
     scan_range: Optional[Tuple[int, int]] = None,
@@ -306,6 +341,7 @@ def run_batch(
                 smooth_window=smooth_window,
                 smooth_polyorder=smooth_polyorder,
                 minima_search_window_V=minima_search_window_V,
+                use_prominent_minima=use_prominent_minima,
                 min_peak_height_uA=min_peak_height_uA,
                 compute_skew=compute_skew,
                 compute_wavelet_energy=compute_wavelet_energy,
@@ -322,6 +358,7 @@ def run_batch(
                 smooth_window=smooth_window,
                 smooth_polyorder=smooth_polyorder,
                 minima_search_window_V=minima_search_window_V,
+                use_prominent_minima=use_prominent_minima,
             )
             all_results.append({
                 **common,
@@ -337,6 +374,8 @@ def run_batch(
                     "corrected_current", "smoothed_corrected_current",
                     "local_baseline", "partial_error",
                     "left_min_idx", "right_min_idx", "peak_idx", "peak_idx_corr",
+                    "left_local_min_candidates", "right_local_min_candidates",
+                    "minima_mode",
                 )},
             })
 
