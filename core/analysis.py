@@ -20,6 +20,48 @@ from .processing import (
 )
 
 
+def _run_correction_pass(
+    v: np.ndarray,
+    y_for_correction: np.ndarray,
+    smooth_window: int,
+    smooth_polyorder: int,
+    minima_search_window_V: float,
+    use_prominent_minima: bool,
+    peak_source: Optional[np.ndarray] = None,
+    peak_idx: Optional[int] = None,
+) -> dict:
+    y_corr_input = np.asarray(y_for_correction, dtype=float)
+    peak_signal = np.asarray(peak_source if peak_source is not None else y_corr_input, dtype=float)
+    selected_peak_idx = int(detect_dominant_peak(peak_signal) if peak_idx is None else peak_idx)
+
+    corr = (
+        rotate_offset_using_prominent_bracketing_minima(v, y_corr_input, selected_peak_idx, minima_search_window_V)
+        if use_prominent_minima
+        else rotate_offset_using_bracketing_minima(v, y_corr_input, selected_peak_idx, minima_search_window_V)
+    )
+    y_corr = np.asarray(corr["y_corrected"], dtype=float)
+    y_corr_smooth = (
+        apply_smoothing(y_corr, smooth_window, smooth_polyorder)
+        if smooth_window > 0 else y_corr.copy()
+    )
+    left_idx, right_idx = int(corr["left_idx"]), int(corr["right_idx"])
+    segment = y_corr_smooth[left_idx:right_idx + 1]
+    peak_idx_corr = left_idx + detect_dominant_peak(segment, boundary_margin=0)
+
+    return {
+        "peak_idx": selected_peak_idx,
+        "peak_idx_corr": int(peak_idx_corr),
+        "corrected_current": y_corr,
+        "smoothed_corrected_current": y_corr_smooth,
+        "local_baseline": np.asarray(corr["local_baseline"], dtype=float),
+        "left_idx": left_idx,
+        "right_idx": right_idx,
+        "left_local_min_candidates": np.asarray(corr.get("left_local_min_candidates", []), dtype=int),
+        "right_local_min_candidates": np.asarray(corr.get("right_local_min_candidates", []), dtype=int),
+        "minima_mode": corr.get("minima_mode", "argmin_window"),
+    }
+
+
 def analyze_swv_file(
     filepath: str,
     crop_range: Tuple[float, float] = (-0.6, -0.2),
@@ -29,6 +71,7 @@ def analyze_swv_file(
     smooth_polyorder: int = 2,
     minima_search_window_V: float = 0.30,
     use_prominent_minima: bool = False,
+    use_double_correction: bool = False,
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -44,6 +87,7 @@ def analyze_swv_file(
         smooth_polyorder=smooth_polyorder,
         minima_search_window_V=minima_search_window_V,
         use_prominent_minima=use_prominent_minima,
+        use_double_correction=use_double_correction,
         min_peak_height_uA=min_peak_height_uA,
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
@@ -59,6 +103,7 @@ def analyze_swv_arrays(
     smooth_polyorder: int = 2,
     minima_search_window_V: float = 0.30,
     use_prominent_minima: bool = False,
+    use_double_correction: bool = False,
     min_peak_height_uA: Optional[float] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -71,17 +116,36 @@ def analyze_swv_arrays(
         raise ValueError("Too few points after cropping.")
 
     i_smooth = apply_smoothing(i, smooth_window, smooth_polyorder) if smooth_window > 0 else i.copy()
-    peak_idx = detect_dominant_peak(i_smooth)
-    corr = (
-        rotate_offset_using_prominent_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
-        if use_prominent_minima
-        else rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+    first_pass = _run_correction_pass(
+        v=v,
+        y_for_correction=i_smooth,
+        smooth_window=smooth_window,
+        smooth_polyorder=smooth_polyorder,
+        minima_search_window_V=minima_search_window_V,
+        use_prominent_minima=use_prominent_minima,
     )
-    y_corr = corr["y_corrected"]
-    y_corr_smooth = apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
-    left_idx, right_idx = int(corr["left_idx"]), int(corr["right_idx"])
-    segment = y_corr_smooth[left_idx:right_idx + 1]
-    peak_idx_corr = left_idx + detect_dominant_peak(segment, boundary_margin=0)
+    final_pass = first_pass
+    second_pass = None
+    double_correction_error = None
+    if use_double_correction:
+        try:
+            second_pass = _run_correction_pass(
+                v=v,
+                y_for_correction=first_pass["corrected_current"],
+                peak_source=first_pass["smoothed_corrected_current"],
+                smooth_window=smooth_window,
+                smooth_polyorder=smooth_polyorder,
+                minima_search_window_V=minima_search_window_V,
+                use_prominent_minima=use_prominent_minima,
+            )
+            final_pass = second_pass
+        except Exception as exc:
+            double_correction_error = str(exc)
+
+    y_corr = final_pass["corrected_current"]
+    y_corr_smooth = final_pass["smoothed_corrected_current"]
+    left_idx, right_idx = int(final_pass["left_idx"]), int(final_pass["right_idx"])
+    peak_idx_corr = int(final_pass["peak_idx_corr"])
     peak_height = float(y_corr[peak_idx_corr])
 
     if min_peak_height_uA is not None and peak_height < float(min_peak_height_uA):
@@ -108,18 +172,52 @@ def analyze_swv_arrays(
         "smoothed_current": i_smooth,
         "corrected_current": y_corr,
         "smoothed_corrected_current": y_corr_smooth,
-        "local_baseline": corr["local_baseline"],
+        "local_baseline": first_pass["local_baseline"],
+        "first_pass_corrected_current": first_pass["corrected_current"] if use_double_correction else None,
+        "first_pass_smoothed_corrected_current": first_pass["smoothed_corrected_current"] if use_double_correction else None,
+        "first_pass_local_baseline": first_pass["local_baseline"] if use_double_correction else None,
         # Use corrected-trace peak position for peak voltage (and drift downstream)
         "peak_voltage": float(v[peak_idx_corr]),
         "peak_current": peak_height,
-        "peak_current_raw": float(i[peak_idx]),
-        "peak_idx": peak_idx,
+        "peak_current_raw": float(i[first_pass["peak_idx"]]),
+        "peak_idx": first_pass["peak_idx"],
         "peak_idx_corr": peak_idx_corr,
-        "left_min_idx": int(corr["left_idx"]),
-        "right_min_idx": int(corr["right_idx"]),
-        "left_local_min_candidates": np.asarray(corr.get("left_local_min_candidates", []), dtype=int),
-        "right_local_min_candidates": np.asarray(corr.get("right_local_min_candidates", []), dtype=int),
-        "minima_mode": corr.get("minima_mode", "argmin_window"),
+        "left_min_idx": left_idx,
+        "right_min_idx": right_idx,
+        "left_local_min_candidates": np.asarray(final_pass["left_local_min_candidates"], dtype=int),
+        "right_local_min_candidates": np.asarray(final_pass["right_local_min_candidates"], dtype=int),
+        "minima_mode": final_pass["minima_mode"],
+        "first_pass_peak_idx": first_pass["peak_idx"] if use_double_correction else None,
+        "first_pass_peak_idx_corr": first_pass["peak_idx_corr"] if use_double_correction else None,
+        "first_pass_left_min_idx": first_pass["left_idx"] if use_double_correction else None,
+        "first_pass_right_min_idx": first_pass["right_idx"] if use_double_correction else None,
+        "first_pass_left_local_min_candidates": (
+            np.asarray(first_pass["left_local_min_candidates"], dtype=int) if use_double_correction else np.array([], dtype=int)
+        ),
+        "first_pass_right_local_min_candidates": (
+            np.asarray(first_pass["right_local_min_candidates"], dtype=int) if use_double_correction else np.array([], dtype=int)
+        ),
+        "first_pass_minima_mode": first_pass["minima_mode"] if use_double_correction else None,
+        "second_pass_corrected_current": second_pass["corrected_current"] if second_pass is not None else None,
+        "second_pass_smoothed_corrected_current": (
+            second_pass["smoothed_corrected_current"] if second_pass is not None else None
+        ),
+        "second_pass_local_baseline": second_pass["local_baseline"] if second_pass is not None else None,
+        "second_pass_peak_idx": second_pass["peak_idx"] if second_pass is not None else None,
+        "second_pass_peak_idx_corr": second_pass["peak_idx_corr"] if second_pass is not None else None,
+        "second_pass_left_min_idx": second_pass["left_idx"] if second_pass is not None else None,
+        "second_pass_right_min_idx": second_pass["right_idx"] if second_pass is not None else None,
+        "second_pass_left_local_min_candidates": (
+            np.asarray(second_pass["left_local_min_candidates"], dtype=int) if second_pass is not None else np.array([], dtype=int)
+        ),
+        "second_pass_right_local_min_candidates": (
+            np.asarray(second_pass["right_local_min_candidates"], dtype=int) if second_pass is not None else np.array([], dtype=int)
+        ),
+        "second_pass_minima_mode": second_pass["minima_mode"] if second_pass is not None else None,
+        "double_correction_requested": bool(use_double_correction),
+        "double_correction_applied": bool(second_pass is not None),
+        "double_correction_error": double_correction_error,
+        "correction_passes": 2 if second_pass is not None else 1,
         "skew": skew_val,
         "peak_offset_norm": peak_offset_norm,
         "wavelet_energy": wavelet_energy,
@@ -134,6 +232,7 @@ def partial_traces_for_failure_arrays(
     smooth_polyorder: int,
     minima_search_window_V: float,
     use_prominent_minima: bool,
+    use_double_correction: bool,
 ) -> dict:
     base = dict(voltage=None, raw_current=None, smoothed_current=None,
                 smoothed_corrected_current=None,
@@ -141,7 +240,31 @@ def partial_traces_for_failure_arrays(
                 peak_idx=None, peak_idx_corr=None, left_min_idx=None, right_min_idx=None,
                 left_local_min_candidates=np.array([], dtype=int),
                 right_local_min_candidates=np.array([], dtype=int),
-                minima_mode=None)
+                minima_mode=None,
+                first_pass_corrected_current=None,
+                first_pass_smoothed_corrected_current=None,
+                first_pass_local_baseline=None,
+                first_pass_peak_idx=None,
+                first_pass_peak_idx_corr=None,
+                first_pass_left_min_idx=None,
+                first_pass_right_min_idx=None,
+                first_pass_left_local_min_candidates=np.array([], dtype=int),
+                first_pass_right_local_min_candidates=np.array([], dtype=int),
+                first_pass_minima_mode=None,
+                second_pass_corrected_current=None,
+                second_pass_smoothed_corrected_current=None,
+                second_pass_local_baseline=None,
+                second_pass_peak_idx=None,
+                second_pass_peak_idx_corr=None,
+                second_pass_left_min_idx=None,
+                second_pass_right_min_idx=None,
+                second_pass_left_local_min_candidates=np.array([], dtype=int),
+                second_pass_right_local_min_candidates=np.array([], dtype=int),
+                second_pass_minima_mode=None,
+                double_correction_requested=bool(use_double_correction),
+                double_correction_applied=False,
+                double_correction_error=None,
+                correction_passes=1)
     try:
         mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
         v, i = v_raw[mask], i_raw[mask]
@@ -153,30 +276,77 @@ def partial_traces_for_failure_arrays(
         i_smooth = apply_smoothing(i, smooth_window, smooth_polyorder) if smooth_window > 0 else i.copy()
         base["smoothed_current"] = i_smooth
 
-        peak_idx = detect_dominant_peak(i_smooth)
-        corr = (
-            rotate_offset_using_prominent_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
-            if use_prominent_minima
-            else rotate_offset_using_bracketing_minima(v, i_smooth, peak_idx, minima_search_window_V)
+        first_pass = _run_correction_pass(
+            v=v,
+            y_for_correction=i_smooth,
+            smooth_window=smooth_window,
+            smooth_polyorder=smooth_polyorder,
+            minima_search_window_V=minima_search_window_V,
+            use_prominent_minima=use_prominent_minima,
         )
-        y_corr = corr["y_corrected"]
-        y_corr_smooth = apply_smoothing(y_corr, smooth_window, smooth_polyorder) if smooth_window > 0 else y_corr.copy()
-        left_idx, right_idx = int(corr["left_idx"]), int(corr["right_idx"])
-        segment = y_corr_smooth[left_idx:right_idx + 1]
-        peak_idx_corr = left_idx + detect_dominant_peak(segment, boundary_margin=0)
+        final_pass = first_pass
+        second_pass = None
+        double_correction_error = None
+        if use_double_correction:
+            try:
+                second_pass = _run_correction_pass(
+                    v=v,
+                    y_for_correction=first_pass["corrected_current"],
+                    peak_source=first_pass["smoothed_corrected_current"],
+                    smooth_window=smooth_window,
+                    smooth_polyorder=smooth_polyorder,
+                    minima_search_window_V=minima_search_window_V,
+                    use_prominent_minima=use_prominent_minima,
+                )
+                final_pass = second_pass
+            except Exception as exc:
+                double_correction_error = str(exc)
 
         return {
             **base,
-            "corrected_current": y_corr,
-            "smoothed_corrected_current": y_corr_smooth,
-            "local_baseline": corr["local_baseline"],
-            "peak_idx": peak_idx,
-            "peak_idx_corr": peak_idx_corr,
-            "left_min_idx": int(corr["left_idx"]),
-            "right_min_idx": int(corr["right_idx"]),
-            "left_local_min_candidates": np.asarray(corr.get("left_local_min_candidates", []), dtype=int),
-            "right_local_min_candidates": np.asarray(corr.get("right_local_min_candidates", []), dtype=int),
-            "minima_mode": corr.get("minima_mode", "argmin_window"),
+            "corrected_current": final_pass["corrected_current"],
+            "smoothed_corrected_current": final_pass["smoothed_corrected_current"],
+            "local_baseline": first_pass["local_baseline"],
+            "peak_idx": first_pass["peak_idx"],
+            "peak_idx_corr": final_pass["peak_idx_corr"],
+            "left_min_idx": int(final_pass["left_idx"]),
+            "right_min_idx": int(final_pass["right_idx"]),
+            "left_local_min_candidates": np.asarray(final_pass["left_local_min_candidates"], dtype=int),
+            "right_local_min_candidates": np.asarray(final_pass["right_local_min_candidates"], dtype=int),
+            "minima_mode": final_pass["minima_mode"],
+            "first_pass_corrected_current": first_pass["corrected_current"] if use_double_correction else None,
+            "first_pass_smoothed_corrected_current": first_pass["smoothed_corrected_current"] if use_double_correction else None,
+            "first_pass_local_baseline": first_pass["local_baseline"] if use_double_correction else None,
+            "first_pass_peak_idx": first_pass["peak_idx"] if use_double_correction else None,
+            "first_pass_peak_idx_corr": first_pass["peak_idx_corr"] if use_double_correction else None,
+            "first_pass_left_min_idx": first_pass["left_idx"] if use_double_correction else None,
+            "first_pass_right_min_idx": first_pass["right_idx"] if use_double_correction else None,
+            "first_pass_left_local_min_candidates": (
+                np.asarray(first_pass["left_local_min_candidates"], dtype=int) if use_double_correction else np.array([], dtype=int)
+            ),
+            "first_pass_right_local_min_candidates": (
+                np.asarray(first_pass["right_local_min_candidates"], dtype=int) if use_double_correction else np.array([], dtype=int)
+            ),
+            "first_pass_minima_mode": first_pass["minima_mode"] if use_double_correction else None,
+            "second_pass_corrected_current": second_pass["corrected_current"] if second_pass is not None else None,
+            "second_pass_smoothed_corrected_current": (
+                second_pass["smoothed_corrected_current"] if second_pass is not None else None
+            ),
+            "second_pass_local_baseline": second_pass["local_baseline"] if second_pass is not None else None,
+            "second_pass_peak_idx": second_pass["peak_idx"] if second_pass is not None else None,
+            "second_pass_peak_idx_corr": second_pass["peak_idx_corr"] if second_pass is not None else None,
+            "second_pass_left_min_idx": second_pass["left_idx"] if second_pass is not None else None,
+            "second_pass_right_min_idx": second_pass["right_idx"] if second_pass is not None else None,
+            "second_pass_left_local_min_candidates": (
+                np.asarray(second_pass["left_local_min_candidates"], dtype=int) if second_pass is not None else np.array([], dtype=int)
+            ),
+            "second_pass_right_local_min_candidates": (
+                np.asarray(second_pass["right_local_min_candidates"], dtype=int) if second_pass is not None else np.array([], dtype=int)
+            ),
+            "second_pass_minima_mode": second_pass["minima_mode"] if second_pass is not None else None,
+            "double_correction_applied": bool(second_pass is not None),
+            "double_correction_error": double_correction_error,
+            "correction_passes": 2 if second_pass is not None else 1,
             "partial_error": None,
         }
     except Exception as e:
@@ -224,6 +394,7 @@ def run_batch(
     smooth_polyorder: int = 2,
     minima_search_window_V: float = 0.30,
     use_prominent_minima: bool = False,
+    use_double_correction: bool = False,
     min_peak_height_uA: Optional[float] = None,
     min_start_voltage: float = -0.6,
     scan_range: Optional[Tuple[int, int]] = None,
@@ -295,6 +466,7 @@ def run_batch(
                 smooth_polyorder=smooth_polyorder,
                 minima_search_window_V=minima_search_window_V,
                 use_prominent_minima=use_prominent_minima,
+                use_double_correction=use_double_correction,
                 min_peak_height_uA=min_peak_height_uA,
                 compute_skew=compute_skew,
                 compute_wavelet_energy=compute_wavelet_energy,
@@ -312,6 +484,7 @@ def run_batch(
                 smooth_polyorder=smooth_polyorder,
                 minima_search_window_V=minima_search_window_V,
                 use_prominent_minima=use_prominent_minima,
+                use_double_correction=use_double_correction,
             )
             all_results.append({
                 **common,
@@ -329,7 +502,19 @@ def run_batch(
                     "local_baseline", "partial_error",
                     "left_min_idx", "right_min_idx", "peak_idx", "peak_idx_corr",
                     "left_local_min_candidates", "right_local_min_candidates",
-                    "minima_mode",
+                    "minima_mode", "first_pass_corrected_current",
+                    "first_pass_smoothed_corrected_current", "first_pass_local_baseline",
+                    "first_pass_peak_idx", "first_pass_peak_idx_corr",
+                    "first_pass_left_min_idx", "first_pass_right_min_idx",
+                    "first_pass_left_local_min_candidates", "first_pass_right_local_min_candidates",
+                    "first_pass_minima_mode", "second_pass_corrected_current",
+                    "second_pass_smoothed_corrected_current", "second_pass_local_baseline",
+                    "second_pass_peak_idx", "second_pass_peak_idx_corr",
+                    "second_pass_left_min_idx", "second_pass_right_min_idx",
+                    "second_pass_left_local_min_candidates", "second_pass_right_local_min_candidates",
+                    "second_pass_minima_mode", "double_correction_requested",
+                    "double_correction_applied", "double_correction_error",
+                    "correction_passes",
                 )},
             })
 

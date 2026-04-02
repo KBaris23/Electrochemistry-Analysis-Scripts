@@ -597,238 +597,175 @@ def plot_single_trace(result: dict) -> plt.Figure:
     """Single-trace inspector with mode-dependent panel count."""
 
     v = result["voltage"]
-
-    minima_mode = result.get("minima_mode")
-
+    double_correction_applied = bool(result.get("double_correction_applied")) and (
+        result.get("second_pass_corrected_current") is not None
+    )
+    minima_mode = result.get("first_pass_minima_mode") if double_correction_applied else result.get("minima_mode")
     use_prominent_minima = isinstance(minima_mode, str) and minima_mode.startswith("prominent")
 
-
+    first_pass_corrected_key = "first_pass_corrected_current" if double_correction_applied else "corrected_current"
+    keys = ["raw_current", "smoothed_current"]
+    labels = ["Raw", "Smoothed"]
+    colors = ["steelblue", "darkorange"]
 
     if use_prominent_minima:
+        keys.append("inverted_smoothed_current")
+        labels.append("Inverted Smoothed")
+        colors.append("firebrick")
 
-        keys   = ["raw_current", "smoothed_current", "inverted_smoothed_current", "corrected_current"]
+    keys.append(first_pass_corrected_key)
+    labels.append("Corrected")
+    colors.append("seagreen")
 
-        labels = ["Raw", "Smoothed", "Inverted Smoothed", "Corrected"]
+    if double_correction_applied:
+        keys.append("second_pass_corrected_current")
+        labels.append("Corrected x2")
+        colors.append("mediumseagreen")
 
-        colors = ["steelblue", "darkorange", "firebrick", "seagreen"]
-
-    else:
-
-        keys   = ["raw_current", "smoothed_current", "corrected_current"]
-
-        labels = ["Raw", "Smoothed", "Corrected"]
-
-        colors = ["steelblue", "darkorange", "seagreen"]
-
-
-
-    fig_width = 18 if use_prominent_minima else 14
-
+    fig_width = max(14, 4.2 * len(keys))
     fig, axes = plt.subplots(1, len(keys), figsize=(fig_width, 4), sharey=False)
-
     axes = np.atleast_1d(axes)
 
-
+    correction_meta = {
+        "corrected_current": ("left_min_idx", "right_min_idx", "peak_idx_corr", result.get("minima_mode")),
+        "first_pass_corrected_current": (
+            "first_pass_left_min_idx", "first_pass_right_min_idx", "first_pass_peak_idx_corr",
+            result.get("first_pass_minima_mode"),
+        ),
+        "second_pass_corrected_current": (
+            "second_pass_left_min_idx", "second_pass_right_min_idx", "second_pass_peak_idx_corr",
+            result.get("second_pass_minima_mode"),
+        ),
+    }
+    corrected_keys = set(correction_meta.keys())
 
     for ax, key, label, color in zip(axes, keys, labels, colors):
-
         if key == "inverted_smoothed_current":
-
             source = result.get("smoothed_current")
-
             y = (-np.asarray(source)) if source is not None else None
-
         else:
-
             y = result.get(key)
 
-
-
         if y is None:
-
             ax.set_visible(False)
-
             continue
-
-
 
         ax.plot(v, y, color=color, lw=1.2)
 
-
-
         if key == "smoothed_current" and result.get("local_baseline") is not None:
-
-            ax.plot(v, result["local_baseline"], color="gray", lw=1,
-
-                    linestyle="--", label="baseline")
-
+            ax.plot(v, result["local_baseline"], color="gray", lw=1, linestyle="--", label="baseline")
             if minima_mode:
-
                 ax.text(
-
                     0.02, 0.98, f"minima mode: {minima_mode}",
-
                     transform=ax.transAxes, va="top", ha="left", fontsize=8,
-
                     bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=3),
-
                 )
 
-
-
         if key == "inverted_smoothed_current":
-
-            left_candidates = np.asarray(result.get("left_local_min_candidates", []), dtype=int)
-
-            right_candidates = np.asarray(result.get("right_local_min_candidates", []), dtype=int)
-
+            left_candidates_key = "first_pass_left_local_min_candidates" if double_correction_applied else "left_local_min_candidates"
+            right_candidates_key = "first_pass_right_local_min_candidates" if double_correction_applied else "right_local_min_candidates"
+            left_idx_key = "first_pass_left_min_idx" if double_correction_applied else "left_min_idx"
+            right_idx_key = "first_pass_right_min_idx" if double_correction_applied else "right_min_idx"
+            left_candidates = np.asarray(result.get(left_candidates_key, []), dtype=int)
+            right_candidates = np.asarray(result.get(right_candidates_key, []), dtype=int)
             if len(left_candidates):
-
-                ax.scatter(v[left_candidates], y[left_candidates],
-
-                           facecolors="none", edgecolors="red", s=34, zorder=5,
-
-                           linewidths=1.0, label="left minima as peaks")
-
+                ax.scatter(
+                    v[left_candidates], y[left_candidates],
+                    facecolors="none", edgecolors="red", s=34, zorder=5,
+                    linewidths=1.0, label="left minima as peaks",
+                )
                 top_two_left = left_candidates[:2]
-
                 left_labels = ("1st left prominent", "2nd left prominent")
-
                 for idx, lbl in zip(top_two_left, left_labels):
-
-                    ax.scatter(v[idx], y[idx],
-
-                               color="red", s=52, zorder=6,
-
-                               edgecolors="white", linewidths=0.8,
-
-                               label=lbl)
-
+                    ax.scatter(
+                        v[idx], y[idx],
+                        color="red", s=52, zorder=6,
+                        edgecolors="white", linewidths=0.8,
+                        label=lbl,
+                    )
             if len(right_candidates):
-
-                ax.scatter(v[right_candidates], y[right_candidates],
-
-                           facecolors="none", edgecolors="blue", s=34, zorder=5,
-
-                           linewidths=1.0, label="right minima as peaks")
-
+                ax.scatter(
+                    v[right_candidates], y[right_candidates],
+                    facecolors="none", edgecolors="blue", s=34, zorder=5,
+                    linewidths=1.0, label="right minima as peaks",
+                )
                 top_two_right = right_candidates[:2]
-
                 right_labels = ("1st right prominent", "2nd right prominent")
-
                 for idx, lbl in zip(top_two_right, right_labels):
-
-                    ax.scatter(v[idx], y[idx],
-
-                               color="blue", s=52, zorder=6,
-
-                               edgecolors="white", linewidths=0.8,
-
-                               label=lbl)
-
+                    ax.scatter(
+                        v[idx], y[idx],
+                        color="blue", s=52, zorder=6,
+                        edgecolors="white", linewidths=0.8,
+                        label=lbl,
+                    )
             for idx_key, marker_color, marker_label in (
-
-                ("left_min_idx", "red", "selected left anchor"),
-
-                ("right_min_idx", "blue", "selected right anchor"),
-
+                (left_idx_key, "red", "selected left anchor"),
+                (right_idx_key, "blue", "selected right anchor"),
             ):
-
                 idx = result.get(idx_key)
-
                 if idx is not None and 0 <= idx < len(v):
-
-                    ax.scatter(v[idx], y[idx],
-
-                               color=marker_color, s=40, zorder=6,
-
-                               edgecolors="white", linewidths=0.8,
-
-                               label=marker_label)
-
-
+                    ax.scatter(
+                        v[idx], y[idx],
+                        color=marker_color, s=40, zorder=6,
+                        edgecolors="white", linewidths=0.8,
+                        label=marker_label,
+                    )
 
         if key == "smoothed_current":
-
             candidates = find_peak_candidates(y)
-
             raw_valid_peaks = candidates["raw_valid_peaks"]
-
             if len(raw_valid_peaks):
+                ax.scatter(
+                    v[raw_valid_peaks], y[raw_valid_peaks],
+                    color="gold", s=28, zorder=5,
+                    edgecolors="black", linewidths=0.5,
+                    label="pre-prominence find_peaks",
+                )
 
-                ax.scatter(v[raw_valid_peaks], y[raw_valid_peaks],
-
-                           color="gold", s=28, zorder=5,
-
-                           edgecolors="black", linewidths=0.5,
-
-                           label="pre-prominence find_peaks")
-
-
-
-        if key == "corrected_current":
-
+        if key in corrected_keys:
+            left_idx_key, right_idx_key, _, panel_minima_mode = correction_meta[key]
             for idx_key, marker_color, marker_label in (
-
-                ("left_min_idx",  "red",  "left anchor"),
-
-                ("right_min_idx", "blue", "right anchor"),
-
+                (left_idx_key, "red", "left anchor"),
+                (right_idx_key, "blue", "right anchor"),
             ):
-
                 idx = result.get(idx_key)
-
                 if idx is not None and 0 <= idx < len(v):
+                    ax.scatter(
+                        v[idx], y[idx],
+                        color=marker_color, s=40, zorder=5,
+                        edgecolors="white", linewidths=0.8,
+                        label=marker_label,
+                    )
+            if key == "second_pass_corrected_current" and panel_minima_mode:
+                ax.text(
+                    0.02, 0.98, f"2nd pass minima mode: {panel_minima_mode}",
+                    transform=ax.transAxes, va="top", ha="left", fontsize=8,
+                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=3),
+                )
 
-                    ax.scatter(v[idx], y[idx],
-
-                               color=marker_color, s=40, zorder=5,
-
-                               edgecolors="white", linewidths=0.8,
-
-                               label=marker_label)
-
-
-
-        peak_idx_key = "peak_idx_corr" if key == "corrected_current" else "peak_idx"
-
+        peak_idx_key = "peak_idx"
+        if key in corrected_keys:
+            _, _, peak_idx_key, _ = correction_meta[key]
         peak_idx_for_line = result.get(peak_idx_key)
-
         if peak_idx_for_line is not None and 0 <= peak_idx_for_line < len(v):
-
             pi = peak_idx_for_line
-
             ax.axvline(v[pi], color="red", lw=0.8, linestyle=":")
-
             if key != "raw_current":
-
-                ax.scatter(v[pi], y[pi],
-
-                           color="crimson", s=55, zorder=6,
-
-                           edgecolors="white", linewidths=0.8,
-
-                           label="selected dominant peak")
-
-
+                ax.scatter(
+                    v[pi], y[pi],
+                    color="crimson", s=55, zorder=6,
+                    edgecolors="white", linewidths=0.8,
+                    label="selected dominant peak",
+                )
 
         ax.set_title(label)
-
         ax.set_xlabel("Voltage (V)")
-
         ax.set_ylabel("Current (uA)")
-
         ax.grid(False)
-
-        if key in ("smoothed_current", "inverted_smoothed_current", "corrected_current"):
-
+        if key in {"smoothed_current", "inverted_smoothed_current"} | corrected_keys:
             ax.legend(fontsize=7)
 
-
-
     fig.suptitle(result.get("file_name", ""), fontsize=9, y=1.01)
-
     fig.tight_layout()
-
     return fig
 

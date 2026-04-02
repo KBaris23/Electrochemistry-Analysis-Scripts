@@ -47,7 +47,7 @@ def _pick_folder_windows() -> str:
 # 
 st.set_page_config(
     page_title="SWV Analysis",
-    page_icon="",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -72,6 +72,7 @@ def cached_run_batch(
     smooth_polyorder,
     minima_search_window_V,
     use_prominent_minima,
+    use_double_correction,
     min_peak_height_uA,
     min_start_voltage,
     scan_range,
@@ -85,6 +86,7 @@ def cached_run_batch(
         smooth_polyorder=smooth_polyorder,
         minima_search_window_V=minima_search_window_V,
         use_prominent_minima=use_prominent_minima,
+        use_double_correction=use_double_correction,
         min_peak_height_uA=min_peak_height_uA,
         min_start_voltage=min_start_voltage,
         scan_range=scan_range,
@@ -105,7 +107,7 @@ for k, v in dict(results=None, last_results=None, folders=[], run_count=0).items
 # Sidebar
 # 
 with st.sidebar:
-    st.title(" SWV Analysis")
+    st.title("⚡ SWV Analysis")
     st.divider()
 
     #  Folders 
@@ -193,6 +195,20 @@ with st.sidebar:
         value=False,
         help="Experimental comparison mode: uses peaks of the inverted smoothed signal and takes the most prominent local minimum on each side of the detected peak.",
     )
+    use_double_correction = st.checkbox(
+        "Double baseline correction",
+        value=False,
+        help=(
+            "Optional refinement: after the first baseline rotation, run one more "
+            "bracketing-minima correction on the once-corrected trace so the anchors "
+            "can better match the shifted minima."
+        ),
+    )
+    if use_double_correction:
+        st.caption(
+            "Adds a second correction pass to refine anchors after the first rotation. "
+            "Single-trace inspectors will show an extra second-pass panel."
+        )
     use_peak_cutoff = st.checkbox("Enforce min peak height", value=True)
     min_peak_height = None
     if use_peak_cutoff:
@@ -286,6 +302,7 @@ if run_clicked and folders and not folder_errors:
                     smooth_polyorder=smooth_polyorder,
                     minima_search_window_V=minima_search_window,
                     use_prominent_minima=use_prominent_minima,
+                    use_double_correction=use_double_correction,
                     min_peak_height_uA=min_peak_height,
                     min_start_voltage=min_start_voltage,
                     scan_range=scan_range,
@@ -308,6 +325,7 @@ if run_clicked and folders and not folder_errors:
                 smooth_polyorder=smooth_polyorder,
                 minima_search_window_V=minima_search_window,
                 use_prominent_minima=use_prominent_minima,
+                use_double_correction=use_double_correction,
                 min_peak_height_uA=min_peak_height,
                 min_start_voltage=min_start_voltage,
                 scan_range=scan_range,
