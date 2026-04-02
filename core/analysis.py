@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -18,6 +19,80 @@ from .processing import (
     rotate_offset_using_prominent_bracketing_minima,
     rotate_offset_using_bracketing_minima,
 )
+
+
+def _file_signature(filepath: str) -> Tuple[int, int]:
+    stat = os.stat(filepath)
+    return int(stat.st_mtime_ns), int(stat.st_size)
+
+
+@lru_cache(maxsize=512)
+def _load_filtered_arrays_cached(
+    filepath: str,
+    voltage_col: str,
+    current_col: Optional[str],
+    file_mtime_ns: int,
+    file_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    # Include file metadata in the cache key so edits invalidate cached arrays.
+    del file_mtime_ns, file_size
+    v_raw, i_raw = load_swv_csv(filepath, voltage_col=voltage_col, current_col=current_col)
+    v_raw, i_raw = filter_finite(v_raw, i_raw)
+    return np.asarray(v_raw, dtype=float), np.asarray(i_raw, dtype=float)
+
+
+@lru_cache(maxsize=256)
+def _process_file_cached(
+    filepath: str,
+    voltage_col: str,
+    current_col: Optional[str],
+    file_mtime_ns: int,
+    file_size: int,
+    crop_range: Tuple[float, float],
+    smooth_window: int,
+    smooth_polyorder: int,
+    minima_search_window_V: float,
+    use_prominent_minima: bool,
+    use_double_correction: bool,
+    min_peak_height_uA: Optional[float],
+    compute_skew: bool,
+    compute_wavelet_energy: bool,
+) -> dict:
+    v_raw, i_raw = _load_filtered_arrays_cached(
+        filepath=filepath,
+        voltage_col=voltage_col,
+        current_col=current_col,
+        file_mtime_ns=file_mtime_ns,
+        file_size=file_size,
+    )
+    try:
+        result = analyze_swv_arrays(
+            v_raw=v_raw,
+            i_raw=i_raw,
+            crop_range=crop_range,
+            smooth_window=smooth_window,
+            smooth_polyorder=smooth_polyorder,
+            minima_search_window_V=minima_search_window_V,
+            use_prominent_minima=use_prominent_minima,
+            use_double_correction=use_double_correction,
+            min_peak_height_uA=min_peak_height_uA,
+            compute_skew=compute_skew,
+            compute_wavelet_energy=compute_wavelet_energy,
+            file_path=filepath,
+        )
+        return {"status": "OK", "result": result, "partial": None, "error": None}
+    except Exception as exc:
+        partial = partial_traces_for_failure_arrays(
+            v_raw=v_raw,
+            i_raw=i_raw,
+            crop_range=crop_range,
+            smooth_window=smooth_window,
+            smooth_polyorder=smooth_polyorder,
+            minima_search_window_V=minima_search_window_V,
+            use_prominent_minima=use_prominent_minima,
+            use_double_correction=use_double_correction,
+        )
+        return {"status": "FAILED", "result": None, "partial": partial, "error": str(exc)}
 
 
 def _run_correction_pass(
@@ -76,8 +151,14 @@ def analyze_swv_file(
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
 ) -> dict:
-    v_raw, i_raw = load_swv_csv(filepath, voltage_col=voltage_col, current_col=current_col)
-    v_raw, i_raw = filter_finite(v_raw, i_raw)
+    file_mtime_ns, file_size = _file_signature(filepath)
+    v_raw, i_raw = _load_filtered_arrays_cached(
+        filepath=filepath,
+        voltage_col=voltage_col,
+        current_col=current_col,
+        file_mtime_ns=file_mtime_ns,
+        file_size=file_size,
+    )
 
     return analyze_swv_arrays(
         v_raw=v_raw,
@@ -423,8 +504,14 @@ def run_batch(
             progress_callback(idx + 1, total, os.path.basename(f.path))
 
         try:
-            v_check, i_check = load_swv_csv(f.path, voltage_col=voltage_col, current_col=current_col)
-            v_check, i_check = filter_finite(v_check, i_check)
+            file_mtime_ns, file_size = _file_signature(f.path)
+            v_check, i_check = _load_filtered_arrays_cached(
+                filepath=f.path,
+                voltage_col=voltage_col,
+                current_col=current_col,
+                file_mtime_ns=file_mtime_ns,
+                file_size=file_size,
+            )
         except Exception:
             continue
 
@@ -457,35 +544,29 @@ def run_batch(
             file_name=os.path.basename(f.path),
         )
 
-        try:
-            r = analyze_swv_arrays(
-                v_raw=v_check,
-                i_raw=i_check,
-                crop_range=crop_range,
-                smooth_window=smooth_window,
-                smooth_polyorder=smooth_polyorder,
-                minima_search_window_V=minima_search_window_V,
-                use_prominent_minima=use_prominent_minima,
-                use_double_correction=use_double_correction,
-                min_peak_height_uA=min_peak_height_uA,
-                compute_skew=compute_skew,
-                compute_wavelet_energy=compute_wavelet_energy,
-                file_path=f.path,
-            )
+        processed = _process_file_cached(
+            filepath=f.path,
+            voltage_col=voltage_col,
+            current_col=current_col,
+            file_mtime_ns=file_mtime_ns,
+            file_size=file_size,
+            crop_range=crop_range,
+            smooth_window=smooth_window,
+            smooth_polyorder=smooth_polyorder,
+            minima_search_window_V=minima_search_window_V,
+            use_prominent_minima=use_prominent_minima,
+            use_double_correction=use_double_correction,
+            min_peak_height_uA=min_peak_height_uA,
+            compute_skew=compute_skew,
+            compute_wavelet_energy=compute_wavelet_energy,
+        )
+
+        if processed["status"] == "OK":
+            r = dict(processed["result"])
             r.update(common)
             all_results.append(r)
-
-        except Exception as e:
-            partial = partial_traces_for_failure_arrays(
-                v_raw=v_check,
-                i_raw=i_check,
-                crop_range=crop_range,
-                smooth_window=smooth_window,
-                smooth_polyorder=smooth_polyorder,
-                minima_search_window_V=minima_search_window_V,
-                use_prominent_minima=use_prominent_minima,
-                use_double_correction=use_double_correction,
-            )
+        else:
+            partial = dict(processed["partial"])
             all_results.append({
                 **common,
                 "peak_current": np.nan,
@@ -495,7 +576,7 @@ def run_batch(
                 "peak_offset_norm": np.nan,
                 "wavelet_energy": np.nan,
                 "status": "FAILED",
-                "error": str(e),
+                "error": processed["error"],
                 **{k: partial.get(k) for k in (
                     "voltage", "raw_current", "smoothed_current",
                     "corrected_current", "smoothed_corrected_current",
