@@ -9,6 +9,8 @@ import numpy as np
 from matplotlib import cm
 
 from matplotlib.colors import Normalize
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import curve_fit
 
 from .processing import find_peak_candidates
 
@@ -232,6 +234,245 @@ def add_scan_vlines(ax, vlines, y_frac: float = 0.85):
 
         )
 
+
+
+
+
+def _filter_titration_vlines(
+
+    vlines: Optional[List[Tuple[float, str]]],
+
+    scan_range: Optional[Tuple[int, int]] = None,
+
+) -> List[Tuple[float, str]]:
+
+    if not vlines:
+
+        return []
+
+    filtered = (
+
+        [(float(x), str(label)) for x, label in vlines if scan_range[0] <= x <= scan_range[1]]
+
+        if scan_range else [(float(x), str(label)) for x, label in vlines]
+
+    )
+    filtered = sorted(filtered, key=lambda item: item[0])
+
+    deduped: List[Tuple[float, str]] = []
+    for x, label in filtered:
+
+        if deduped and np.isclose(deduped[-1][0], x):
+
+            continue
+
+        deduped.append((x, label))
+
+    return deduped
+
+
+
+
+def _plateau_slice(n_points: int, edge_trim_fraction: float) -> slice:
+
+    if n_points <= 2 or edge_trim_fraction <= 0:
+
+        return slice(0, n_points)
+
+    trim_n = int(np.floor(n_points * edge_trim_fraction))
+    if trim_n <= 0 or (n_points - (2 * trim_n)) < 1:
+
+        return slice(0, n_points)
+
+    return slice(trim_n, n_points - trim_n)
+
+
+
+
+def build_titration_step_table(
+
+    all_results: List[dict],
+
+    metric: str,
+
+    vlines: Optional[List[Tuple[float, str]]],
+
+    channels: Optional[List[int]] = None,
+
+    scan_range: Optional[Tuple[int, int]] = None,
+
+    edge_trim_fraction: float = 0.15,
+
+) -> List[dict]:
+
+    titration_vlines = _filter_titration_vlines(vlines, scan_range=scan_range)
+    if len(titration_vlines) < 2:
+
+        return []
+
+    all_ch = sorted({r["channel"] for r in all_results})
+    channels = [ch for ch in channels if ch in all_ch] if channels else all_ch
+    if not channels:
+
+        return []
+
+    plot_results = (
+
+        [r for r in all_results if scan_range[0] <= r["scan_number"] <= scan_range[1]]
+
+        if scan_range else all_results
+
+    )
+
+    rows: List[dict] = []
+    for ch in channels:
+
+        ch_res = sorted(
+
+            [
+
+                r for r in plot_results
+
+                if r.get("status") == "OK"
+
+                and r["channel"] == ch
+
+                and np.isfinite(r.get(metric, np.nan))
+
+            ],
+
+            key=lambda r: r["scan_number"],
+
+        )
+        if not ch_res:
+
+            continue
+
+        for step_index, ((start_scan, left_label), (end_scan, right_label)) in enumerate(
+
+            zip(titration_vlines[:-1], titration_vlines[1:]),
+
+            start=1,
+
+        ):
+
+            if end_scan <= start_scan:
+
+                continue
+
+            step_results = [
+
+                r for r in ch_res
+
+                if start_scan <= r["scan_number"] < end_scan
+
+            ]
+            if not step_results:
+
+                continue
+
+            step_scan_numbers = np.asarray([r["scan_number"] for r in step_results], dtype=float)
+            step_values = np.asarray([r.get(metric, np.nan) for r in step_results], dtype=float)
+            keep = _plateau_slice(len(step_results), edge_trim_fraction)
+            plateau_scan_numbers = step_scan_numbers[keep]
+            plateau_values = step_values[keep]
+            if plateau_values.size == 0:
+
+                plateau_scan_numbers = step_scan_numbers
+                plateau_values = step_values
+
+            plateau_value = float(np.median(plateau_values))
+            plateau_mad = float(np.median(np.abs(plateau_values - plateau_value)))
+
+            rows.append({
+
+                "channel": ch,
+
+                "metric_key": metric,
+
+                "step_index": step_index,
+
+                "step_label": f"Step {step_index}",
+
+                "left_vline_label": left_label,
+
+                "right_vline_label": right_label,
+
+                "step_start_scan": float(start_scan),
+
+                "step_end_scan": float(end_scan),
+
+                "midpoint_scan": float((start_scan + end_scan) / 2.0),
+
+                "scan_start_observed": float(step_scan_numbers[0]),
+
+                "scan_end_observed": float(step_scan_numbers[-1]),
+
+                "plateau_scan_start": float(plateau_scan_numbers[0]),
+
+                "plateau_scan_end": float(plateau_scan_numbers[-1]),
+
+                "step_scan_count": int(step_scan_numbers.size),
+
+                "plateau_scan_count": int(plateau_values.size),
+
+                "plateau_value": plateau_value,
+
+                "plateau_mad": plateau_mad,
+
+            })
+
+    return rows
+
+
+
+
+def _langmuir_isotherm(x, baseline, amplitude, kd):
+
+    return baseline + amplitude * (x / (kd + x))
+
+
+
+
+def _fit_langmuir_isotherm(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[float, float, float]]:
+
+    if x.size < 3 or np.unique(x).size < 3:
+
+        return None
+
+    baseline0 = float(y[0])
+    amplitude0 = float(y[-1] - y[0])
+    if np.isclose(amplitude0, 0.0):
+
+        amplitude0 = float(np.nanmax(y) - np.nanmin(y))
+        if np.isclose(amplitude0, 0.0):
+
+            amplitude0 = 1.0
+
+    kd0 = float(max(1.0, np.median(x)))
+
+    try:
+
+        params, _ = curve_fit(
+
+            _langmuir_isotherm,
+
+            x,
+
+            y,
+
+            p0=(baseline0, amplitude0, kd0),
+
+            bounds=([-np.inf, -np.inf, 1e-6], [np.inf, np.inf, np.inf]),
+
+            maxfev=20000,
+
+        )
+    except Exception:
+
+        return None
+
+    return float(params[0]), float(params[1]), float(params[2])
 
 
 
@@ -470,6 +711,402 @@ def plot_metric_vs_scan(
 
     return fig
 
+
+
+
+
+def plot_titration_plateaus(
+
+    all_results: List[dict],
+
+    metric: str,
+
+    vlines: Optional[List[Tuple[float, str]]],
+
+    channels: Optional[List[int]] = None,
+
+    title: Optional[str] = None,
+
+    ylabel: Optional[str] = None,
+
+    scan_range: Optional[Tuple[int, int]] = None,
+
+    edge_trim_fraction: float = 0.15,
+
+    vline_y_frac: float = 0.85,
+
+    figsize: Tuple[int, int] = (10, 4),
+
+    highlight_channel: Optional[int] = None,
+
+) -> Optional[plt.Figure]:
+
+    step_rows = build_titration_step_table(
+
+        all_results,
+
+        metric=metric,
+
+        vlines=vlines,
+
+        channels=channels,
+
+        scan_range=scan_range,
+
+        edge_trim_fraction=edge_trim_fraction,
+
+    )
+    if not step_rows:
+
+        return None
+
+    all_ch = sorted({r["channel"] for r in all_results})
+    channels = sorted({row["channel"] for row in step_rows})
+    plot_results = (
+
+        [r for r in all_results if scan_range[0] <= r["scan_number"] <= scan_range[1]]
+
+        if scan_range else all_results
+
+    )
+    filtered_vlines = _filter_titration_vlines(vlines, scan_range=scan_range)
+
+    cmap = plt.get_cmap("tab10")
+    colors = {ch: cmap(i % 10) for i, ch in enumerate(all_ch)}
+
+    fig, ax = plt.subplots(figsize=figsize)
+    for ch in channels:
+
+        ch_res = sorted(
+
+            [
+
+                r for r in plot_results
+
+                if r.get("status") == "OK"
+
+                and r["channel"] == ch
+
+                and np.isfinite(r.get(metric, np.nan))
+
+            ],
+
+            key=lambda r: r["scan_number"],
+
+        )
+        ch_steps = [row for row in step_rows if row["channel"] == ch]
+        if not ch_res or not ch_steps:
+
+            continue
+
+        dimmed = highlight_channel is not None and ch != highlight_channel
+        color = colors[ch]
+        x = [r["scan_number"] for r in ch_res]
+        y = [r.get(metric, np.nan) for r in ch_res]
+
+        ax.plot(
+
+            x,
+
+            y,
+
+            marker="o",
+
+            ms=2.8,
+
+            lw=1.0,
+
+            color=color,
+
+            alpha=0.08 if dimmed else 0.22,
+
+        )
+
+        step_midpoints = np.asarray([row["midpoint_scan"] for row in ch_steps], dtype=float)
+        plateau_values = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float)
+
+        for row in ch_steps:
+
+            ax.hlines(
+
+                row["plateau_value"],
+
+                row["step_start_scan"],
+
+                row["step_end_scan"],
+
+                color=color,
+
+                lw=3.0,
+
+                alpha=0.35 if dimmed else 0.95,
+
+            )
+
+        ax.scatter(
+
+            step_midpoints,
+
+            plateau_values,
+
+            color=color,
+
+            s=28,
+
+            marker="D",
+
+            alpha=0.25 if dimmed else 0.95,
+
+            label=f"Ch{ch}",
+
+            zorder=3,
+
+        )
+
+        if step_midpoints.size >= 2:
+
+            if step_midpoints.size >= 3:
+
+                try:
+
+                    bridge = PchipInterpolator(step_midpoints, plateau_values)
+                    x_dense = np.linspace(step_midpoints.min(), step_midpoints.max(), 300)
+                    y_dense = bridge(x_dense)
+                    ax.plot(
+
+                        x_dense,
+
+                        y_dense,
+
+                        color=color,
+
+                        lw=1.8,
+
+                        linestyle="--",
+
+                        alpha=0.25 if dimmed else 0.75,
+
+                    )
+                except Exception:
+
+                    ax.plot(
+
+                        step_midpoints,
+
+                        plateau_values,
+
+                        color=color,
+
+                        lw=1.4,
+
+                        linestyle="--",
+
+                        alpha=0.25 if dimmed else 0.75,
+
+                    )
+            else:
+
+                ax.plot(
+
+                    step_midpoints,
+
+                    plateau_values,
+
+                    color=color,
+
+                    lw=1.4,
+
+                    linestyle="--",
+
+                    alpha=0.25 if dimmed else 0.75,
+
+                )
+
+    ax.set_xlabel("Scan number")
+    ax.set_ylabel(ylabel or metric)
+    ax.set_title(title or f"{metric} titration plateaus")
+    ax.grid(False)
+    ax.legend(title="Channel", loc="best", fontsize=8)
+    add_scan_vlines(ax, filtered_vlines, vline_y_frac)
+    if scan_range:
+
+        ax.set_xlim(scan_range)
+
+    fig.tight_layout()
+    return fig
+
+
+
+
+def plot_titration_langmuir(
+
+    all_results: List[dict],
+
+    metric: str,
+
+    vlines: Optional[List[Tuple[float, str]]],
+
+    channels: Optional[List[int]] = None,
+
+    title: Optional[str] = None,
+
+    ylabel: Optional[str] = None,
+
+    scan_range: Optional[Tuple[int, int]] = None,
+
+    edge_trim_fraction: float = 0.15,
+
+    figsize: Tuple[int, int] = (8, 4),
+
+    highlight_channel: Optional[int] = None,
+
+    fit_langmuir: bool = True,
+
+) -> Optional[plt.Figure]:
+
+    step_rows = build_titration_step_table(
+
+        all_results,
+
+        metric=metric,
+
+        vlines=vlines,
+
+        channels=channels,
+
+        scan_range=scan_range,
+
+        edge_trim_fraction=edge_trim_fraction,
+
+    )
+    if not step_rows:
+
+        return None
+
+    all_ch = sorted({r["channel"] for r in all_results})
+    channels = sorted({row["channel"] for row in step_rows})
+
+    cmap = plt.get_cmap("tab10")
+    colors = {ch: cmap(i % 10) for i, ch in enumerate(all_ch)}
+
+    fig, ax = plt.subplots(figsize=figsize)
+    plotted_any = False
+    xticks = set()
+
+    for ch in channels:
+
+        ch_steps = sorted(
+
+            [row for row in step_rows if row["channel"] == ch],
+
+            key=lambda row: row["step_index"],
+
+        )
+        if not ch_steps:
+
+            continue
+
+        dimmed = highlight_channel is not None and ch != highlight_channel
+        color = colors[ch]
+        x = np.asarray([row["step_index"] for row in ch_steps], dtype=float)
+        y = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float)
+        xticks.update(int(v) for v in x)
+
+        ax.scatter(
+
+            x,
+
+            y,
+
+            color=color,
+
+            s=34,
+
+            marker="D",
+
+            alpha=0.25 if dimmed else 0.95,
+
+            label=f"Ch{ch}",
+
+            zorder=3,
+
+        )
+
+        if x.size >= 2:
+
+            if fit_langmuir:
+
+                params = _fit_langmuir_isotherm(x, y)
+                if params is not None:
+
+                    x_dense = np.linspace(x.min(), x.max(), 300)
+                    y_dense = _langmuir_isotherm(x_dense, *params)
+                    ax.plot(
+
+                        x_dense,
+
+                        y_dense,
+
+                        color=color,
+
+                        lw=2.0,
+
+                        alpha=0.25 if dimmed else 0.8,
+
+                    )
+                else:
+
+                    ax.plot(
+
+                        x,
+
+                        y,
+
+                        color=color,
+
+                        lw=1.4,
+
+                        linestyle="--",
+
+                        alpha=0.2 if dimmed else 0.65,
+
+                    )
+            else:
+
+                ax.plot(
+
+                    x,
+
+                    y,
+
+                    color=color,
+
+                    lw=1.4,
+
+                    linestyle="--",
+
+                    alpha=0.2 if dimmed else 0.65,
+
+                )
+
+        plotted_any = True
+
+    if not plotted_any:
+
+        plt.close(fig)
+        return None
+
+    ax.set_xlabel("Titration step index (proxy concentration)")
+    ax.set_ylabel(ylabel or metric)
+    ax.set_title(title or f"{metric} titration isotherm")
+    ax.grid(False)
+    ax.legend(title="Channel", loc="best", fontsize=8)
+    if xticks:
+
+        ax.set_xticks(sorted(xticks))
+
+    fig.tight_layout()
+    return fig
 
 
 

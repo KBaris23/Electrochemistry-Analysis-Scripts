@@ -46,6 +46,18 @@ swv_app/
 | 🗂 Data Table | Filterable results table |
 | 💾 Export | Download results.csv and a ZIP of all figures |
 
+## Titration mode
+
+If you enable `Treat vline intervals as titration steps` in the sidebar, the app adds an opt-in titration analysis layer on top of the normal scan-by-scan metrics.
+
+- Each interval between consecutive vertical lines becomes one titration step.
+- Plateau values are estimated per channel and per metric using the median of the middle portion of each step.
+- Metric plots gain horizontal step plateaus, midpoint markers, and a smooth bridge through the step centers.
+- An optional Langmuir-style fit is drawn from plateau value vs. titration step index.
+- The Data Table and Export tabs expose step-level titration summaries only when this mode is enabled.
+
+The plateau estimator trims a configurable fraction from both edges of each step before taking the median, which helps suppress transition scans immediately after an addition event.
+
 ## Peak finding and baseline correction
 
 For each SWV trace, the app follows this sequence:
