@@ -15,11 +15,14 @@ import pandas as pd
 import streamlit as st
 
 from core import (
+    build_titration_step_table,
     plot_drift_vs_scan,
     plot_failed_traces,
     plot_metric_vs_scan,
     plot_overlaid_traces,
     plot_single_trace,
+    plot_titration_langmuir,
+    plot_titration_plateaus,
     run_batch,
 )
 
@@ -93,6 +96,34 @@ def cached_run_batch(
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
     )
+
+
+def collect_titration_rows(
+    all_results,
+    metric_cfg,
+    channels,
+    vlines,
+    scan_range,
+    edge_trim_fraction,
+):
+    rows = []
+    for label, (metric_key, ylabel) in metric_cfg.items():
+        metric_rows = build_titration_step_table(
+            all_results,
+            metric=metric_key,
+            vlines=vlines,
+            channels=channels,
+            scan_range=scan_range,
+            edge_trim_fraction=edge_trim_fraction,
+        )
+        for row in metric_rows:
+            rows.append({
+                "metric_label": label,
+                "metric_key": metric_key,
+                "metric_ylabel": ylabel,
+                **row,
+            })
+    return rows
 
 
 # 
@@ -271,6 +302,28 @@ with st.sidebar:
             except ValueError:
                 pass
 
+    enable_titration_analysis = st.checkbox(
+        "Treat vline intervals as titration steps",
+        value=False,
+        help="Each interval between consecutive vertical lines becomes one titration step.",
+    )
+    titration_edge_trim_fraction = 0.15
+    fit_titration_langmuir = False
+    if enable_titration_analysis:
+        titration_edge_trim_fraction = st.slider(
+            "Plateau edge trim fraction",
+            min_value=0.0,
+            max_value=0.4,
+            value=0.15,
+            step=0.05,
+            help="Uses only the middle portion of each step when estimating the plateau median.",
+        )
+        fit_titration_langmuir = st.checkbox(
+            "Fit Langmuir-style curve to step plateaus",
+            value=True,
+            help="Uses titration step index as a proxy x-axis and fits a simple Langmuir isotherm.",
+        )
+
     st.divider()
 
     #  Failed traces 
@@ -379,6 +432,21 @@ c4.metric("Channels found", len(all_channels))
 
 st.divider()
 
+metric_cfg = {
+    "Peak current (corrected)": ("peak_current",     "Corrected Peak Height (uA)"),
+    "Peak current (raw)":       ("peak_current_raw", "Raw Current at Peak (uA)"),
+    "Skew":                     ("skew",             "Skew (corrected trace)"),
+    "Peak offset (normalized)": ("peak_offset_norm", "Peak offset from bracket center (normalized)"),
+    "Wavelet energy":           ("wavelet_energy",   "Wavelet Energy (a.u.)"),
+}
+if not compute_skew:
+    metric_cfg.pop("Skew", None)
+    metric_cfg.pop("Peak offset (normalized)", None)
+if not compute_wavelet_energy:
+    metric_cfg.pop("Wavelet energy", None)
+
+titration_ready = enable_titration_analysis and len(vlines) >= 2
+
 # 
 # Tabs
 # 
@@ -442,20 +510,6 @@ if view == "Overlays":
 if view == "Metrics":
     st.subheader("Metrics vs scan number")
 
-    metric_cfg = {
-        "Peak current (corrected)": ("peak_current",     "Corrected Peak Height (uA)"),
-        "Peak current (raw)":       ("peak_current_raw", "Raw Current at Peak (uA)"),
-        "Skew":                     ("skew",             "Skew (corrected trace)"),
-        "Peak offset (normalized)": ("peak_offset_norm", "Peak offset from bracket center (normalized)"),
-        "Wavelet energy":           ("wavelet_energy",   "Wavelet Energy (a.u.)"),
-    }
-    if not compute_skew:
-        metric_cfg.pop("Skew", None)
-        metric_cfg.pop("Peak offset (normalized)", None)
-    if not compute_wavelet_energy:
-        metric_cfg.pop("Wavelet energy", None)
-
-
     m_c1, m_c2 = st.columns([3, 1])
     selected_metrics = m_c1.multiselect(
         "Metrics to display",
@@ -471,6 +525,17 @@ if view == "Metrics":
 
     view_mode = st.radio("View mode", ["Combined", "Individual channels"],
                           horizontal=True, key="metric_view_mode")
+
+    if enable_titration_analysis:
+        if not titration_ready:
+            st.warning("Titration analysis needs at least two vertical lines inside the active scan range.")
+        else:
+            kept_pct = int(round((1.0 - (2.0 * titration_edge_trim_fraction)) * 100))
+            kept_pct = max(kept_pct, 0)
+            st.caption(
+                f"Titration mode is on. Each vline interval becomes one step, and plateau values are "
+                f"estimated from the median of the middle {kept_pct}% of scans in that step."
+            )
 
     for label in selected_metrics:
         metric, ylabel = metric_cfg[label]
@@ -497,6 +562,80 @@ if view == "Metrics":
                     with cols[i % min(len(channels_display), 3)]:
                         st.pyplot(fig)
                     plt.close(fig)
+
+        if titration_ready:
+            st.caption("Titration plateaus")
+            if view_mode == "Combined":
+                fig = plot_titration_plateaus(
+                    results,
+                    metric=metric,
+                    channels=channels_display,
+                    title=f"{label} | plateau fit",
+                    ylabel=ylabel,
+                    vlines=vlines,
+                    scan_range=scan_range,
+                    edge_trim_fraction=titration_edge_trim_fraction,
+                    highlight_channel=highlight_ch,
+                )
+                if fig:
+                    st.pyplot(fig)
+                    plt.close(fig)
+            else:
+                cols = st.columns(min(len(channels_display), 3))
+                for i, ch in enumerate(channels_display):
+                    fig = plot_titration_plateaus(
+                        results,
+                        metric=metric,
+                        channels=[ch],
+                        title=f"Ch{ch} | plateau fit",
+                        ylabel=ylabel,
+                        vlines=vlines,
+                        scan_range=scan_range,
+                        edge_trim_fraction=titration_edge_trim_fraction,
+                        figsize=(5, 3),
+                    )
+                    if fig:
+                        with cols[i % min(len(channels_display), 3)]:
+                            st.pyplot(fig)
+                        plt.close(fig)
+
+            if fit_titration_langmuir:
+                st.caption("Langmuir-style fit of plateau midpoints")
+                if view_mode == "Combined":
+                    fig = plot_titration_langmuir(
+                        results,
+                        metric=metric,
+                        channels=channels_display,
+                        title=f"{label} | Langmuir-style fit",
+                        ylabel=ylabel,
+                        vlines=vlines,
+                        scan_range=scan_range,
+                        edge_trim_fraction=titration_edge_trim_fraction,
+                        highlight_channel=highlight_ch,
+                        fit_langmuir=True,
+                    )
+                    if fig:
+                        st.pyplot(fig)
+                        plt.close(fig)
+                else:
+                    cols = st.columns(min(len(channels_display), 3))
+                    for i, ch in enumerate(channels_display):
+                        fig = plot_titration_langmuir(
+                            results,
+                            metric=metric,
+                            channels=[ch],
+                            title=f"Ch{ch} | Langmuir-style fit",
+                            ylabel=ylabel,
+                            vlines=vlines,
+                            scan_range=scan_range,
+                            edge_trim_fraction=titration_edge_trim_fraction,
+                            figsize=(5, 3),
+                            fit_langmuir=True,
+                        )
+                        if fig:
+                            with cols[i % min(len(channels_display), 3)]:
+                                st.pyplot(fig)
+                            plt.close(fig)
 
         st.divider()
 
@@ -657,6 +796,56 @@ if view == "Data Table":
     st.dataframe(filtered_df, use_container_width=True, height=400)
     st.caption(f"{mask.sum()} rows shown")
 
+    if enable_titration_analysis:
+        st.divider()
+        st.markdown("#### Titration step table")
+        if not titration_ready:
+            st.info("Add at least two vertical lines inside the active scan range to build titration steps.")
+        else:
+            default_titration_metrics = (
+                ["Peak current (corrected)"]
+                if "Peak current (corrected)" in metric_cfg
+                else list(metric_cfg.keys())[:1]
+            )
+            titration_metric_labels = st.multiselect(
+                "Titration metrics to tabulate",
+                options=list(metric_cfg.keys()),
+                default=default_titration_metrics,
+                key="table_titration_metrics",
+            )
+            titration_rows = []
+            for label in titration_metric_labels:
+                metric_key, ylabel = metric_cfg[label]
+                for row in build_titration_step_table(
+                    filtered_results,
+                    metric=metric_key,
+                    vlines=vlines,
+                    channels=ch_filter,
+                    scan_range=scan_range,
+                    edge_trim_fraction=titration_edge_trim_fraction,
+                ):
+                    titration_rows.append({
+                        "Metric": label,
+                        "Channel": row["channel"],
+                        "Step #": row["step_index"],
+                        "Left marker": row["left_vline_label"],
+                        "Right marker": row["right_vline_label"],
+                        "Step start": row["step_start_scan"],
+                        "Step end": row["step_end_scan"],
+                        "Midpoint": row["midpoint_scan"],
+                        "Plateau value": row["plateau_value"],
+                        "Plateau MAD": row["plateau_mad"],
+                        "Step scans": row["step_scan_count"],
+                        "Plateau scans": row["plateau_scan_count"],
+                    })
+
+            if titration_rows:
+                titration_df = pd.DataFrame(titration_rows)
+                st.dataframe(titration_df, use_container_width=True, height=260)
+                st.caption(f"{len(titration_df)} titration step rows shown")
+            else:
+                st.info("No titration steps with valid plateau data match the current filters.")
+
     st.divider()
     st.markdown("#### Single-trace inspector")
 
@@ -706,6 +895,31 @@ if view == "Export":
                        file_name="swv_results.csv", mime="text/csv",
                        use_container_width=True)
 
+    if enable_titration_analysis:
+        st.markdown("####  Titration step CSV")
+        if not titration_ready:
+            st.info("Add at least two vertical lines inside the active scan range to export titration steps.")
+        else:
+            titration_export_rows = collect_titration_rows(
+                results,
+                metric_cfg=metric_cfg,
+                channels=channels_display,
+                vlines=vlines,
+                scan_range=scan_range,
+                edge_trim_fraction=titration_edge_trim_fraction,
+            )
+            if titration_export_rows:
+                titration_csv = pd.DataFrame(titration_export_rows).to_csv(index=False).encode()
+                st.download_button(
+                    "  Download titration_steps.csv",
+                    data=titration_csv,
+                    file_name="swv_titration_steps.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            else:
+                st.info("No titration step rows are available for export with the current settings.")
+
     st.divider()
 
     st.markdown("####  Figures ZIP")
@@ -723,18 +937,42 @@ if view == "Export":
                 zf.writestr(path, buf.getvalue())
                 plt.close(fig)
 
-            for metric, (title, ylabel) in {
-                "peak_current":     ("Peak current (corrected)", "Corrected Peak Height (uA)"),
-                "peak_current_raw": ("Peak current (raw)",       "Raw Current at Peak (uA)"),
-                "skew":             ("Skew",                     "Skew (corrected trace)"),
-                "peak_offset_norm":   ("Peak offset (normalized)", "Peak offset from bracket center (normalized)"),
-                "wavelet_energy":   ("Wavelet energy",           "Wavelet Energy (a.u.)"),
-            }.items():
+            for title, (metric, ylabel) in metric_cfg.items():
                 fig = plot_metric_vs_scan(results, metric=metric, channels=channels_display,
                                           title=title, ylabel=ylabel,
                                           vlines=vlines, scan_range=scan_range)
                 if fig:
                     _save(fig, f"metrics/{metric}.{fig_format}")
+
+            if titration_ready:
+                for title, (metric, ylabel) in metric_cfg.items():
+                    fig = plot_titration_plateaus(
+                        results,
+                        metric=metric,
+                        channels=channels_display,
+                        title=f"{title} | plateau fit",
+                        ylabel=ylabel,
+                        vlines=vlines,
+                        scan_range=scan_range,
+                        edge_trim_fraction=titration_edge_trim_fraction,
+                    )
+                    if fig:
+                        _save(fig, f"titration/plateaus/{metric}.{fig_format}")
+
+                    if fit_titration_langmuir:
+                        fig = plot_titration_langmuir(
+                            results,
+                            metric=metric,
+                            channels=channels_display,
+                            title=f"{title} | Langmuir-style fit",
+                            ylabel=ylabel,
+                            vlines=vlines,
+                            scan_range=scan_range,
+                            edge_trim_fraction=titration_edge_trim_fraction,
+                            fit_langmuir=True,
+                        )
+                        if fig:
+                            _save(fig, f"titration/langmuir/{metric}.{fig_format}")
 
             for dk, ylabel, title in (
                 ("peak_voltage_drift", "Peak voltage (V)", "Peak voltage drift"),
