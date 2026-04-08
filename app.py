@@ -78,6 +78,7 @@ def cached_run_batch(
     use_double_correction,
     min_peak_height_uA,
     min_start_voltage,
+    scan_windows,
     scan_range,
     compute_skew,
     compute_wavelet_energy,
@@ -92,6 +93,7 @@ def cached_run_batch(
         use_double_correction=use_double_correction,
         min_peak_height_uA=min_peak_height_uA,
         min_start_voltage=min_start_voltage,
+        scan_windows=scan_windows,
         scan_range=scan_range,
         compute_skew=compute_skew,
         compute_wavelet_energy=compute_wavelet_energy,
@@ -124,6 +126,136 @@ def collect_titration_rows(
                 **row,
             })
     return rows
+
+
+LANGMUIR_METRIC_KEY = "peak_current"
+
+
+def supports_langmuir(metric_key: str) -> bool:
+    return metric_key == LANGMUIR_METRIC_KEY
+
+
+def format_scan_window(scan_window: Tuple[int, int]) -> str:
+    return f"{scan_window[0]}:{scan_window[1]}"
+
+
+def format_scan_windows(scan_windows: List[Tuple[int, int]]) -> str:
+    return ", ".join(format_scan_window(scan_window) for scan_window in scan_windows)
+
+
+def parse_scan_windows(
+    text: str,
+    base_scan_range: Optional[Tuple[int, int]] = None,
+) -> Tuple[List[Tuple[int, int]], List[str]]:
+    windows: List[Tuple[int, int]] = []
+    errors: List[str] = []
+    seen = set()
+
+    normalized = text.replace("&", "\n").replace(",", "\n")
+    for token in [part.strip() for part in normalized.splitlines() if part.strip()]:
+        if ":" not in token:
+            errors.append(f"Ignored '{token}': use start:end format.")
+            continue
+
+        start_text, end_text = [part.strip() for part in token.split(":", 1)]
+        try:
+            start = int(float(start_text))
+            end = int(float(end_text))
+        except ValueError:
+            errors.append(f"Ignored '{token}': start and end must be numbers.")
+            continue
+
+        if end <= start:
+            errors.append(f"Ignored '{token}': end must be greater than start.")
+            continue
+
+        if base_scan_range is not None:
+            start = max(start, int(base_scan_range[0]))
+            end = min(end, int(base_scan_range[1]))
+            if end <= start:
+                errors.append(
+                    f"Ignored '{token}': it falls outside the active scan range "
+                    f"{format_scan_window(base_scan_range)}."
+                )
+                continue
+
+        window = (start, end)
+        if window in seen:
+            continue
+
+        seen.add(window)
+        windows.append(window)
+
+    return windows, errors
+
+
+def scan_in_windows(scan_number: float, scan_windows: List[Tuple[int, int]]) -> bool:
+    return any(start <= scan_number < end for start, end in scan_windows)
+
+
+def vline_in_windows(vline_position: float, scan_windows: List[Tuple[int, int]]) -> bool:
+    return any(start <= vline_position <= end for start, end in scan_windows)
+
+
+def remap_scan_number(
+    scan_number: float,
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
+    scan_range: Optional[Tuple[int, int]] = None,
+) -> float:
+    if scan_windows:
+        offset = 0
+        for start, end in scan_windows:
+            if start <= scan_number < end:
+                return float(offset + (scan_number - start))
+            offset += end - start
+        raise ValueError(f"Scan {scan_number} is outside selected analysis windows.")
+    if scan_range is not None:
+        return float(scan_number - scan_range[0])
+    return float(scan_number)
+
+
+def remap_vline_position(
+    vline_position: float,
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
+    scan_range: Optional[Tuple[int, int]] = None,
+) -> float:
+    if scan_windows:
+        offset = 0
+        for start, end in scan_windows:
+            if start <= vline_position <= end:
+                return float(offset + (vline_position - start))
+            offset += end - start
+        raise ValueError(f"Vline {vline_position} is outside selected analysis windows.")
+    if scan_range is not None:
+        return float(vline_position - scan_range[0])
+    return float(vline_position)
+
+
+def remap_vlines_to_active_scan_range(
+    vlines,
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
+    scan_range: Optional[Tuple[int, int]] = None,
+):
+    if not vlines:
+        return []
+
+    if scan_windows:
+        remapped = []
+        for x, label in vlines:
+            if vline_in_windows(float(x), scan_windows):
+                remapped.append(
+                    (remap_vline_position(float(x), scan_windows=scan_windows), label)
+                )
+        return remapped
+
+    if scan_range is not None:
+        return [
+            (remap_vline_position(float(x), scan_range=scan_range), label)
+            for x, label in vlines
+            if scan_range[0] <= x <= scan_range[1]
+        ]
+
+    return list(vlines)
 
 
 # 
@@ -271,12 +403,40 @@ with st.sidebar:
 
     #  Scan range 
     st.subheader(" Scan Range")
-    use_scan_range = st.checkbox("Limit scan range", value=False)
+    use_scan_range = st.checkbox(
+        "Analyze subsection(s) of data",
+        value=False,
+        help=(
+            "Limit analysis to one or more scan windows. Enter windows using the original scan indices. "
+            "Windows use start:end slice-style bounds and are concatenated into the active dataset."
+        ),
+    )
     scan_range: Optional[Tuple[int, int]] = None
+    scan_windows: List[Tuple[int, int]] = []
     if use_scan_range:
-        sr_c1, sr_c2 = st.columns(2)
-        scan_range = (int(sr_c1.number_input("From", value=0, min_value=0)),
-                      int(sr_c2.number_input("To",   value=260, min_value=0)))
+        scan_windows_input = st.text_area(
+            "Scan window(s)",
+            value="0:260",
+            height=80,
+            help=(
+                "Use original scan indices in start:end format with end excluded. "
+                "Use commas to concatenate multiple chunks, or separate with & or new lines. "
+                "Example: 0:20, 20:40, 60:80, 80:100"
+            ),
+        )
+        scan_windows, scan_window_errors = parse_scan_windows(scan_windows_input)
+        for err in scan_window_errors:
+            st.warning(err)
+        if scan_windows:
+            st.caption(f"Active analysis windows: {format_scan_windows(scan_windows)}")
+            st.caption(
+                "These subsection windows are entered on the original scan index, "
+                "then concatenated into one continuous analysis axis."
+            )
+            if len(scan_windows) == 1:
+                scan_range = scan_windows[0]
+        elif scan_windows_input.strip():
+            st.error("No valid scan windows were parsed.")
 
     st.divider()
 
@@ -301,6 +461,10 @@ with st.sidebar:
                 vlines.append((float(parts[0].strip()), parts[1].strip()))
             except ValueError:
                 pass
+    st.caption(
+        "Vertical lines are entered using the original scan index. "
+        "When subsection analysis is active, matching vlines are remapped onto the concatenated analysis axis."
+    )
 
     enable_titration_analysis = st.checkbox(
         "Treat vline intervals as titration steps",
@@ -321,7 +485,7 @@ with st.sidebar:
         fit_titration_langmuir = st.checkbox(
             "Fit Langmuir-style curve to step plateaus",
             value=True,
-            help="Uses titration step index as a proxy x-axis and fits a simple Langmuir isotherm.",
+            help="Only applies to corrected peak-current plateaus and fits a Langmuir-to-saturation curve with an optional post-saturation polynomial tail.",
         )
 
     st.divider()
@@ -331,11 +495,12 @@ with st.sidebar:
     max_failed = st.number_input("Max failed traces to plot", value=40, min_value=1)
 
     st.divider()
+    scan_selection_invalid = use_scan_range and not scan_windows
 
     run_clicked = st.button(
         "  Run Analysis",
         type="primary",
-        disabled=not folders or bool(folder_errors),
+        disabled=not folders or bool(folder_errors) or scan_selection_invalid,
         use_container_width=True,
     )
 
@@ -358,7 +523,8 @@ if run_clicked and folders and not folder_errors:
                     use_double_correction=use_double_correction,
                     min_peak_height_uA=min_peak_height,
                     min_start_voltage=min_start_voltage,
-                    scan_range=scan_range,
+                    scan_windows=tuple(scan_windows),
+                    scan_range=None if scan_windows else scan_range,
                     compute_skew=compute_skew,
                     compute_wavelet_energy=compute_wavelet_energy,
                 )
@@ -381,7 +547,8 @@ if run_clicked and folders and not folder_errors:
                 use_double_correction=use_double_correction,
                 min_peak_height_uA=min_peak_height,
                 min_start_voltage=min_start_voltage,
-                scan_range=scan_range,
+                scan_windows=tuple(scan_windows),
+                scan_range=None if scan_windows else scan_range,
                 compute_skew=compute_skew,
                 compute_wavelet_energy=compute_wavelet_energy,
                 progress_callback=_progress,
@@ -445,7 +612,13 @@ if not compute_skew:
 if not compute_wavelet_energy:
     metric_cfg.pop("Wavelet energy", None)
 
-titration_ready = enable_titration_analysis and len(vlines) >= 2
+plot_scan_range = None if scan_windows else scan_range
+active_vlines = remap_vlines_to_active_scan_range(
+    vlines,
+    scan_windows=scan_windows,
+    scan_range=scan_range if use_scan_range and not scan_windows else None,
+)
+titration_ready = enable_titration_analysis and len(active_vlines) >= 2
 
 # 
 # Tabs
@@ -483,8 +656,8 @@ if view == "Overlays":
 
     for ch in channels_display:
         ch_res = [r for r in ok_results if r["channel"] == ch]
-        if scan_range:
-            ch_res = [r for r in ch_res if scan_range[0] <= r["scan_number"] <= scan_range[1]]
+        if plot_scan_range:
+            ch_res = [r for r in ch_res if plot_scan_range[0] <= r["scan_number"] <= plot_scan_range[1]]
         if not ch_res:
             continue
         with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(channels_display) <= 4):
@@ -536,6 +709,8 @@ if view == "Metrics":
                 f"Titration mode is on. Each vline interval becomes one step, and plateau values are "
                 f"estimated from the median of the middle {kept_pct}% of scans in that step."
             )
+            if fit_titration_langmuir:
+                st.caption("Langmuir fits are only shown for Peak current (corrected).")
 
     for label in selected_metrics:
         metric, ylabel = metric_cfg[label]
@@ -544,8 +719,8 @@ if view == "Metrics":
         if view_mode == "Combined":
             fig = plot_metric_vs_scan(
                 results, metric=metric, channels=channels_display,
-                title=label, ylabel=ylabel, vlines=vlines,
-                scan_range=scan_range, highlight_channel=highlight_ch,
+                title=label, ylabel=ylabel, vlines=active_vlines,
+                scan_range=plot_scan_range, highlight_channel=highlight_ch,
             )
             if fig:
                 st.pyplot(fig)
@@ -555,8 +730,8 @@ if view == "Metrics":
             for i, ch in enumerate(channels_display):
                 fig = plot_metric_vs_scan(
                     results, metric=metric, channels=[ch],
-                    title=f"Ch{ch}", ylabel=ylabel, vlines=vlines,
-                    scan_range=scan_range, figsize=(5, 3),
+                    title=f"Ch{ch}", ylabel=ylabel, vlines=active_vlines,
+                    scan_range=plot_scan_range, figsize=(5, 3),
                 )
                 if fig:
                     with cols[i % min(len(channels_display), 3)]:
@@ -572,8 +747,9 @@ if view == "Metrics":
                     channels=channels_display,
                     title=f"{label} | plateau fit",
                     ylabel=ylabel,
-                    vlines=vlines,
-                    scan_range=scan_range,
+                    vlines=active_vlines,
+                    scan_windows=None,
+                    scan_range=plot_scan_range,
                     edge_trim_fraction=titration_edge_trim_fraction,
                     highlight_channel=highlight_ch,
                 )
@@ -589,8 +765,9 @@ if view == "Metrics":
                         channels=[ch],
                         title=f"Ch{ch} | plateau fit",
                         ylabel=ylabel,
-                        vlines=vlines,
-                        scan_range=scan_range,
+                        vlines=active_vlines,
+                        scan_windows=None,
+                        scan_range=plot_scan_range,
                         edge_trim_fraction=titration_edge_trim_fraction,
                         figsize=(5, 3),
                     )
@@ -599,8 +776,11 @@ if view == "Metrics":
                             st.pyplot(fig)
                         plt.close(fig)
 
-            if fit_titration_langmuir:
-                st.caption("Langmuir-style fit of plateau midpoints")
+            if fit_titration_langmuir and supports_langmuir(metric):
+                fit_caption = "Langmuir-style fit of plateau midpoints"
+                if view_mode == "Combined" and highlight_ch is not None:
+                    fit_caption += f" (fitting Ch{highlight_ch} only)"
+                st.caption(fit_caption)
                 if view_mode == "Combined":
                     fig = plot_titration_langmuir(
                         results,
@@ -608,11 +788,13 @@ if view == "Metrics":
                         channels=channels_display,
                         title=f"{label} | Langmuir-style fit",
                         ylabel=ylabel,
-                        vlines=vlines,
-                        scan_range=scan_range,
+                        vlines=active_vlines,
+                        scan_windows=None,
+                        scan_range=plot_scan_range,
                         edge_trim_fraction=titration_edge_trim_fraction,
                         highlight_channel=highlight_ch,
                         fit_langmuir=True,
+                        fit_channels=[highlight_ch] if highlight_ch is not None else None,
                     )
                     if fig:
                         st.pyplot(fig)
@@ -626,8 +808,9 @@ if view == "Metrics":
                             channels=[ch],
                             title=f"Ch{ch} | Langmuir-style fit",
                             ylabel=ylabel,
-                            vlines=vlines,
-                            scan_range=scan_range,
+                            vlines=active_vlines,
+                            scan_windows=None,
+                            scan_range=plot_scan_range,
                             edge_trim_fraction=titration_edge_trim_fraction,
                             figsize=(5, 3),
                             fit_langmuir=True,
@@ -685,8 +868,8 @@ if view == "Drift":
         if drift_view_mode == "Combined":
             fig = plot_drift_vs_scan(
                 results, drift_metric=drift_key, channels=channels_display,
-                title=label, ylabel=ylabel, vlines=vlines,
-                scan_range=scan_range, highlight_channel=drift_highlight,
+                title=label, ylabel=ylabel, vlines=active_vlines,
+                scan_range=plot_scan_range, highlight_channel=drift_highlight,
             )
             if fig:
                 st.pyplot(fig)
@@ -698,8 +881,8 @@ if view == "Drift":
             for i, ch in enumerate(channels_display):
                 fig = plot_drift_vs_scan(
                     results, drift_metric=drift_key, channels=[ch],
-                    title=f"Ch{ch}", ylabel=ylabel, vlines=vlines,
-                    scan_range=scan_range, figsize=(5, 3),
+                    title=f"Ch{ch}", ylabel=ylabel, vlines=active_vlines,
+                    scan_range=plot_scan_range, figsize=(5, 3),
                 )
                 if fig:
                     with cols[i % min(len(channels_display), 3)]:
@@ -775,7 +958,7 @@ if view == "Data Table":
     st.subheader("Results table")
 
     scalar_keys = [
-        "channel", "scan_number", "file_name", "status",
+        "channel", "scan_number", "original_scan_number", "file_name", "status",
         "peak_voltage", "peak_current", "peak_current_raw",
         "skew", "peak_offset_norm", "wavelet_energy",
         "peak_voltage_drift", "skew_drift", "peak_offset_norm_drift", "error",
@@ -819,9 +1002,9 @@ if view == "Data Table":
                 for row in build_titration_step_table(
                     filtered_results,
                     metric=metric_key,
-                    vlines=vlines,
+                    vlines=active_vlines,
                     channels=ch_filter,
-                    scan_range=scan_range,
+                    scan_range=plot_scan_range,
                     edge_trim_fraction=titration_edge_trim_fraction,
                 ):
                     titration_rows.append({
@@ -884,7 +1067,7 @@ if view == "Export":
 
     st.markdown("####  Results CSV")
     export_keys = [
-        "channel", "scan_number", "timestamp", "file_name", "status",
+        "channel", "scan_number", "original_scan_number", "timestamp", "file_name", "status",
         "peak_voltage", "peak_current", "peak_current_raw",
         "skew", "peak_offset_norm", "wavelet_energy",
         "peak_voltage_drift", "skew_drift", "peak_offset_norm_drift", "error",
@@ -904,8 +1087,8 @@ if view == "Export":
                 results,
                 metric_cfg=metric_cfg,
                 channels=channels_display,
-                vlines=vlines,
-                scan_range=scan_range,
+                vlines=active_vlines,
+                scan_range=plot_scan_range,
                 edge_trim_fraction=titration_edge_trim_fraction,
             )
             if titration_export_rows:
@@ -940,7 +1123,7 @@ if view == "Export":
             for title, (metric, ylabel) in metric_cfg.items():
                 fig = plot_metric_vs_scan(results, metric=metric, channels=channels_display,
                                           title=title, ylabel=ylabel,
-                                          vlines=vlines, scan_range=scan_range)
+                                          vlines=active_vlines, scan_range=plot_scan_range)
                 if fig:
                     _save(fig, f"metrics/{metric}.{fig_format}")
 
@@ -952,22 +1135,24 @@ if view == "Export":
                         channels=channels_display,
                         title=f"{title} | plateau fit",
                         ylabel=ylabel,
-                        vlines=vlines,
-                        scan_range=scan_range,
+                        vlines=active_vlines,
+                        scan_windows=None,
+                        scan_range=plot_scan_range,
                         edge_trim_fraction=titration_edge_trim_fraction,
                     )
                     if fig:
                         _save(fig, f"titration/plateaus/{metric}.{fig_format}")
 
-                    if fit_titration_langmuir:
+                    if fit_titration_langmuir and supports_langmuir(metric):
                         fig = plot_titration_langmuir(
                             results,
                             metric=metric,
                             channels=channels_display,
                             title=f"{title} | Langmuir-style fit",
                             ylabel=ylabel,
-                            vlines=vlines,
-                            scan_range=scan_range,
+                            vlines=active_vlines,
+                            scan_windows=None,
+                            scan_range=plot_scan_range,
                             edge_trim_fraction=titration_edge_trim_fraction,
                             fit_langmuir=True,
                         )
@@ -981,14 +1166,14 @@ if view == "Export":
             ):
                 fig = plot_drift_vs_scan(results, drift_metric=dk, channels=channels_display,
                                          title=title, ylabel=ylabel,
-                                         vlines=vlines, scan_range=scan_range)
+                                         vlines=active_vlines, scan_range=plot_scan_range)
                 if fig:
                     _save(fig, f"drift/{dk}.{fig_format}")
 
             for ch in channels_display:
                 ch_res = [r for r in ok_results if r["channel"] == ch]
-                if scan_range:
-                    ch_res = [r for r in ch_res if scan_range[0] <= r["scan_number"] <= scan_range[1]]
+                if plot_scan_range:
+                    ch_res = [r for r in ch_res if plot_scan_range[0] <= r["scan_number"] <= plot_scan_range[1]]
                 for yk, lbl in (
                     ("corrected_current", "corrected"),
                     ("smoothed_corrected_current", "smoothed_corrected"),

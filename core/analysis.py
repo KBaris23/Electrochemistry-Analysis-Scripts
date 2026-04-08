@@ -466,6 +466,35 @@ def compute_drift_fields(all_results: List[dict]) -> List[dict]:
     return all_results
 
 
+def _scan_in_windows(
+    scan_number: int,
+    scan_windows: Optional[Tuple[Tuple[int, int], ...]],
+    scan_range: Optional[Tuple[int, int]],
+) -> bool:
+    if scan_windows:
+        return any(start <= scan_number < end for start, end in scan_windows)
+    if scan_range is not None:
+        return scan_range[0] <= scan_number <= scan_range[1]
+    return True
+
+
+def _remap_scan_number(
+    scan_number: int,
+    scan_windows: Optional[Tuple[Tuple[int, int], ...]],
+    scan_range: Optional[Tuple[int, int]],
+) -> int:
+    if scan_windows:
+        offset = 0
+        for start, end in scan_windows:
+            if start <= scan_number < end:
+                return offset + (scan_number - start)
+            offset += end - start
+        raise ValueError(f"Scan {scan_number} is outside selected scan windows.")
+    if scan_range is not None:
+        return scan_number - scan_range[0]
+    return scan_number
+
+
 def run_batch(
     folders: List[str],
     crop_range: Tuple[float, float] = (-0.6, -0.2),
@@ -478,6 +507,7 @@ def run_batch(
     use_double_correction: bool = False,
     min_peak_height_uA: Optional[float] = None,
     min_start_voltage: float = -0.6,
+    scan_windows: Optional[Tuple[Tuple[int, int], ...]] = None,
     scan_range: Optional[Tuple[int, int]] = None,
     compute_skew: bool = True,
     compute_wavelet_energy: bool = True,
@@ -527,18 +557,25 @@ def run_batch(
         scan_counters[ch] = scan_counters.get(ch, 0) + 1
         scan_number = scan_counters[ch]
 
-        # If a scan_range filter is active, skip analysis+storage for out-of-range
-        # scans BUT only after the counter has been incremented so numbering stays
-        # consistent with the full dataset.
-        if scan_range is not None and not (scan_range[0] <= scan_number <= scan_range[1]):
+        # If scan filtering is active, skip analysis+storage for out-of-range scans
+        # only after the counter has been incremented so numbering stays consistent
+        # with the full dataset.
+        if not _scan_in_windows(scan_number, scan_windows=scan_windows, scan_range=scan_range):
             continue
+
+        analysis_scan_number = _remap_scan_number(
+            scan_number,
+            scan_windows=scan_windows,
+            scan_range=scan_range,
+        )
 
         common = dict(
             channel=ch,
             channel_label=f"Ch{ch}",
             timestamp=f.ts,
             scan_id_from_name=f.scan,
-            scan_number=scan_number,
+            original_scan_number=scan_number,
+            scan_number=analysis_scan_number,
             folder_index=f.folder_index,
             file_path=f.path,
             file_name=os.path.basename(f.path),
