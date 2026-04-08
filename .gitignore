@@ -1,7 +1,9 @@
 .venv64/
 __pycache__/
+**/__pycache__/
 core/__pycache__
 *.pyc
+**/*.pyc
 .env
 .env.*
 .DS_Store
