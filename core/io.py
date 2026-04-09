@@ -7,12 +7,15 @@ import numpy as np
 import pandas as pd
 
 FILENAME_RE = re.compile(
-    r"^swv_ch(?P<ch>\d+)_([0-9a-f]+)_meas_(?P<date>\d{8})_(?P<time>\d{4})_(?P<scan>\d+)_ch(?P<ch2>\d+)\.csv$",
+    r"^(?P<mode>swv|cv)_ch(?P<ch>\d+)_([0-9a-f]+)_meas_"
+    r"(?P<date>\d{8})_(?P<time>\d{4})_(?P<scan>\d+)_ch(?P<ch2>\d+)\.csv$",
     re.IGNORECASE,
 )
 
+
 @dataclass(frozen=True)
-class SWVFile:
+class MeasurementFile:
+    mode: str
     scan: int
     ch: int
     ts: int
@@ -20,8 +23,16 @@ class SWVFile:
     folder_index: int
 
 
-def collect_swv_csvs_from_folders(folders: List[str]) -> List[SWVFile]:
-    out: List[SWVFile] = []
+# Backward-compatible alias used across the existing SWV pipeline.
+SWVFile = MeasurementFile
+
+
+def collect_measurement_csvs_from_folders(
+    folders: List[str],
+    mode: Optional[str] = None,
+) -> List[MeasurementFile]:
+    wanted_mode = mode.lower() if mode else None
+    out: List[MeasurementFile] = []
     for folder_index, folder in enumerate(folders):
         if not os.path.isdir(folder):
             raise ValueError(f"Folder not found: {folder}")
@@ -31,12 +42,16 @@ def collect_swv_csvs_from_folders(folders: List[str]) -> List[SWVFile]:
             m = FILENAME_RE.match(fn)
             if not m:
                 continue
+            file_mode = m.group("mode").lower()
+            if wanted_mode is not None and file_mode != wanted_mode:
+                continue
             ch = int(m.group("ch"))
             if int(m.group("ch2")) != ch:
                 continue
             ts = int(f"{m.group('date')}{m.group('time')}")
             out.append(
-                SWVFile(
+                MeasurementFile(
+                    mode=file_mode,
                     scan=int(m.group("scan")),
                     ch=ch,
                     ts=ts,
@@ -45,6 +60,14 @@ def collect_swv_csvs_from_folders(folders: List[str]) -> List[SWVFile]:
                 )
             )
     return out
+
+
+def collect_swv_csvs_from_folders(folders: List[str]) -> List[SWVFile]:
+    return collect_measurement_csvs_from_folders(folders, mode="swv")
+
+
+def collect_cv_csvs_from_folders(folders: List[str]) -> List[MeasurementFile]:
+    return collect_measurement_csvs_from_folders(folders, mode="cv")
 
 
 def group_by_channel_and_sort(files: List[SWVFile]) -> Dict[int, List[SWVFile]]:

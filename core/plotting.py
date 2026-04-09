@@ -661,6 +661,7 @@ def plot_metric_vs_scan(
     scan_range: Optional[Tuple[int, int]] = None,
 
     figsize: Tuple[int, int] = (10, 4),
+    xlabel: str = "Scan number",
 
     highlight_channel: Optional[int] = None,
 
@@ -728,7 +729,7 @@ def plot_metric_vs_scan(
 
 
 
-    ax.set_xlabel("Scan number")
+    ax.set_xlabel(xlabel)
 
     ax.set_ylabel(ylabel or metric)
 
@@ -989,6 +990,7 @@ def plot_titration_langmuir(
     edge_trim_fraction: float = 0.15,
     figsize: Tuple[int, int] = (8, 4),
     highlight_channel: Optional[int] = None,
+    xlabel: str = "Scan number",
     fit_langmuir: bool = True,
     fit_channels: Optional[List[int]] = None,
 ) -> Optional[plt.Figure]:
@@ -1177,6 +1179,8 @@ def plot_drift_vs_scan(
 
     figsize: Tuple[int, int] = (10, 4),
 
+    xlabel: str = "Scan number",
+
 ) -> Optional[plt.Figure]:
 
     all_ch = sorted({r["channel"] for r in all_results})
@@ -1249,7 +1253,7 @@ def plot_drift_vs_scan(
 
 
 
-    ax.set_xlabel("Scan number")
+    ax.set_xlabel(xlabel)
 
     ax.set_ylabel(ylabel or drift_metric)
 
