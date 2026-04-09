@@ -173,7 +173,12 @@ def _cmap_fig(
 
             y = r[y_key]
 
-            peak_idx = r.get("peak_idx")
+            peak_idx_key = (
+                "peak_idx_corr"
+                if y_key in ("corrected_current", "smoothed_corrected_current")
+                else "peak_idx"
+            )
+            peak_idx = r.get(peak_idx_key)
 
             if peak_idx is not None and 0 <= peak_idx < len(v):
 

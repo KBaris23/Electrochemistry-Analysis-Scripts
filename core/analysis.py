@@ -1,4 +1,5 @@
 import os
+import re
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
@@ -20,10 +21,59 @@ from .processing import (
     rotate_offset_using_bracketing_minima,
 )
 
+SWV_LOOP_RE = re.compile(
+    r"meas_loop_swv\s+\S+\s+\S+\s+\S+\s+\S+\s+"
+    r"(?P<start>[-\d.]+m)\s+"
+    r"(?P<end>[-\d.]+m)\s+"
+    r"(?P<step>[-\d.]+m)\s+"
+    r"(?P<amplitude>[-\d.]+m)\s+"
+    r"(?P<frequency>[-\d.]+)",
+    re.IGNORECASE,
+)
+
 
 def _file_signature(filepath: str) -> Tuple[int, int]:
     stat = os.stat(filepath)
     return int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def _infer_method_path(csv_path: str) -> str:
+    folder = os.path.dirname(csv_path)
+    stem, _ = os.path.splitext(os.path.basename(csv_path))
+    return os.path.join(folder, "methods_used", f"{stem}.ms")
+
+
+def _format_frequency_label(frequency_hz: Optional[float]) -> str:
+    if frequency_hz is None:
+        return "Unknown method"
+    if float(frequency_hz).is_integer():
+        return f"{int(frequency_hz)} Hz"
+    return f"{float(frequency_hz):g} Hz"
+
+
+@lru_cache(maxsize=512)
+def load_swv_method_metadata(method_path: str) -> dict:
+    meta = {
+        "method_path": method_path,
+        "method_exists": False,
+        "swv_frequency_hz": None,
+        "swv_method_group": "Unknown method",
+    }
+    if not os.path.exists(method_path):
+        return meta
+
+    meta["method_exists"] = True
+    with open(method_path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+
+    loop_match = SWV_LOOP_RE.search(text)
+    if not loop_match:
+        return meta
+
+    frequency_hz = float(loop_match.group("frequency"))
+    meta["swv_frequency_hz"] = frequency_hz
+    meta["swv_method_group"] = _format_frequency_label(frequency_hz)
+    return meta
 
 
 @lru_cache(maxsize=512)
@@ -579,6 +629,13 @@ def run_batch(
             folder_index=f.folder_index,
             file_path=f.path,
             file_name=os.path.basename(f.path),
+        )
+        method_meta = load_swv_method_metadata(_infer_method_path(f.path))
+        common.update(
+            method_path=method_meta.get("method_path"),
+            method_exists=method_meta.get("method_exists"),
+            swv_frequency_hz=method_meta.get("swv_frequency_hz"),
+            swv_method_group=method_meta.get("swv_method_group"),
         )
 
         processed = _process_file_cached(

@@ -3,6 +3,7 @@ SWV Batch Analysis  Streamlit UI
 Run with:  python -m streamlit run app.py
 """
 
+import bisect
 import io
 import os
 import subprocess
@@ -16,6 +17,7 @@ import streamlit as st
 
 from core import (
     build_titration_step_table,
+    compute_drift_fields,
     plot_cv_overlaid_cycles,
     plot_cv_trace,
     plot_drift_vs_scan,
@@ -274,6 +276,87 @@ def remap_vlines_to_active_scan_range(
         ]
 
     return list(vlines)
+
+
+def _method_group_sort_key(label: str) -> Tuple[int, float, str]:
+    if label.endswith(" Hz"):
+        number_text = label[:-3].strip()
+        try:
+            return (0, float(number_text), label)
+        except ValueError:
+            pass
+    return (1, float("inf"), label)
+
+
+def remap_vlines_to_filtered_scan_axis(
+    vlines: List[Tuple[float, str]],
+    kept_scan_numbers: List[float],
+) -> List[Tuple[float, str]]:
+    if not vlines or not kept_scan_numbers:
+        return []
+
+    sorted_scans = sorted(float(x) for x in kept_scan_numbers)
+    exact_map = {scan_number: idx + 1 for idx, scan_number in enumerate(sorted_scans)}
+    remapped: List[Tuple[float, str]] = []
+
+    for x, label in vlines:
+        scan_x = float(x)
+        insert_at = bisect.bisect_left(sorted_scans, scan_x)
+
+        if insert_at < len(sorted_scans) and sorted_scans[insert_at] == scan_x:
+            remapped.append((float(exact_map[scan_x]), label))
+            continue
+
+        if 0 < insert_at < len(sorted_scans):
+            remapped.append((float(insert_at) + 0.5, label))
+
+    return remapped
+
+
+def reindex_swv_results_for_display(
+    results: List[dict],
+    vlines: List[Tuple[float, str]],
+) -> Tuple[List[dict], List[Tuple[float, str]], Optional[Tuple[int, int]]]:
+    if not results:
+        return [], [], None
+
+    rows_by_channel = {}
+    for row in results:
+        channel = row.get("channel")
+        scan_number = row.get("scan_number")
+        if channel is None or scan_number is None:
+            continue
+        rows_by_channel.setdefault(channel, []).append(row)
+
+    if not rows_by_channel:
+        return list(results), [], None
+
+    reindexed_rows = {}
+    for channel, channel_rows in rows_by_channel.items():
+        ordered_rows = sorted(channel_rows, key=lambda r: float(r["scan_number"]))
+        for idx, row in enumerate(ordered_rows, start=1):
+            updated = dict(row)
+            updated["filtered_source_scan_number"] = row.get("scan_number")
+            updated["scan_number"] = idx
+            reindexed_rows[id(row)] = updated
+
+    reindexed_results: List[dict] = [
+        reindexed_rows.get(id(row), dict(row))
+        for row in results
+    ]
+
+    compute_drift_fields(reindexed_results)
+    reference_channel = max(
+        rows_by_channel,
+        key=lambda ch: (len(rows_by_channel[ch]), -int(ch)),
+    )
+    reference_scan_numbers = sorted(
+        float(row["filtered_source_scan_number"])
+        for row in reindexed_rows.values()
+        if row.get("channel") == reference_channel and row.get("filtered_source_scan_number") is not None
+    )
+    remapped_vlines = remap_vlines_to_filtered_scan_axis(vlines, reference_scan_numbers)
+    return reindexed_results, remapped_vlines, (1, len(reference_scan_numbers))
 
 
 # 
@@ -717,28 +800,6 @@ if analysis_mode == "CV":
         "CV files are segmented into repeated cycles using the method metadata and turning points in the voltage trace."
     )
 
-ok_results     = [r for r in results if r.get("status") == "OK"]
-failed_results = [r for r in results if r.get("status") == "FAILED"]
-all_channels   = sorted({r["channel"] for r in results})
-channels_display = channels_to_plot if channels_to_plot else all_channels
-ch_options = ["All channels"] + [f"Ch{ch}" for ch in channels_display]
-
-#  Summary banner 
-c1, c2, c3, c4 = st.columns(4)
-if analysis_mode == "CV":
-    total_files = len({r.get("file_path") for r in results if r.get("file_path")})
-    c1.metric("Cycles", len(results))
-    c2.metric("Files", total_files)
-    c3.metric("Failed cycles", len(failed_results))
-    c4.metric("Channels found", len(all_channels))
-else:
-    c1.metric("Total files", len(results))
-    c2.metric(" Successful", len(ok_results))
-    c3.metric(" Failed", len(failed_results))
-    c4.metric("Channels found", len(all_channels))
-
-st.divider()
-
 if analysis_mode == "CV":
     metric_cfg = {
         "Oxidation peak current": ("oxidation_peak_current", "Oxidation Peak Current (uA)"),
@@ -769,8 +830,76 @@ active_vlines = remap_vlines_to_active_scan_range(
     scan_windows=scan_windows,
     scan_range=scan_range if use_scan_range and not scan_windows else None,
 )
+swv_method_filter_enabled = False
+swv_method_filter_applied = False
+selected_swv_method_groups: List[str] = []
+if analysis_mode == "SWV":
+    available_method_groups = sorted(
+        {r.get("swv_method_group", "Unknown method") for r in results},
+        key=_method_group_sort_key,
+    )
+    if available_method_groups:
+        mf_c1, mf_c2 = st.columns([1, 3])
+        swv_method_filter_enabled = mf_c1.checkbox(
+            "Filter by SWV method",
+            value=False,
+            help="Uses the SWV method file to split the dataset into method groups without rerunning analysis.",
+        )
+        if swv_method_filter_enabled:
+            selected_swv_method_groups = mf_c2.multiselect(
+                "SWV method groups",
+                options=available_method_groups,
+                default=available_method_groups,
+                help="Selected groups are concatenated into a fresh sequential scan axis for display.",
+            )
+        else:
+            selected_swv_method_groups = available_method_groups
+
+        selected_group_set = set(selected_swv_method_groups)
+        swv_method_filter_applied = swv_method_filter_enabled and (
+            selected_group_set != set(available_method_groups)
+        )
+        if swv_method_filter_applied:
+            results = [
+                r for r in results
+                if r.get("swv_method_group", "Unknown method") in selected_group_set
+            ]
+            results, active_vlines, plot_scan_range = reindex_swv_results_for_display(results, active_vlines)
+            st.caption(
+                "SWV method filtering is display-only. The filtered subset is concatenated and renumbered "
+                "without rerunning the expensive analysis."
+            )
+
 titration_ready = enable_titration_analysis and len(active_vlines) >= 2
-x_axis_label = "Cycle number" if analysis_mode == "CV" else "Scan number"
+x_axis_label = (
+    "Cycle number"
+    if analysis_mode == "CV"
+    else ("Filtered scan number" if swv_method_filter_applied else "Scan number")
+)
+ok_results     = [r for r in results if r.get("status") == "OK"]
+failed_results = [r for r in results if r.get("status") == "FAILED"]
+all_channels   = sorted({r["channel"] for r in results})
+channels_display = channels_to_plot if channels_to_plot else all_channels
+ch_options = ["All channels"] + [f"Ch{ch}" for ch in channels_display]
+
+#  Summary banner 
+c1, c2, c3, c4 = st.columns(4)
+if analysis_mode == "CV":
+    total_files = len({r.get("file_path") for r in results if r.get("file_path")})
+    c1.metric("Cycles", len(results))
+    c2.metric("Files", total_files)
+    c3.metric("Failed cycles", len(failed_results))
+    c4.metric("Channels found", len(all_channels))
+else:
+    c1.metric("Total files", len(results))
+    c2.metric(" Successful", len(ok_results))
+    c3.metric(" Failed", len(failed_results))
+    c4.metric("Channels found", len(all_channels))
+
+st.divider()
+if not results:
+    st.info("No measurements match the current SWV method filter.")
+    st.stop()
 
 # 
 # Tabs
@@ -1278,7 +1407,9 @@ if view == "Data Table":
         ]
     else:
         scalar_keys = [
-            "channel", "scan_number", "original_scan_number", "file_name", "status",
+            "channel", "swv_method_group", "swv_frequency_hz",
+            "scan_number", "filtered_source_scan_number", "original_scan_number",
+            "file_name", "status",
             "peak_voltage", "peak_current", "peak_current_raw",
             "skew", "peak_offset_norm", "wavelet_energy",
             "peak_voltage_drift", "skew_drift", "peak_offset_norm_drift", "error",
@@ -1368,6 +1499,10 @@ if view == "Data Table":
             meta_cols[1].caption(f"Scan: {chosen.get('scan_number', '')}")
             meta_cols[2].caption(f"Status: {chosen.get('status', '')}")
             meta_cols[3].caption(f"File: {chosen.get('file_name', '')}")
+            if chosen.get("swv_method_group"):
+                st.caption(f"Method group: {chosen.get('swv_method_group')}")
+            if chosen.get("filtered_source_scan_number") is not None:
+                st.caption(f"Source scan on prior axis: {chosen.get('filtered_source_scan_number')}")
 
             if chosen.get("error"):
                 st.caption(f"Error: {chosen.get('error')}")
@@ -1413,7 +1548,9 @@ if view == "Export":
         ]
     else:
         export_keys = [
-            "channel", "scan_number", "original_scan_number", "timestamp", "file_name", "status",
+            "channel", "swv_method_group", "swv_frequency_hz",
+            "scan_number", "filtered_source_scan_number", "original_scan_number",
+            "timestamp", "file_name", "status",
             "peak_voltage", "peak_current", "peak_current_raw",
             "skew", "peak_offset_norm", "wavelet_energy",
             "peak_voltage_drift", "skew_drift", "peak_offset_norm_drift", "error",
