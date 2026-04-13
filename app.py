@@ -148,12 +148,36 @@ def collect_titration_rows(
     return rows
 
 
-LANGMUIR_METRIC_KEY = "peak_current"
+LANGMUIR_METRIC_KEY = "peak_current_selected"
 DEFAULT_SWV_VLINES_TEXT = ""
 
 
 def supports_langmuir(metric_key: str) -> bool:
     return metric_key == LANGMUIR_METRIC_KEY
+
+
+def annotate_swv_peak_height_metrics(
+    results: List[dict],
+    selected_peak_height_source: str,
+) -> List[dict]:
+    for row in results:
+        corrected_height = row.get("peak_current")
+        row["peak_current_corrected"] = corrected_height
+
+        smoothed_height = float("nan")
+        peak_idx_corr = row.get("peak_idx_corr")
+        smoothed_trace = row.get("smoothed_corrected_current")
+        try:
+            idx = int(peak_idx_corr)
+            if smoothed_trace is not None and 0 <= idx < len(smoothed_trace):
+                smoothed_height = float(smoothed_trace[idx])
+        except (TypeError, ValueError, IndexError):
+            pass
+
+        row["peak_current_smoothed_corrected"] = smoothed_height
+        row["peak_current_selected"] = row.get(selected_peak_height_source, corrected_height)
+
+    return results
 
 
 def format_scan_window(scan_window: Tuple[int, int]) -> str:
@@ -863,6 +887,43 @@ if analysis_mode == "CV":
         "CV files are segmented into repeated cycles using the method metadata and turning points in the voltage trace."
     )
 
+selected_peak_height_source = "peak_current"
+selected_peak_height_metric_label = "Peak current (corrected)"
+selected_peak_height_ylabel = "Corrected Peak Height (uA)"
+if analysis_mode == "SWV":
+    peak_height_source_options = {
+        "Corrected": (
+            "peak_current",
+            "Peak current (corrected)",
+            "Corrected Peak Height (uA)",
+        ),
+        "Corrected + smoothed": (
+            "peak_current_smoothed_corrected",
+            "Peak current (corrected + smoothed)",
+            "Corrected + Smoothed Peak Height (uA)",
+        ),
+    }
+    peak_source_label = st.radio(
+        "SWV peak height source",
+        options=list(peak_height_source_options.keys()),
+        horizontal=True,
+        key="swv_peak_height_source_label",
+        help=(
+            "Peak position still comes from the smoothed corrected trace. "
+            "This only changes which y-value is reported as the SWV peak height."
+        ),
+    )
+    (
+        selected_peak_height_source,
+        selected_peak_height_metric_label,
+        selected_peak_height_ylabel,
+    ) = peak_height_source_options[peak_source_label]
+    results = annotate_swv_peak_height_metrics(results, selected_peak_height_source)
+    st.caption(
+        "Peak location is still taken from the corrected-and-smoothed peak index. "
+        "This switch only changes the reported peak height value."
+    )
+
 if analysis_mode == "CV":
     metric_cfg = {
         "Oxidation peak current": ("oxidation_peak_current", "Oxidation Peak Current (uA)"),
@@ -875,7 +936,7 @@ if analysis_mode == "CV":
     }
 else:
     metric_cfg = {
-        "Peak current (corrected)": ("peak_current",     "Corrected Peak Height (uA)"),
+        selected_peak_height_metric_label: ("peak_current_selected", selected_peak_height_ylabel),
         "Peak current (raw)":       ("peak_current_raw", "Raw Current at Peak (uA)"),
         "Bracket width (V)":        ("bracket_width_V",  "Distance between left/right correction anchors (V)"),
         "Skew":                     ("skew",             "Skew (corrected trace)"),
@@ -1185,7 +1246,7 @@ if view == "Metrics":
                 f"estimated from the median of the middle {kept_pct}% of scans in that step."
             )
             if fit_titration_langmuir:
-                st.caption("Langmuir fits are only shown for Peak current (corrected).")
+                st.caption(f"Langmuir fits are only shown for {selected_peak_height_metric_label}.")
 
     for label in selected_metrics:
         metric, ylabel = metric_cfg[label]
@@ -1548,7 +1609,8 @@ if view == "Data Table":
             "channel", "swv_method_group", "swv_frequency_hz",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
             "file_name", "status",
-            "peak_voltage", "peak_current", "peak_current_raw", "bracket_width_V",
+            "peak_voltage", "peak_current_selected", "peak_current", "peak_current_smoothed_corrected",
+            "peak_current_raw", "bracket_width_V",
             "skew", "peak_offset_norm", "wavelet_energy",
             "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
@@ -1575,8 +1637,8 @@ if view == "Data Table":
             st.info("Add at least two vertical lines inside the active scan range to build titration steps.")
         else:
             default_titration_metrics = (
-                ["Peak current (corrected)"]
-                if "Peak current (corrected)" in metric_cfg
+                [selected_peak_height_metric_label]
+                if selected_peak_height_metric_label in metric_cfg
                 else list(metric_cfg.keys())[:1]
             )
             titration_metric_labels = st.multiselect(
@@ -1689,7 +1751,8 @@ if view == "Export":
             "channel", "swv_method_group", "swv_frequency_hz",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
             "timestamp", "file_name", "status",
-            "peak_voltage", "peak_current", "peak_current_raw", "bracket_width_V",
+            "peak_voltage", "peak_current_selected", "peak_current", "peak_current_smoothed_corrected",
+            "peak_current_raw", "bracket_width_V",
             "skew", "peak_offset_norm", "wavelet_energy",
             "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
