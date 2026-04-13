@@ -5,6 +5,7 @@ Run with:  python -m streamlit run app.py
 
 import bisect
 import io
+import json
 import os
 import subprocess
 import sys
@@ -146,6 +147,85 @@ def collect_titration_rows(
                 **row,
             })
     return rows
+
+
+def _serialize_vlines(vlines: List[Tuple[float, str]]) -> str:
+    return json.dumps(
+        [
+            {"scan": float(scan_value), "label": str(label)}
+            for scan_value, label in vlines
+        ],
+        separators=(",", ":"),
+    )
+
+
+def build_export_metadata(
+    analysis_mode: str,
+    crop_range: Tuple[float, float],
+    smooth_window: int,
+    smooth_polyorder: int,
+    active_vlines: List[Tuple[float, str]],
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
+    scan_range: Optional[Tuple[int, int]] = None,
+    minima_search_window_V: Optional[float] = None,
+    min_peak_height_uA: Optional[float] = None,
+    min_start_voltage_V: Optional[float] = None,
+    edge_trim_fraction: Optional[float] = None,
+    min_peak_prominence_uA: Optional[float] = None,
+    titration_edge_trim_fraction: Optional[float] = None,
+    peak_height_source_key: Optional[str] = None,
+    peak_height_source_label: Optional[str] = None,
+) -> dict:
+    metadata = {
+        "analysis_crop_min_V": float(crop_range[0]),
+        "analysis_crop_max_V": float(crop_range[1]),
+        "analysis_smooth_window": int(smooth_window),
+        "analysis_smooth_polyorder": int(smooth_polyorder),
+        "analysis_scan_range_start": (
+            float(scan_range[0]) if scan_range is not None else None
+        ),
+        "analysis_scan_range_end": (
+            float(scan_range[1]) if scan_range is not None else None
+        ),
+        "analysis_scan_windows": format_scan_windows(scan_windows) if scan_windows else "",
+        "analysis_vline_count": int(len(active_vlines)),
+        "analysis_vlines_json": _serialize_vlines(active_vlines),
+    }
+
+    if analysis_mode == "SWV":
+        metadata.update(
+            analysis_minima_search_window_V=(
+                float(minima_search_window_V)
+                if minima_search_window_V is not None else None
+            ),
+            analysis_min_peak_height_uA=(
+                float(min_peak_height_uA)
+                if min_peak_height_uA is not None else None
+            ),
+            analysis_min_start_voltage_V=(
+                float(min_start_voltage_V)
+                if min_start_voltage_V is not None else None
+            ),
+            analysis_titration_edge_trim_fraction=(
+                float(titration_edge_trim_fraction)
+                if titration_edge_trim_fraction is not None else None
+            ),
+            analysis_peak_height_source_key=peak_height_source_key or "",
+            analysis_peak_height_source_label=peak_height_source_label or "",
+        )
+    else:
+        metadata.update(
+            analysis_edge_trim_fraction=(
+                float(edge_trim_fraction)
+                if edge_trim_fraction is not None else None
+            ),
+            analysis_min_peak_prominence_uA=(
+                float(min_peak_prominence_uA)
+                if min_peak_prominence_uA is not None else None
+            ),
+        )
+
+    return metadata
 
 
 LANGMUIR_METRIC_KEY = "peak_current_selected"
@@ -888,6 +968,7 @@ if analysis_mode == "CV":
     )
 
 selected_peak_height_source = "peak_current"
+selected_peak_height_source_label = "Corrected"
 selected_peak_height_metric_label = "Peak current (corrected)"
 selected_peak_height_ylabel = "Corrected Peak Height (uA)"
 if analysis_mode == "SWV":
@@ -918,6 +999,7 @@ if analysis_mode == "SWV":
         selected_peak_height_metric_label,
         selected_peak_height_ylabel,
     ) = peak_height_source_options[peak_source_label]
+    selected_peak_height_source_label = peak_source_label
     results = annotate_swv_peak_height_metrics(results, selected_peak_height_source)
     st.caption(
         "Peak location is still taken from the corrected-and-smoothed peak index. "
@@ -1735,6 +1817,37 @@ if view == "Data Table":
 if view == "Export":
     st.subheader("Export results")
 
+    export_metadata = build_export_metadata(
+        analysis_mode=analysis_mode,
+        crop_range=(crop_min, crop_max),
+        smooth_window=smooth_window,
+        smooth_polyorder=smooth_polyorder,
+        active_vlines=active_vlines,
+        scan_windows=scan_windows,
+        scan_range=plot_scan_range,
+        minima_search_window_V=minima_search_window if analysis_mode == "SWV" else None,
+        min_peak_height_uA=min_peak_height if analysis_mode == "SWV" else None,
+        min_start_voltage_V=min_start_voltage if analysis_mode == "SWV" else None,
+        edge_trim_fraction=edge_trim_fraction if analysis_mode == "CV" else None,
+        min_peak_prominence_uA=min_peak_prominence if analysis_mode == "CV" else None,
+        titration_edge_trim_fraction=titration_edge_trim_fraction if analysis_mode == "SWV" else None,
+        peak_height_source_key=selected_peak_height_source if analysis_mode == "SWV" else None,
+        peak_height_source_label=selected_peak_height_source_label if analysis_mode == "SWV" else None,
+    )
+
+    st.markdown("####  Signal Processing Inputs CSV")
+    signal_processing_csv = pd.DataFrame([export_metadata]).to_csv(index=False).encode()
+    st.download_button(
+        "  Download signal_processing_inputs.csv",
+        data=signal_processing_csv,
+        file_name=(
+            "cv_signal_processing_inputs.csv"
+            if analysis_mode == "CV" else "swv_signal_processing_inputs.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True,
+    )
+
     st.markdown("####  Results CSV")
     if analysis_mode == "CV":
         export_keys = [
@@ -1748,7 +1861,7 @@ if view == "Export":
         ]
     else:
         export_keys = [
-            "channel", "swv_method_group", "swv_frequency_hz",
+            "channel", "swv_method_group", "frequency_hz",
             "scan_number", "filtered_source_scan_number", "original_scan_number",
             "timestamp", "file_name", "status",
             "peak_voltage", "peak_current_selected", "peak_current", "peak_current_smoothed_corrected",
@@ -1756,8 +1869,16 @@ if view == "Export":
             "skew", "peak_offset_norm", "wavelet_energy",
             "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
-    csv_bytes = pd.DataFrame([{k: r.get(k) for k in export_keys} for r in results])\
-                  .to_csv(index=False).encode()
+    csv_rows = []
+    for r in results:
+        row = {}
+        for k in export_keys:
+            if analysis_mode == "SWV" and k == "frequency_hz":
+                row[k] = r.get("swv_frequency_hz")
+            else:
+                row[k] = r.get(k)
+        csv_rows.append(row)
+    csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode()
     st.download_button("  Download results.csv", data=csv_bytes,
                        file_name="cv_results.csv" if analysis_mode == "CV" else "swv_results.csv", mime="text/csv",
                        use_container_width=True)
