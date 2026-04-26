@@ -317,7 +317,7 @@ Background RMS = sqrt( (1 / |O|) * sum_{k in O} I_k^2 )
 
 This metric is intentionally computed outside the SWV crop window so the peak-analysis region does not directly drive the background estimate.
 
-## Background drift correction
+## Background drift metrics
 
 For each channel, the app uses the median background RMS of the first 3 valid scans as the reference:
 
@@ -345,19 +345,35 @@ and the background drift percent shown in the UI is:
 Background drift (%) = 100 * D(t)
 ```
 
-If the selected SWV peak height is `P_selected(t)`, then the background-drift-corrected peak is:
+This RMS-based quantity is best treated as a diagnostic drift metric. Because RMS is always positive, it does not preserve the sign of an additive baseline shift, and it can increase either because the baseline moved or because the noise amplitude changed.
+
+## Experimental additive background recentering
+
+If you enable the experimental additive background recentering option in the SWV analysis sidebar, the app also computes the outside-crop median raw current for each scan:
 
 ```text
-P_corr,bg(t) = P_selected(t) / R_norm(t)
+b(t) = median( I_k ) over k in O
 ```
 
-or equivalently:
+Using the median of the first 3 valid scans in each channel as the reference background:
 
 ```text
-P_corr,bg(t) = P_selected(t) * (R_ref / R_t)
+b_ref = median(b_1, b_2, b_3)
 ```
 
-This correction is an experimental normalization layer. It assumes that scan-to-scan changes in the outside-crop RMS act as a multiplicative background drift on the selected peak height.
+the signed additive offset is:
+
+```text
+Delta_b(t) = b(t) - b_ref
+```
+
+The cropped raw SWV trace is then recentered before the usual baseline-correction workflow is rerun:
+
+```text
+I_recentered(V, t) = I_raw(V, t) - Delta_b(t)
+```
+
+The reported background-recentered peak is measured from that recentered trace after the standard SWV correction steps. This mode is opt-in and intended for comparison rather than as the default analysis path.
 
 ## Using core modules directly (no UI)
 

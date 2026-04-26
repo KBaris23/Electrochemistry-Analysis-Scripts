@@ -232,6 +232,14 @@ def _compute_outside_crop_rms(i_raw: np.ndarray, crop_mask: np.ndarray) -> float
     return float(np.sqrt(np.mean(outside ** 2)))
 
 
+def _compute_outside_crop_median(i_raw: np.ndarray, crop_mask: np.ndarray) -> float:
+    signal = np.asarray(i_raw, dtype=float)
+    outside = signal[~np.asarray(crop_mask, dtype=bool)]
+    if outside.size == 0:
+        return np.nan
+    return float(np.median(outside))
+
+
 def analyze_swv_file(
     filepath: str,
     crop_range: Tuple[float, float] = (-0.6, -0.2),
@@ -293,6 +301,7 @@ def analyze_swv_arrays(
 ) -> dict:
     mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
     background_rms = _compute_outside_crop_rms(i_raw, mask)
+    background_median = _compute_outside_crop_median(i_raw, mask)
     v, i = v_raw[mask], i_raw[mask]
 
     if len(v) < 5:
@@ -361,6 +370,7 @@ def analyze_swv_arrays(
     return {
         "file_path": file_path,
         "background_current_rms": background_rms,
+        "background_current_median": background_median,
         "voltage": v,
         "raw_current": i,
         "smoothed_current": i_smooth,
@@ -435,6 +445,7 @@ def partial_traces_for_failure_arrays(
 ) -> dict:
     initial_mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
     base = dict(background_current_rms=_compute_outside_crop_rms(i_raw, initial_mask),
+                background_current_median=_compute_outside_crop_median(i_raw, initial_mask),
                 voltage=None, raw_current=None, smoothed_current=None,
                 wavelet_denoised_current=None,
                 smoothed_corrected_current=None,
@@ -768,7 +779,7 @@ def run_batch(
                 "status": "FAILED",
                 "error": processed["error"],
                 **{k: partial.get(k) for k in (
-                    "background_current_rms",
+                    "background_current_rms", "background_current_median",
                     "voltage", "raw_current", "smoothed_current",
                     "wavelet_denoised_current",
                     "corrected_current", "smoothed_corrected_current",
