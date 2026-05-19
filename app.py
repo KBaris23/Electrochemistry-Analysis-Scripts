@@ -11,6 +11,7 @@ import zipfile
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import pandas as pd
 import streamlit as st
 
@@ -124,6 +125,134 @@ def collect_titration_rows(
                 **row,
             })
     return rows
+
+
+def _figure_to_image(fig: plt.Figure, dpi: int = 150):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return plt.imread(buf)
+
+
+def _write_pdf_plot_page(
+    pdf: PdfPages,
+    page_title: str,
+    figures: List[plt.Figure],
+    columns: Optional[int] = None,
+    dpi: int = 150,
+) -> None:
+    images = [_figure_to_image(fig, dpi=dpi) for fig in figures if fig is not None]
+    if not images:
+        page_fig, ax = plt.subplots(figsize=(11, 8.5))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No plottable data", ha="center", va="center", fontsize=14)
+        page_fig.suptitle(page_title, fontsize=16, fontweight="bold")
+        pdf.savefig(page_fig, bbox_inches="tight")
+        plt.close(page_fig)
+        return
+
+    columns = columns or min(3, len(images))
+    rows = (len(images) + columns - 1) // columns
+    page_fig, axes = plt.subplots(rows, columns, figsize=(11, 8.5), squeeze=False)
+    page_fig.suptitle(page_title, fontsize=16, fontweight="bold")
+
+    for ax, image in zip(axes.flat, images):
+        ax.imshow(image)
+        ax.axis("off")
+
+    for ax in axes.flat[len(images):]:
+        ax.axis("off")
+
+    page_fig.tight_layout(rect=[0, 0, 1, 0.95])
+    pdf.savefig(page_fig)
+    plt.close(page_fig)
+
+
+def build_analysis_plots_pdf(
+    results,
+    ok_results,
+    channels,
+    metric_cfg,
+    drift_options,
+    vlines,
+    scan_range,
+    individual_metric_channels: bool = False,
+    dpi: int = 150,
+) -> bytes:
+    pdf_buf = io.BytesIO()
+    with PdfPages(pdf_buf) as pdf:
+        raw_overlay_figs = []
+        smoothed_corrected_overlay_figs = []
+        for ch in channels:
+            ch_res = [r for r in ok_results if r["channel"] == ch]
+            if scan_range:
+                ch_res = [r for r in ch_res if scan_range[0] <= r["scan_number"] <= scan_range[1]]
+            raw_overlay_figs.append(
+                plot_overlaid_traces(
+                    ch_res,
+                    y_key="raw_current",
+                    title=f"Raw overlay | Ch{ch}",
+                    ylabel="Current (uA)",
+                )
+            )
+            smoothed_corrected_overlay_figs.append(
+                plot_overlaid_traces(
+                    ch_res,
+                    y_key="smoothed_corrected_current",
+                    title=f"Smoothed corrected overlay | Ch{ch}",
+                    ylabel="Current (uA)",
+                    show_zero_baseline=True,
+                )
+            )
+
+        _write_pdf_plot_page(pdf, "Raw Overlays by Channel", raw_overlay_figs, dpi=dpi)
+        _write_pdf_plot_page(pdf, "Smoothed Corrected Overlays by Channel", smoothed_corrected_overlay_figs, dpi=dpi)
+
+        for title, (metric, ylabel) in metric_cfg.items():
+            if individual_metric_channels:
+                metric_figs = [
+                    plot_metric_vs_scan(
+                        results,
+                        metric=metric,
+                        channels=[ch],
+                        title=f"Ch{ch}",
+                        ylabel=ylabel,
+                        vlines=vlines,
+                        scan_range=scan_range,
+                        figsize=(5, 3),
+                    )
+                    for ch in channels
+                ]
+                _write_pdf_plot_page(pdf, title, metric_figs, columns=3, dpi=dpi)
+            else:
+                metric_fig = plot_metric_vs_scan(
+                    results,
+                    metric=metric,
+                    channels=channels,
+                    title=title,
+                    ylabel=ylabel,
+                    vlines=vlines,
+                    scan_range=scan_range,
+                    figsize=(11, 6.5),
+                )
+                _write_pdf_plot_page(pdf, title, [metric_fig], columns=1, dpi=dpi)
+
+        for title, (drift_key, ylabel, _caption) in drift_options.items():
+            drift_fig = plot_drift_vs_scan(
+                results,
+                drift_metric=drift_key,
+                channels=channels,
+                title=title,
+                ylabel=ylabel,
+                vlines=vlines,
+                scan_range=scan_range,
+                figsize=(11, 6.5),
+            )
+            _write_pdf_plot_page(pdf, title, [drift_fig], columns=1, dpi=dpi)
+
+    pdf_buf.seek(0)
+    return pdf_buf.getvalue()
 
 
 # 
@@ -445,6 +574,18 @@ if not compute_skew:
 if not compute_wavelet_energy:
     metric_cfg.pop("Wavelet energy", None)
 
+drift_options = {
+    "Peak voltage drift (V)": ("peak_voltage_drift", "Peak voltage (V)",
+                               "Shift in peak position  indicates a change in the redox potential."),
+    "Skew drift":             ("skew_drift",         "Skew",
+                               "Change in corrected-trace asymmetry  sensitive to baseline shape changes."),
+    "Peak offset (normalized) drift": ("peak_offset_norm_drift", "Peak offset (normalized)",
+                               "Shift in peak position relative to bracket center (normalized)."),
+}
+if not compute_skew:
+    drift_options.pop("Skew drift", None)
+    drift_options.pop("Peak offset (normalized) drift", None)
+
 titration_ready = enable_titration_analysis and len(vlines) >= 2
 
 # 
@@ -652,18 +793,6 @@ if view == "Drift":
     )
 
     dr_c1, dr_c2 = st.columns([3, 1])
-    drift_options = {
-        "Peak voltage drift (V)": ("peak_voltage_drift", "Peak voltage (V)",
-                                   "Shift in peak position  indicates a change in the redox potential."),
-        "Skew drift":             ("skew_drift",         "Skew",
-                                   "Change in corrected-trace asymmetry  sensitive to baseline shape changes."),
-        "Peak offset (normalized) drift": ("peak_offset_norm_drift", "Peak offset (normalized)",
-                                   "Shift in peak position relative to bracket center (normalized)."),
-    }
-    if not compute_skew:
-        drift_options.pop("Skew drift", None)
-        drift_options.pop("Peak offset (normalized) drift", None)
-
     selected_drift = dr_c1.multiselect(
         "Drift metrics to display",
         options=list(drift_options.keys()),
@@ -922,6 +1051,39 @@ if view == "Export":
 
     st.divider()
 
+    st.markdown("####  Analysis plots PDF")
+    st.caption(
+        "Creates a PDF with overlays first, then one full page per metric and drift plot."
+    )
+    pdf_metric_layout = st.radio(
+        "Metrics PDF page",
+        ["Combined channels", "Individual channels"],
+        horizontal=True,
+    )
+    pdf_dpi = st.slider("PDF plot DPI", 72, 300, 150)
+
+    if st.button("  Build analysis plots PDF", use_container_width=True):
+        pdf_bytes = build_analysis_plots_pdf(
+            results=results,
+            ok_results=ok_results,
+            channels=channels_display,
+            metric_cfg=metric_cfg,
+            drift_options=drift_options,
+            vlines=vlines,
+            scan_range=scan_range,
+            individual_metric_channels=(pdf_metric_layout == "Individual channels"),
+            dpi=pdf_dpi,
+        )
+        st.download_button(
+            "  Download analysis_plots.pdf",
+            data=pdf_bytes,
+            file_name="swv_analysis_plots.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    st.divider()
+
     st.markdown("####  Figures ZIP")
     fig_format = st.selectbox("Format", ["png", "pdf", "svg"], index=0)
     fig_dpi    = st.slider("DPI (PNG only)", 72, 300, 150)
@@ -974,11 +1136,7 @@ if view == "Export":
                         if fig:
                             _save(fig, f"titration/langmuir/{metric}.{fig_format}")
 
-            for dk, ylabel, title in (
-                ("peak_voltage_drift", "Peak voltage (V)", "Peak voltage drift"),
-                ("skew_drift",         "Skew",             "Skew drift"),
-                ("peak_offset_norm_drift", "Peak offset (normalized)", "Peak offset (normalized) drift"),
-            ):
+            for title, (dk, ylabel, _caption) in drift_options.items():
                 fig = plot_drift_vs_scan(results, drift_metric=dk, channels=channels_display,
                                          title=title, ylabel=ylabel,
                                          vlines=vlines, scan_range=scan_range)
