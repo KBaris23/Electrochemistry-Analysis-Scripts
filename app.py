@@ -1118,6 +1118,28 @@ with st.sidebar:
         st.subheader(" Cycle View")
         st.caption("CV metrics are tracked across detected cycle number within each EC block, so scan windows and vlines are not used here.")
 
+    enable_titration_analysis = st.checkbox(
+        "Treat vline intervals as titration steps",
+        value=False,
+        help="Each interval between consecutive vertical lines becomes one titration step.",
+    )
+    titration_edge_trim_fraction = 0.15
+    fit_titration_langmuir = False
+    if enable_titration_analysis:
+        titration_edge_trim_fraction = st.slider(
+            "Plateau edge trim fraction",
+            min_value=0.0,
+            max_value=0.4,
+            value=0.15,
+            step=0.05,
+            help="Uses only the middle portion of each step when estimating the plateau median.",
+        )
+        fit_titration_langmuir = st.checkbox(
+            "Fit Langmuir-style curve to step plateaus",
+            value=True,
+            help="Uses titration step index as a proxy x-axis and fits a simple Langmuir isotherm.",
+        )
+
     st.divider()
 
     #  Failed traces 
@@ -1507,6 +1529,21 @@ st.divider()
 if not results:
     st.info("No measurements match the current SWV method filter.")
     st.stop()
+
+metric_cfg = {
+    "Peak current (corrected)": ("peak_current",     "Corrected Peak Height (uA)"),
+    "Peak current (raw)":       ("peak_current_raw", "Raw Current at Peak (uA)"),
+    "Skew":                     ("skew",             "Skew (corrected trace)"),
+    "Peak offset (normalized)": ("peak_offset_norm", "Peak offset from bracket center (normalized)"),
+    "Wavelet energy":           ("wavelet_energy",   "Wavelet Energy (a.u.)"),
+}
+if not compute_skew:
+    metric_cfg.pop("Skew", None)
+    metric_cfg.pop("Peak offset (normalized)", None)
+if not compute_wavelet_energy:
+    metric_cfg.pop("Wavelet energy", None)
+
+titration_ready = enable_titration_analysis and len(vlines) >= 2
 
 # 
 # Tabs
