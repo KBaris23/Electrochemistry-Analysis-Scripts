@@ -54,7 +54,10 @@ If you enable `Treat vline intervals as titration steps` in the sidebar, the app
 - Plateau values are estimated per channel and per metric using the median of the middle portion of each step.
 - Metric plots gain horizontal step plateaus, midpoint markers, and a smooth bridge through the step centers.
 - An optional Langmuir-style fit is drawn from plateau value vs. titration step index.
+- When the Langmuir fit is enabled, the app also exposes a Langmuir fit summary table / CSV with the fitted baseline, amplitude, saturation step, and apparent `Kd`.
 - The Data Table and Export tabs expose step-level titration summaries only when this mode is enabled.
+
+Because the current Langmuir x-axis is the titration step index rather than a physical concentration, the reported `Kd` is an apparent `Kd` in step-index units. If your steps map to known concentrations, you can convert or refit externally against that concentration axis.
 
 The plateau estimator trims a configurable fraction from both edges of each step before taking the median, which helps suppress transition scans immediately after an addition event.
 
@@ -241,6 +244,14 @@ Peak current  = I_corr[k_peak,corr]
 
 So the app uses the first-pass peak only to place the baseline anchors, but the final reported peak position and peak height come from the baseline-corrected trace.
 
+If the SWV peak source is set to `Corrected + smoothed`, then the reported peak height instead uses:
+
+```text
+Peak current_selected = I_corr_smooth[k_peak,corr]
+```
+
+In that mode, the same selected trace basis is also used for the derived SWV metrics that depend on the final peak location.
+
 ### 8. Interpretation
 
 If the measured signal is thought of as
@@ -274,6 +285,98 @@ The parameter `minima_search_window_V` changes the allowed regions `L` and `R`:
 
 - Smaller values force the minima to be closer to the peak, making the correction more local but also more sensitive to noise or shoulders.
 - Larger values allow the minima to be farther from the peak, which can be more stable but may span a region where the true baseline is less linear.
+
+## Background drift metric
+
+The app also computes a simple peak-excluded background metric from the full raw trace. Let the crop window be:
+
+```text
+v_min <= v <= v_max
+```
+
+and let the full raw current be:
+
+```text
+I_raw = {I_k}
+```
+
+Define the outside-crop index set:
+
+```text
+O = {k : v_k < v_min or v_k > v_max}
+```
+
+Then the background RMS is:
+
+```text
+Background RMS = sqrt( mean( I_k^2 ) over k in O )
+```
+
+or equivalently:
+
+```text
+Background RMS = sqrt( (1 / |O|) * sum_{k in O} I_k^2 )
+```
+
+This metric is intentionally computed outside the SWV crop window so the peak-analysis region does not directly drive the background estimate.
+
+## Background drift metrics
+
+For each channel, the app uses the median background RMS of the first 3 valid scans as the reference:
+
+```text
+R_ref = median(R_1, R_2, R_3)
+```
+
+where `R_t` is the background RMS at scan `t` for that channel.
+
+The normalized background level is:
+
+```text
+R_norm(t) = R_t / R_ref
+```
+
+The background drift fraction is:
+
+```text
+D(t) = R_norm(t) - 1
+```
+
+and the background drift percent shown in the UI is:
+
+```text
+Background drift (%) = 100 * D(t)
+```
+
+This RMS-based quantity is best treated as a diagnostic drift metric. Because RMS is always positive, it does not preserve the sign of an additive baseline shift, and it can increase either because the baseline moved or because the noise amplitude changed.
+
+## Experimental additive background recentering
+
+If you enable the experimental additive background recentering option in the SWV analysis sidebar, the app also computes the outside-crop median raw current for each scan:
+
+```text
+b(t) = median( I_k ) over k in O
+```
+
+Using the median of the first 3 valid scans in each channel as the reference background:
+
+```text
+b_ref = median(b_1, b_2, b_3)
+```
+
+the signed additive offset is:
+
+```text
+Delta_b(t) = b(t) - b_ref
+```
+
+The cropped raw SWV trace is then recentered before the usual baseline-correction workflow is rerun:
+
+```text
+I_recentered(V, t) = I_raw(V, t) - Delta_b(t)
+```
+
+The reported background-recentered peak is measured from that recentered trace after the standard SWV correction steps. This mode is opt-in and intended for comparison rather than as the default analysis path.
 
 ## Using core modules directly (no UI)
 

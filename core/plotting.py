@@ -10,7 +10,8 @@ from matplotlib import cm
 
 from matplotlib.colors import Normalize
 from scipy.interpolate import PchipInterpolator
-from scipy.optimize import curve_fit
+from scipy.optimize import OptimizeWarning, curve_fit
+import warnings
 
 from .processing import find_peak_candidates
 
@@ -65,13 +66,11 @@ def _cmap_fig(
         ax.axhline(0, color="gray", lw=1.0, linestyle="--", alpha=0.8)
 
     for i, r in enumerate(results):
-
         if r.get(y_key) is None or r.get("voltage") is None:
 
             continue
 
         color = cmap(norm(i))
-
         ax.plot(r["voltage"], r[y_key], color=color, lw=linewidth, alpha=alpha)
 
 
@@ -94,9 +93,20 @@ def _cmap_fig(
 
             y = r[y_key]
 
-            left_candidates = np.asarray(r.get("left_local_min_candidates", []), dtype=int)
+            double_correction_applied = bool(r.get("double_correction_applied")) and (
+                r.get("second_pass_corrected_current") is not None
+            )
+            left_candidates_key = (
+                "first_pass_left_local_min_candidates" if double_correction_applied else "left_local_min_candidates"
+            )
+            right_candidates_key = (
+                "first_pass_right_local_min_candidates" if double_correction_applied else "right_local_min_candidates"
+            )
+            left_idx_key = "first_pass_left_min_idx" if double_correction_applied else "left_min_idx"
+            right_idx_key = "first_pass_right_min_idx" if double_correction_applied else "right_min_idx"
+            left_candidates = np.asarray(r.get(left_candidates_key, []), dtype=int)
 
-            right_candidates = np.asarray(r.get("right_local_min_candidates", []), dtype=int)
+            right_candidates = np.asarray(r.get(right_candidates_key, []), dtype=int)
 
             if len(left_candidates):
 
@@ -122,7 +132,7 @@ def _cmap_fig(
 
                 )
 
-            for idx_key in ("left_min_idx", "right_min_idx"):
+            for idx_key in (left_idx_key, right_idx_key):
 
                 idx = r.get(idx_key)
 
@@ -172,7 +182,12 @@ def _cmap_fig(
 
             y = r[y_key]
 
-            peak_idx = r.get("peak_idx")
+            peak_idx_key = (
+                "peak_idx_corr"
+                if y_key in ("corrected_current", "smoothed_corrected_current")
+                else "peak_idx"
+            )
+            peak_idx = r.get(peak_idx_key)
 
             if peak_idx is not None and 0 <= peak_idx < len(v):
 
@@ -250,13 +265,21 @@ def _filter_titration_vlines(
 
         return []
 
-    filtered = (
-
-        [(float(x), str(label)) for x, label in vlines if scan_range[0] <= x <= scan_range[1]]
-
-        if scan_range else [(float(x), str(label)) for x, label in vlines]
-
-    )
+    if scan_range:
+        start_scan, end_scan = scan_range
+        in_range = [
+            (float(x), str(label))
+            for x, label in vlines
+            if start_scan <= x <= end_scan
+        ]
+        left_candidates = [
+            (float(x), str(label))
+            for x, label in vlines
+            if float(x) < start_scan
+        ]
+        filtered = ([max(left_candidates, key=lambda item: item[0])] if left_candidates else []) + in_range
+    else:
+        filtered = [(float(x), str(label)) for x, label in vlines]
     filtered = sorted(filtered, key=lambda item: item[0])
 
     deduped: List[Tuple[float, str]] = []
@@ -287,6 +310,18 @@ def _plateau_slice(n_points: int, edge_trim_fraction: float) -> slice:
     return slice(trim_n, n_points - trim_n)
 
 
+def _scan_window_for_value(
+    scan_value: float,
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
+) -> Optional[Tuple[int, int]]:
+    if not scan_windows:
+        return None
+    for start, end in scan_windows:
+        if start <= scan_value <= end:
+            return (start, end)
+    return None
+
+
 
 
 def build_titration_step_table(
@@ -298,6 +333,8 @@ def build_titration_step_table(
     vlines: Optional[List[Tuple[float, str]]],
 
     channels: Optional[List[int]] = None,
+
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
 
     scan_range: Optional[Tuple[int, int]] = None,
 
@@ -355,6 +392,11 @@ def build_titration_step_table(
             start=1,
 
         ):
+            if scan_windows:
+                start_window = _scan_window_for_value(start_scan, scan_windows=scan_windows)
+                end_window = _scan_window_for_value(end_scan, scan_windows=scan_windows)
+                if start_window is None or end_window is None or start_window != end_window:
+                    continue
 
             if end_scan <= start_scan:
 
@@ -425,56 +467,156 @@ def build_titration_step_table(
     return rows
 
 
-
-
 def _langmuir_isotherm(x, baseline, amplitude, kd):
-
     return baseline + amplitude * (x / (kd + x))
 
 
-
-
 def _fit_langmuir_isotherm(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[float, float, float]]:
-
     if x.size < 3 or np.unique(x).size < 3:
-
         return None
 
     baseline0 = float(y[0])
     amplitude0 = float(y[-1] - y[0])
     if np.isclose(amplitude0, 0.0):
-
         amplitude0 = float(np.nanmax(y) - np.nanmin(y))
         if np.isclose(amplitude0, 0.0):
-
             amplitude0 = 1.0
 
     kd0 = float(max(1.0, np.median(x)))
 
     try:
-
-        params, _ = curve_fit(
-
-            _langmuir_isotherm,
-
-            x,
-
-            y,
-
-            p0=(baseline0, amplitude0, kd0),
-
-            bounds=([-np.inf, -np.inf, 1e-6], [np.inf, np.inf, np.inf]),
-
-            maxfev=20000,
-
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", OptimizeWarning)
+            params, _ = curve_fit(
+                _langmuir_isotherm,
+                x,
+                y,
+                p0=(baseline0, amplitude0, kd0),
+                bounds=([-np.inf, -np.inf, 1e-6], [np.inf, np.inf, np.inf]),
+                maxfev=20000,
+            )
     except Exception:
-
         return None
 
     return float(params[0]), float(params[1]), float(params[2])
 
 
+def _fit_polynomial_segment(
+    x: np.ndarray,
+    y: np.ndarray,
+    max_degree: int = 2,
+) -> Optional[Tuple[np.poly1d, int]]:
+    unique_x = np.unique(x)
+    if x.size < 2 or unique_x.size < 2:
+        return None
+
+    degree = min(max_degree, int(unique_x.size - 1))
+    if degree < 1:
+        return None
+
+    try:
+        coeffs = np.polyfit(x, y, deg=degree)
+    except Exception:
+        return None
+
+    return np.poly1d(coeffs), degree
+
+
+def _build_langmuir_hybrid_fit(x: np.ndarray, y: np.ndarray) -> Optional[dict]:
+    if x.size < 2 or y.size < 2:
+        return None
+
+    saturation_idx = int(np.nanargmax(y))
+    return {
+        "saturation_idx": saturation_idx,
+        "saturation_x": float(x[saturation_idx]),
+        "saturation_y": float(y[saturation_idx]),
+        "langmuir_params": _fit_langmuir_isotherm(x[:saturation_idx + 1], y[:saturation_idx + 1]),
+        "post_sat_poly": _fit_polynomial_segment(x[saturation_idx:], y[saturation_idx:]),
+    }
+
+
+def build_titration_langmuir_summary_table(
+    all_results: List[dict],
+    metric: str,
+    vlines: Optional[List[Tuple[float, str]]],
+    channels: Optional[List[int]] = None,
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
+    scan_range: Optional[Tuple[int, int]] = None,
+    edge_trim_fraction: float = 0.15,
+) -> List[dict]:
+    step_rows = build_titration_step_table(
+        all_results,
+        metric=metric,
+        vlines=vlines,
+        channels=channels,
+        scan_windows=scan_windows,
+        scan_range=scan_range,
+        edge_trim_fraction=edge_trim_fraction,
+    )
+    if not step_rows:
+        return []
+
+    rows: List[dict] = []
+    for ch in sorted({row["channel"] for row in step_rows}):
+        ch_steps = sorted(
+            [row for row in step_rows if row["channel"] == ch],
+            key=lambda row: row["step_index"],
+        )
+        if len(ch_steps) < 2:
+            continue
+
+        x = np.asarray([row["step_index"] for row in ch_steps], dtype=float)
+        y = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float)
+        hybrid_fit = _build_langmuir_hybrid_fit(x, y)
+        if hybrid_fit is None:
+            continue
+
+        saturation_idx = hybrid_fit["saturation_idx"]
+        saturation_step = ch_steps[saturation_idx]
+        langmuir_params = hybrid_fit["langmuir_params"]
+        post_sat_poly = hybrid_fit["post_sat_poly"]
+
+        baseline = None
+        amplitude = None
+        kd_step_index = None
+        fit_status = "guide_only"
+        if langmuir_params is not None:
+            baseline = float(langmuir_params[0])
+            amplitude = float(langmuir_params[1])
+            kd_step_index = float(langmuir_params[2])
+            fit_status = "langmuir_only"
+
+        post_sat_poly_degree = None
+        if post_sat_poly is not None and saturation_idx < (len(ch_steps) - 1):
+            _, post_sat_poly_degree = post_sat_poly
+            fit_status = (
+                "langmuir_plus_post_sat_poly"
+                if langmuir_params is not None
+                else "guide_plus_post_sat_poly"
+            )
+
+        rows.append({
+            "channel": ch,
+            "metric_key": metric,
+            "fit_axis": "titration_step_index",
+            "fit_axis_note": "proxy_concentration",
+            "step_count": int(len(ch_steps)),
+            "pre_saturation_step_count": int(saturation_idx + 1),
+            "post_saturation_step_count": int(len(ch_steps) - saturation_idx - 1),
+            "saturation_step_index": float(hybrid_fit["saturation_x"]),
+            "saturation_plateau_value": float(hybrid_fit["saturation_y"]),
+            "saturation_left_vline_label": saturation_step["left_vline_label"],
+            "saturation_right_vline_label": saturation_step["right_vline_label"],
+            "langmuir_fit_used": bool(langmuir_params is not None),
+            "langmuir_fit_status": fit_status,
+            "langmuir_baseline": baseline,
+            "langmuir_amplitude": amplitude,
+            "langmuir_kd_step_index": kd_step_index,
+            "post_saturation_polynomial_degree": post_sat_poly_degree,
+        })
+
+    return rows
 
 
 # ---- public plot functions
@@ -508,7 +650,6 @@ def plot_overlaid_traces(
     show_minima_candidates: bool = False,
 
 ) -> Optional[plt.Figure]:
-
     usable = [r for r in results if r.get(y_key) is not None and r.get("voltage") is not None]
 
     if not usable:
@@ -624,6 +765,7 @@ def plot_metric_vs_scan(
     scan_range: Optional[Tuple[int, int]] = None,
 
     figsize: Tuple[int, int] = (10, 4),
+    xlabel: str = "Scan number",
 
     highlight_channel: Optional[int] = None,
 
@@ -691,7 +833,7 @@ def plot_metric_vs_scan(
 
 
 
-    ax.set_xlabel("Scan number")
+    ax.set_xlabel(xlabel)
 
     ax.set_ylabel(ylabel or metric)
 
@@ -729,6 +871,8 @@ def plot_titration_plateaus(
 
     ylabel: Optional[str] = None,
 
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
+
     scan_range: Optional[Tuple[int, int]] = None,
 
     edge_trim_fraction: float = 0.15,
@@ -750,6 +894,8 @@ def plot_titration_plateaus(
         vlines=vlines,
 
         channels=channels,
+
+        scan_windows=scan_windows,
 
         scan_range=scan_range,
 
@@ -936,51 +1082,32 @@ def plot_titration_plateaus(
     return fig
 
 
-
-
 def plot_titration_langmuir(
-
     all_results: List[dict],
-
     metric: str,
-
     vlines: Optional[List[Tuple[float, str]]],
-
     channels: Optional[List[int]] = None,
-
     title: Optional[str] = None,
-
     ylabel: Optional[str] = None,
-
+    scan_windows: Optional[List[Tuple[int, int]]] = None,
     scan_range: Optional[Tuple[int, int]] = None,
-
     edge_trim_fraction: float = 0.15,
-
     figsize: Tuple[int, int] = (8, 4),
-
     highlight_channel: Optional[int] = None,
-
+    xlabel: str = "Scan number",
     fit_langmuir: bool = True,
-
+    fit_channels: Optional[List[int]] = None,
 ) -> Optional[plt.Figure]:
-
     step_rows = build_titration_step_table(
-
         all_results,
-
         metric=metric,
-
         vlines=vlines,
-
         channels=channels,
-
+        scan_windows=scan_windows,
         scan_range=scan_range,
-
         edge_trim_fraction=edge_trim_fraction,
-
     )
     if not step_rows:
-
         return None
 
     all_ch = sorted({r["channel"] for r in all_results})
@@ -989,21 +1116,18 @@ def plot_titration_langmuir(
     cmap = plt.get_cmap("tab10")
     colors = {ch: cmap(i % 10) for i, ch in enumerate(all_ch)}
 
+    fit_channel_set = set(fit_channels) if fit_channels is not None else None
     fig, ax = plt.subplots(figsize=figsize)
     plotted_any = False
     xticks = set()
+    fit_notes: List[str] = []
 
     for ch in channels:
-
         ch_steps = sorted(
-
             [row for row in step_rows if row["channel"] == ch],
-
             key=lambda row: row["step_index"],
-
         )
         if not ch_steps:
-
             continue
 
         dimmed = highlight_channel is not None and ch != highlight_channel
@@ -1013,86 +1137,104 @@ def plot_titration_langmuir(
         xticks.update(int(v) for v in x)
 
         ax.scatter(
-
             x,
-
             y,
-
             color=color,
-
             s=34,
-
             marker="D",
-
             alpha=0.25 if dimmed else 0.95,
-
             label=f"Ch{ch}",
-
             zorder=3,
-
         )
 
         if x.size >= 2:
+            ax.plot(
+                x,
+                y,
+                color=color,
+                lw=1.2,
+                linestyle="--",
+                alpha=0.15 if dimmed else 0.45,
+            )
 
-            if fit_langmuir:
+            should_fit_channel = fit_langmuir and (
+                fit_channel_set is None or ch in fit_channel_set
+            )
+            if should_fit_channel:
+                hybrid_fit = _build_langmuir_hybrid_fit(x, y)
+                if hybrid_fit is not None:
+                    saturation_idx = hybrid_fit["saturation_idx"]
+                    saturation_x = hybrid_fit["saturation_x"]
+                    saturation_y = hybrid_fit["saturation_y"]
+                    langmuir_params = hybrid_fit["langmuir_params"]
+                    post_sat_poly = hybrid_fit["post_sat_poly"]
 
-                params = _fit_langmuir_isotherm(x, y)
-                if params is not None:
+                    if langmuir_params is not None:
+                        x_dense = np.linspace(x.min(), saturation_x, 300)
+                        y_dense = _langmuir_isotherm(x_dense, *langmuir_params)
+                        ax.plot(
+                            x_dense,
+                            y_dense,
+                            color=color,
+                            lw=2.2,
+                            alpha=0.25 if dimmed else 0.85,
+                        )
+                    elif saturation_idx >= 1:
+                        ax.plot(
+                            x[:saturation_idx + 1],
+                            y[:saturation_idx + 1],
+                            color=color,
+                            lw=1.8,
+                            alpha=0.25 if dimmed else 0.75,
+                        )
 
-                    x_dense = np.linspace(x.min(), x.max(), 300)
-                    y_dense = _langmuir_isotherm(x_dense, *params)
-                    ax.plot(
+                    pre_sat_label = "Langmuir <= sat" if langmuir_params is not None else "guide <= sat"
+                    fit_note = f"Ch{ch}: sat step {int(round(saturation_x))}, {pre_sat_label}"
+                    if langmuir_params is not None:
+                        fit_note += f", app. Kd {langmuir_params[2]:.3g} steps"
+                    if post_sat_poly is not None and saturation_idx < (x.size - 1):
+                        poly_model, poly_degree = post_sat_poly
+                        x_dense = np.linspace(saturation_x, x.max(), 200)
+                        ax.plot(
+                            x_dense,
+                            poly_model(x_dense),
+                            color=color,
+                            lw=1.9,
+                            linestyle="-.",
+                            alpha=0.25 if dimmed else 0.85,
+                        )
+                        fit_note += f", post-sat poly deg {poly_degree}"
 
-                        x_dense,
-
-                        y_dense,
-
+                    fit_notes.append(fit_note)
+                    ax.axvline(
+                        saturation_x,
                         color=color,
-
-                        lw=2.0,
-
-                        alpha=0.25 if dimmed else 0.8,
-
+                        lw=1.0,
+                        linestyle=":",
+                        alpha=0.18 if dimmed else 0.5,
                     )
-                else:
-
-                    ax.plot(
-
-                        x,
-
-                        y,
-
+                    ax.scatter(
+                        saturation_x,
+                        saturation_y,
+                        s=88,
+                        facecolors="white",
+                        edgecolors=color,
+                        linewidths=1.5,
+                        zorder=5,
+                    )
+                    ax.annotate(
+                        f"Sat. step {int(round(saturation_x))}",
+                        xy=(saturation_x, saturation_y),
+                        xytext=(8, -16),
+                        textcoords="offset points",
                         color=color,
-
-                        lw=1.4,
-
-                        linestyle="--",
-
-                        alpha=0.2 if dimmed else 0.65,
-
+                        fontsize=8,
+                        bbox=dict(facecolor="white", edgecolor="none", alpha=0.65, pad=1.5),
                     )
-            else:
-
-                ax.plot(
-
-                    x,
-
-                    y,
-
-                    color=color,
-
-                    lw=1.4,
-
-                    linestyle="--",
-
-                    alpha=0.2 if dimmed else 0.65,
-
-                )
 
         plotted_any = True
 
     if not plotted_any:
-
         plt.close(fig)
         return None
 
@@ -1102,8 +1244,18 @@ def plot_titration_langmuir(
     ax.grid(False)
     ax.legend(title="Channel", loc="best", fontsize=8)
     if xticks:
-
         ax.set_xticks(sorted(xticks))
+    if fit_notes:
+        ax.text(
+            0.02,
+            0.98,
+            "\n".join(fit_notes),
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8,
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=4),
+        )
 
     fig.tight_layout()
     return fig
@@ -1132,6 +1284,8 @@ def plot_drift_vs_scan(
     highlight_channel: Optional[int] = None,
 
     figsize: Tuple[int, int] = (10, 4),
+
+    xlabel: str = "Scan number",
 
 ) -> Optional[plt.Figure]:
 
@@ -1205,7 +1359,7 @@ def plot_drift_vs_scan(
 
 
 
-    ax.set_xlabel("Scan number")
+    ax.set_xlabel(xlabel)
 
     ax.set_ylabel(ylabel or drift_metric)
 
@@ -1244,6 +1398,11 @@ def plot_single_trace(result: dict) -> plt.Figure:
     keys = ["raw_current", "smoothed_current"]
     labels = ["Raw", "Smoothed"]
     colors = ["steelblue", "darkorange"]
+
+    if result.get("wavelet_denoised_current") is not None:
+        keys.append("wavelet_denoised_current")
+        labels.append("Wavelet Denoised")
+        colors.append("mediumpurple")
 
     if use_prominent_minima:
         keys.append("inverted_smoothed_current")
