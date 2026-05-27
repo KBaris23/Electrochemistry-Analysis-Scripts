@@ -1,3 +1,4 @@
+import re
 from typing import Dict, List, Optional, Tuple
 
 
@@ -20,6 +21,63 @@ from .processing import find_peak_candidates
 
 
 # ---- helpers
+
+_CONCENTRATION_UNIT_TO_M = {
+    "M": 1.0,
+    "mM": 1e-3,
+    "uM": 1e-6,
+    "µM": 1e-6,
+    "nM": 1e-9,
+    "pM": 1e-12,
+}
+
+
+def _normalize_concentration_unit(unit: str) -> str:
+    unit = (unit or "").strip()
+    if unit in ("um", "uM", "µM", "μM"):
+        return "uM"
+    for known in _CONCENTRATION_UNIT_TO_M:
+        if unit.lower() == known.lower():
+            return known
+    return unit
+
+
+def _parse_concentration_marker_label(
+    label: str,
+    default_unit: str = "",
+) -> Tuple[Optional[float], str]:
+    label = str(label or "").strip()
+    if not label:
+        return None, ""
+
+    buffer_match = re.match(r"\s*buffer\b", label, flags=re.IGNORECASE)
+    if buffer_match:
+        note = (label[:buffer_match.start()] + label[buffer_match.end():]).strip()
+        note = re.sub(r"^[\s,;:|=-]+|[\s,;:|=-]+$", "", note)
+        return 0.0, note or "buffer"
+
+    match = re.match(
+        r"\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*(pM|nM|uM|µM|μM|mM|M)?\b",
+        label,
+    )
+    if not match:
+        return None, label
+
+    try:
+        concentration = float(match.group(1))
+    except ValueError:
+        return None, label
+    if not np.isfinite(concentration) or concentration < 0:
+        return None, label
+
+    parsed_unit = _normalize_concentration_unit(match.group(2) or "")
+    target_unit = _normalize_concentration_unit(default_unit or parsed_unit)
+    if parsed_unit and target_unit and parsed_unit in _CONCENTRATION_UNIT_TO_M and target_unit in _CONCENTRATION_UNIT_TO_M:
+        concentration = concentration * _CONCENTRATION_UNIT_TO_M[parsed_unit] / _CONCENTRATION_UNIT_TO_M[target_unit]
+
+    note = (label[:match.start()] + label[match.end():]).strip()
+    note = re.sub(r"^[\s,;:|=-]+|[\s,;:|=-]+$", "", note)
+    return concentration, note
 
 
 
@@ -339,6 +397,9 @@ def build_titration_step_table(
     scan_range: Optional[Tuple[int, int]] = None,
 
     edge_trim_fraction: float = 0.15,
+    step_concentrations: Optional[List[float]] = None,
+    step_notes: Optional[List[str]] = None,
+    concentration_unit: str = "",
 
 ) -> List[dict]:
 
@@ -425,6 +486,30 @@ def build_titration_step_table(
 
             plateau_value = float(np.median(plateau_values))
             plateau_mad = float(np.median(np.abs(plateau_values - plateau_value)))
+            label_concentration, label_note = _parse_concentration_marker_label(
+                left_label,
+                default_unit=concentration_unit,
+            )
+            step_concentration = _concentration_for_step(
+                step_index,
+                step_concentrations=step_concentrations,
+            )
+            if step_concentration is None:
+                step_concentration = label_concentration
+            step_note = label_note
+            if step_notes and (step_index - 1) < len(step_notes):
+                explicit_note = str(step_notes[step_index - 1]).strip()
+                if explicit_note:
+                    step_note = explicit_note
+            concentration_label = (
+                f"{step_concentration:g} {concentration_unit}".strip()
+                if step_concentration is not None else ""
+            )
+            display_bits = [f"Step {step_index}"]
+            if concentration_label:
+                display_bits.append(concentration_label)
+            if step_note:
+                display_bits.append(step_note)
 
             rows.append({
 
@@ -435,6 +520,10 @@ def build_titration_step_table(
                 "step_index": step_index,
 
                 "step_label": f"Step {step_index}",
+                "step_display_label": " | ".join(display_bits),
+                "step_concentration": step_concentration,
+                "step_concentration_unit": concentration_unit if step_concentration is not None else "",
+                "step_note": step_note,
 
                 "left_vline_label": left_label,
 
@@ -472,7 +561,12 @@ def _langmuir_isotherm(x, baseline, amplitude, kd):
 
 
 def _fit_langmuir_isotherm(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    finite = np.isfinite(x) & np.isfinite(y)
+    x = np.asarray(x[finite], dtype=float)
+    y = np.asarray(y[finite], dtype=float)
     if x.size < 3 or np.unique(x).size < 3:
+        return None
+    if np.any(x < 0):
         return None
 
     baseline0 = float(y[0])
@@ -482,7 +576,11 @@ def _fit_langmuir_isotherm(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[float
         if np.isclose(amplitude0, 0.0):
             amplitude0 = 1.0
 
-    kd0 = float(max(1.0, np.median(x)))
+    positive_x = x[x > 0]
+    if positive_x.size == 0:
+        return None
+    kd_floor = float(max(np.nanmin(positive_x) * 1e-9, 1e-12))
+    kd0 = float(max(kd_floor, np.nanmedian(positive_x)))
 
     try:
         with warnings.catch_warnings():
@@ -492,7 +590,7 @@ def _fit_langmuir_isotherm(x: np.ndarray, y: np.ndarray) -> Optional[Tuple[float
                 x,
                 y,
                 p0=(baseline0, amplitude0, kd0),
-                bounds=([-np.inf, -np.inf, 1e-6], [np.inf, np.inf, np.inf]),
+                bounds=([-np.inf, -np.inf, kd_floor], [np.inf, np.inf, np.inf]),
                 maxfev=20000,
             )
     except Exception:
@@ -522,11 +620,18 @@ def _fit_polynomial_segment(
     return np.poly1d(coeffs), degree
 
 
+def _find_saturation_idx(y: np.ndarray) -> int:
+    response = np.abs(y - float(y[0]))
+    if np.all(~np.isfinite(response)):
+        return int(len(y) - 1)
+    return int(np.nanargmax(response))
+
+
 def _build_langmuir_hybrid_fit(x: np.ndarray, y: np.ndarray) -> Optional[dict]:
     if x.size < 2 or y.size < 2:
         return None
 
-    saturation_idx = int(np.nanargmax(y))
+    saturation_idx = _find_saturation_idx(y)
     return {
         "saturation_idx": saturation_idx,
         "saturation_x": float(x[saturation_idx]),
@@ -534,6 +639,41 @@ def _build_langmuir_hybrid_fit(x: np.ndarray, y: np.ndarray) -> Optional[dict]:
         "langmuir_params": _fit_langmuir_isotherm(x[:saturation_idx + 1], y[:saturation_idx + 1]),
         "post_sat_poly": _fit_polynomial_segment(x[saturation_idx:], y[saturation_idx:]),
     }
+
+
+def _concentration_for_step(
+    step_index: int,
+    step_concentrations: Optional[List[float]] = None,
+) -> Optional[float]:
+    if not step_concentrations:
+        return None
+    idx = int(step_index) - 1
+    if idx < 0 or idx >= len(step_concentrations):
+        return None
+    value = step_concentrations[idx]
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) and value >= 0 else None
+
+
+def _fit_axis_from_steps(
+    ch_steps: List[dict],
+    step_concentrations: Optional[List[float]] = None,
+) -> Tuple[np.ndarray, str]:
+    concentrations = []
+    for row in ch_steps:
+        concentration = _concentration_for_step(
+            row["step_index"],
+            step_concentrations=step_concentrations,
+        )
+        if concentration is None:
+            concentration = row.get("step_concentration")
+        concentrations.append(concentration)
+    if concentrations and all(value is not None for value in concentrations):
+        return np.asarray(concentrations, dtype=float), "concentration"
+    return np.asarray([row["step_index"] for row in ch_steps], dtype=float), "step_index"
 
 
 def build_titration_langmuir_summary_table(
@@ -544,6 +684,8 @@ def build_titration_langmuir_summary_table(
     scan_windows: Optional[List[Tuple[int, int]]] = None,
     scan_range: Optional[Tuple[int, int]] = None,
     edge_trim_fraction: float = 0.15,
+    step_concentrations: Optional[List[float]] = None,
+    concentration_unit: str = "",
 ) -> List[dict]:
     step_rows = build_titration_step_table(
         all_results,
@@ -553,6 +695,8 @@ def build_titration_langmuir_summary_table(
         scan_windows=scan_windows,
         scan_range=scan_range,
         edge_trim_fraction=edge_trim_fraction,
+        step_concentrations=step_concentrations,
+        concentration_unit=concentration_unit,
     )
     if not step_rows:
         return []
@@ -566,7 +710,10 @@ def build_titration_langmuir_summary_table(
         if len(ch_steps) < 2:
             continue
 
-        x = np.asarray([row["step_index"] for row in ch_steps], dtype=float)
+        x, fit_axis_kind = _fit_axis_from_steps(
+            ch_steps,
+            step_concentrations=step_concentrations,
+        )
         y = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float)
         hybrid_fit = _build_langmuir_hybrid_fit(x, y)
         if hybrid_fit is None:
@@ -579,40 +726,51 @@ def build_titration_langmuir_summary_table(
 
         baseline = None
         amplitude = None
-        kd_step_index = None
+        kd = None
         fit_status = "guide_only"
-        if langmuir_params is not None:
+        if langmuir_params is not None and fit_axis_kind == "concentration":
             baseline = float(langmuir_params[0])
             amplitude = float(langmuir_params[1])
-            kd_step_index = float(langmuir_params[2])
+            kd = float(langmuir_params[2])
             fit_status = "langmuir_only"
+        elif langmuir_params is not None:
+            baseline = float(langmuir_params[0])
+            amplitude = float(langmuir_params[1])
+            fit_status = "step_index_fit_no_kd"
 
         post_sat_poly_degree = None
         if post_sat_poly is not None and saturation_idx < (len(ch_steps) - 1):
             _, post_sat_poly_degree = post_sat_poly
-            fit_status = (
-                "langmuir_plus_post_sat_poly"
-                if langmuir_params is not None
-                else "guide_plus_post_sat_poly"
-            )
+            if langmuir_params is not None and fit_axis_kind == "concentration":
+                fit_status = "langmuir_plus_post_sat_poly"
+            elif langmuir_params is not None:
+                fit_status = "step_index_fit_plus_post_sat_poly_no_kd"
+            else:
+                fit_status = "guide_plus_post_sat_poly"
 
         rows.append({
             "channel": ch,
             "metric_key": metric,
-            "fit_axis": "titration_step_index",
-            "fit_axis_note": "proxy_concentration",
+            "fit_axis": "concentration" if fit_axis_kind == "concentration" else "titration_step_index",
+            "fit_axis_unit": concentration_unit if fit_axis_kind == "concentration" else "",
+            "fit_axis_note": "physical_concentration" if fit_axis_kind == "concentration" else "no_physical_kd",
             "step_count": int(len(ch_steps)),
             "pre_saturation_step_count": int(saturation_idx + 1),
             "post_saturation_step_count": int(len(ch_steps) - saturation_idx - 1),
-            "saturation_step_index": float(hybrid_fit["saturation_x"]),
+            "saturation_step_index": float(ch_steps[saturation_idx]["step_index"]),
+            "saturation_concentration": (
+                float(hybrid_fit["saturation_x"])
+                if fit_axis_kind == "concentration" else None
+            ),
             "saturation_plateau_value": float(hybrid_fit["saturation_y"]),
             "saturation_left_vline_label": saturation_step["left_vline_label"],
             "saturation_right_vline_label": saturation_step["right_vline_label"],
-            "langmuir_fit_used": bool(langmuir_params is not None),
+            "langmuir_fit_used": bool(langmuir_params is not None and fit_axis_kind == "concentration"),
             "langmuir_fit_status": fit_status,
             "langmuir_baseline": baseline,
             "langmuir_amplitude": amplitude,
-            "langmuir_kd_step_index": kd_step_index,
+            "langmuir_kd": kd,
+            "langmuir_kd_unit": concentration_unit if kd is not None else "",
             "post_saturation_polynomial_degree": post_sat_poly_degree,
         })
 
@@ -1097,6 +1255,8 @@ def plot_titration_langmuir(
     xlabel: str = "Scan number",
     fit_langmuir: bool = True,
     fit_channels: Optional[List[int]] = None,
+    step_concentrations: Optional[List[float]] = None,
+    concentration_unit: str = "",
 ) -> Optional[plt.Figure]:
     step_rows = build_titration_step_table(
         all_results,
@@ -1106,6 +1266,8 @@ def plot_titration_langmuir(
         scan_windows=scan_windows,
         scan_range=scan_range,
         edge_trim_fraction=edge_trim_fraction,
+        step_concentrations=step_concentrations,
+        concentration_unit=concentration_unit,
     )
     if not step_rows:
         return None
@@ -1121,6 +1283,7 @@ def plot_titration_langmuir(
     plotted_any = False
     xticks = set()
     fit_notes: List[str] = []
+    x_axis_kind = "step_index"
 
     for ch in channels:
         ch_steps = sorted(
@@ -1132,9 +1295,15 @@ def plot_titration_langmuir(
 
         dimmed = highlight_channel is not None and ch != highlight_channel
         color = colors[ch]
-        x = np.asarray([row["step_index"] for row in ch_steps], dtype=float)
+        x, fit_axis_kind = _fit_axis_from_steps(
+            ch_steps,
+            step_concentrations=step_concentrations,
+        )
+        if fit_axis_kind == "concentration":
+            x_axis_kind = "concentration"
         y = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float)
-        xticks.update(int(v) for v in x)
+        if fit_axis_kind == "step_index":
+            xticks.update(int(v) for v in x)
 
         ax.scatter(
             x,
@@ -1179,6 +1348,38 @@ def plot_titration_langmuir(
                             lw=2.2,
                             alpha=0.25 if dimmed else 0.85,
                         )
+                        if fit_axis_kind == "concentration":
+                            kd_x = float(langmuir_params[2])
+                            if np.nanmin(x) <= kd_x <= np.nanmax(x):
+                                kd_y = float(_langmuir_isotherm(kd_x, *langmuir_params))
+                                ax.axvline(
+                                    kd_x,
+                                    color=color,
+                                    lw=1.2,
+                                    linestyle="--",
+                                    alpha=0.18 if dimmed else 0.65,
+                                )
+                                ax.scatter(
+                                    kd_x,
+                                    kd_y,
+                                    s=72,
+                                    marker="o",
+                                    facecolors=color,
+                                    edgecolors="white",
+                                    linewidths=1.1,
+                                    alpha=0.35 if dimmed else 0.95,
+                                    zorder=6,
+                                )
+                                unit_suffix = f" {concentration_unit}" if concentration_unit else ""
+                                ax.annotate(
+                                    f"Kd {kd_x:.3g}{unit_suffix}",
+                                    xy=(kd_x, kd_y),
+                                    xytext=(8, 10),
+                                    textcoords="offset points",
+                                    color=color,
+                                    fontsize=8,
+                                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.5),
+                                )
                     elif saturation_idx >= 1:
                         ax.plot(
                             x[:saturation_idx + 1],
@@ -1189,9 +1390,17 @@ def plot_titration_langmuir(
                         )
 
                     pre_sat_label = "Langmuir <= sat" if langmuir_params is not None else "guide <= sat"
-                    fit_note = f"Ch{ch}: sat step {int(round(saturation_x))}, {pre_sat_label}"
-                    if langmuir_params is not None:
-                        fit_note += f", app. Kd {langmuir_params[2]:.3g} steps"
+                    sat_step_index = int(ch_steps[saturation_idx]["step_index"])
+                    if fit_axis_kind == "concentration":
+                        unit_suffix = f" {concentration_unit}" if concentration_unit else ""
+                        fit_note = f"Ch{ch}: {pre_sat_label}; sat step {sat_step_index} ({saturation_x:.3g}{unit_suffix})"
+                    else:
+                        fit_note = f"Ch{ch}: {pre_sat_label}; sat step {sat_step_index}"
+                    if langmuir_params is not None and fit_axis_kind == "concentration":
+                        unit_suffix = f" {concentration_unit}" if concentration_unit else ""
+                        fit_note = f"Ch{ch}: Kd = {langmuir_params[2]:.3g}{unit_suffix}; sat step {sat_step_index} ({saturation_x:.3g}{unit_suffix})"
+                    elif langmuir_params is not None:
+                        fit_note += ", no Kd (missing concentration axis)"
                     if post_sat_poly is not None and saturation_idx < (x.size - 1):
                         poly_model, poly_degree = post_sat_poly
                         x_dense = np.linspace(saturation_x, x.max(), 200)
@@ -1223,7 +1432,7 @@ def plot_titration_langmuir(
                         zorder=5,
                     )
                     ax.annotate(
-                        f"Sat. step {int(round(saturation_x))}",
+                        f"Sat. step {sat_step_index}",
                         xy=(saturation_x, saturation_y),
                         xytext=(8, -16),
                         textcoords="offset points",
@@ -1238,7 +1447,11 @@ def plot_titration_langmuir(
         plt.close(fig)
         return None
 
-    ax.set_xlabel("Titration step index (proxy concentration)")
+    if x_axis_kind == "concentration":
+        unit_suffix = f" ({concentration_unit})" if concentration_unit else ""
+        ax.set_xlabel(f"Ligand concentration{unit_suffix}")
+    else:
+        ax.set_xlabel("Titration step index")
     ax.set_ylabel(ylabel or metric)
     ax.set_title(title or f"{metric} titration isotherm")
     ax.grid(False)

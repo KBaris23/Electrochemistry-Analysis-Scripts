@@ -4,10 +4,12 @@ Run with:  python -m streamlit run app.py
 """
 
 import bisect
+from datetime import datetime
 import io
 import json
 import math
 import os
+from pathlib import Path
 import subprocess
 import sys
 import zipfile
@@ -153,6 +155,7 @@ def collect_titration_rows(
     vlines,
     scan_range,
     edge_trim_fraction,
+    concentration_unit="",
 ):
     rows = []
     for label, (metric_key, ylabel) in metric_cfg.items():
@@ -163,6 +166,7 @@ def collect_titration_rows(
             channels=channels,
             scan_range=scan_range,
             edge_trim_fraction=edge_trim_fraction,
+            concentration_unit=concentration_unit,
         )
         for row in metric_rows:
             rows.append({
@@ -181,6 +185,8 @@ def collect_langmuir_summary_rows(
     vlines,
     scan_range,
     edge_trim_fraction,
+    step_concentrations=None,
+    concentration_unit="",
 ):
     rows = []
     for label, (metric_key, ylabel) in metric_cfg.items():
@@ -193,6 +199,8 @@ def collect_langmuir_summary_rows(
             channels=channels,
             scan_range=scan_range,
             edge_trim_fraction=edge_trim_fraction,
+            step_concentrations=step_concentrations,
+            concentration_unit=concentration_unit,
         )
         for row in metric_rows:
             rows.append({
@@ -232,6 +240,7 @@ def build_export_metadata(
     peak_height_source_label: Optional[str] = None,
     compute_wavelet_denoised_trace: Optional[bool] = None,
     use_wavelet_for_correction: Optional[bool] = None,
+    titration_concentration_unit: Optional[str] = None,
 ) -> dict:
     metadata = {
         "analysis_crop_min_V": float(crop_range[0]),
@@ -267,6 +276,7 @@ def build_export_metadata(
                 float(titration_edge_trim_fraction)
                 if titration_edge_trim_fraction is not None else None
             ),
+            analysis_titration_concentration_unit=titration_concentration_unit or "",
             analysis_peak_height_source_key=peak_height_source_key or "",
             analysis_peak_height_source_label=peak_height_source_label or "",
             analysis_compute_wavelet_denoised_trace=bool(compute_wavelet_denoised_trace),
@@ -285,6 +295,142 @@ def build_export_metadata(
         )
 
     return metadata
+
+
+def export_file_name(analysis_mode: str, stem: str) -> str:
+    prefix = "cv" if analysis_mode == "CV" else "swv"
+    return f"{prefix}_{stem}.csv"
+
+
+def build_results_export_rows(analysis_mode: str, results: List[dict]) -> Tuple[List[dict], List[str]]:
+    if analysis_mode == "CV":
+        export_keys = [
+            "channel", "ec_label", "measurement_index", "scan_number", "original_scan_number",
+            "cycle_count_in_file", "method_nscans", "timestamp", "file_name", "status",
+            "oxidation_peak_voltage", "oxidation_peak_current", "oxidation_peak_prominence",
+            "reduction_peak_voltage", "reduction_peak_current", "reduction_peak_prominence",
+            "peak_separation_V", "peak_current_ratio", "loop_area_abs",
+            "oxidation_peak_voltage_drift", "reduction_peak_voltage_drift",
+            "peak_separation_drift", "loop_area_abs_drift", "error",
+        ]
+    else:
+        export_keys = [
+            "channel", "swv_method_group", "frequency_hz",
+            "swv_sweep_start_V", "swv_sweep_end_V", "swv_step_size_V", "swv_amplitude_V",
+            "scan_number", "filtered_source_scan_number", "original_scan_number",
+            "timestamp", "file_name", "status",
+            "peak_voltage", "peak_current_selected", "peak_current_background_drift_corrected",
+            "peak_current_background_recentered", "peak_current", "peak_current_smoothed_corrected",
+            "peak_current_raw", "bracket_width_V",
+            "skew", "peak_offset_norm", "wavelet_energy",
+            "background_current_rms", "background_current_median", "background_drift_rms_reference",
+            "background_current_median_reference", "background_current_offset_uA", "background_drift_percent",
+            "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
+        ]
+
+    csv_rows = []
+    for r in results:
+        row = {}
+        for k in export_keys:
+            if analysis_mode == "SWV" and k == "frequency_hz":
+                row[k] = r.get("swv_frequency_hz")
+            else:
+                row[k] = r.get(k)
+        csv_rows.append(row)
+    return csv_rows, export_keys
+
+
+def _safe_folder_name(text: str, fallback: str = "analysis") -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text.strip())
+    safe = "_".join(part for part in safe.split("_") if part)
+    return safe[:80] or fallback
+
+
+def build_experiment_export_payload(
+    analysis_mode: str,
+    results: List[dict],
+    export_metadata: dict,
+    metric_cfg: Dict[str, Tuple[str, str]],
+    channels: List[int],
+    active_vlines: List[Tuple[float, str]],
+    scan_range: Optional[Tuple[int, int]],
+    enable_titration_analysis: bool,
+    titration_ready: bool,
+    titration_edge_trim_fraction: float,
+    fit_titration_langmuir: bool,
+    titration_concentration_unit: str,
+) -> Dict[str, pd.DataFrame]:
+    result_rows, _export_keys = build_results_export_rows(analysis_mode, results)
+    payload = {
+        "signal_processing_inputs": pd.DataFrame([export_metadata]),
+        "results": pd.DataFrame(result_rows),
+    }
+
+    if enable_titration_analysis and titration_ready:
+        titration_rows = collect_titration_rows(
+            results,
+            metric_cfg=metric_cfg,
+            channels=channels,
+            vlines=active_vlines,
+            scan_range=scan_range,
+            edge_trim_fraction=titration_edge_trim_fraction,
+            concentration_unit=titration_concentration_unit,
+        )
+        if titration_rows:
+            payload["titration_steps"] = pd.DataFrame(titration_rows)
+
+        if fit_titration_langmuir:
+            langmuir_rows = collect_langmuir_summary_rows(
+                results,
+                metric_cfg=metric_cfg,
+                channels=channels,
+                vlines=active_vlines,
+                scan_range=scan_range,
+                edge_trim_fraction=titration_edge_trim_fraction,
+                concentration_unit=titration_concentration_unit,
+            )
+            if langmuir_rows:
+                payload["langmuir_fit_summary"] = pd.DataFrame(langmuir_rows)
+
+    return payload
+
+
+def write_experiment_output_bundle(
+    export_root: Path,
+    experiment_name: str,
+    experiment_notes: str,
+    analysis_mode: str,
+    source_folders: List[str],
+    export_payload: Dict[str, pd.DataFrame],
+    export_metadata: dict,
+) -> Path:
+    created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bundle_name = f"{timestamp}_{_safe_folder_name(experiment_name)}"
+    bundle_dir = export_root / "outputs" / bundle_name
+    bundle_dir.mkdir(parents=True, exist_ok=False)
+
+    files = {}
+    for key, df in export_payload.items():
+        file_name = export_file_name(analysis_mode, key)
+        df.to_csv(bundle_dir / file_name, index=False)
+        files[key] = file_name
+
+    manifest = {
+        "schema_version": "1.0",
+        "created_at": created_at,
+        "app": "swv_app",
+        "analysis_mode": analysis_mode,
+        "experiment_name": experiment_name,
+        "experiment_notes": experiment_notes,
+        "source_folders": source_folders,
+        "files": files,
+        "metadata": export_metadata,
+    }
+    with open(bundle_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    return bundle_dir
 
 
 def _fig_to_image(fig: plt.Figure, dpi: int = 130) -> np.ndarray:
@@ -518,6 +664,25 @@ def build_export_pdf(
 
 LANGMUIR_METRIC_KEY = "peak_current_selected"
 DEFAULT_SWV_VLINES_TEXT = ""
+VLINE_ANNOTATION_HELP = (
+    "One marker per line: scan,label. The scan is the x-axis position. "
+    "For titration Kd, start the label with the concentration for the interval after that marker. "
+    "Use buffer for zero ligand. Example: 40,10 uM."
+)
+VLINE_ANNOTATION_PLACEHOLDER = (
+    "0, buffer\n"
+    "20, buffer\n"
+    "40, 10 uM\n"
+    "60, 20 uM\n"
+    "80, 40 uM\n"
+    "100, 80 uM\n"
+    "120, 160 uM\n"
+    "140, 320 uM\n"
+    "160, 640 uM\n"
+    "180, 1.28 mM\n"
+    "200, 2.56 mM\n"
+    "220, end"
+)
 
 
 def supports_langmuir(metric_key: str) -> bool:
@@ -877,7 +1042,10 @@ def parse_vlines(text: str) -> Tuple[List[Tuple[float, str]], List[str]]:
 
         parts = token.split(",", 1)
         if len(parts) != 2:
-            errors.append(f"Ignored line {line_number}: use scan,label format.")
+            errors.append(
+                f"Ignored line {line_number}: use scan,label format, "
+                "for example 45,10 nM, target added."
+            )
             continue
 
         scan_text, label = parts[0].strip(), parts[1].strip()
@@ -1141,6 +1309,7 @@ for k, v in dict(
     swv_enable_titration_analysis=False,
     swv_titration_edge_trim_fraction=0.15,
     swv_fit_titration_langmuir=True,
+    swv_titration_concentration_unit="uM",
 ).items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1406,30 +1575,6 @@ with st.sidebar:
         st.subheader(" Cycle View")
         st.caption("CV metrics are tracked across detected cycle number within each EC block, so scan windows and vlines are not used here.")
 
-    enable_titration_analysis = st.checkbox(
-        "Treat vline intervals as titration steps",
-        value=False,
-        help="Each interval between consecutive vertical lines becomes one titration step.",
-    )
-    titration_edge_trim_fraction = 0.15
-    fit_titration_langmuir = False
-    if enable_titration_analysis:
-        titration_edge_trim_fraction = st.slider(
-            "Plateau edge trim fraction",
-            min_value=0.0,
-            max_value=0.4,
-            value=0.15,
-            step=0.05,
-            help="Uses only the middle portion of each step when estimating the plateau median.",
-        )
-        fit_titration_langmuir = st.checkbox(
-            "Fit Langmuir-style curve to step plateaus",
-            value=True,
-            help="Uses titration step index as a proxy x-axis and fits a simple Langmuir isotherm.",
-        )
-
-    st.divider()
-
     #  Failed traces 
     max_failed = 40
     if analysis_mode == "SWV":
@@ -1674,6 +1819,7 @@ vlines: List[Tuple[float, str]] = []
 enable_titration_analysis = False
 titration_edge_trim_fraction = 0.15
 fit_titration_langmuir = False
+titration_concentration_unit = "uM"
 swv_method_filter_enabled = False
 swv_method_filter_applied = False
 selected_swv_method_groups: List[str] = []
@@ -1731,13 +1877,19 @@ if analysis_mode == "SWV":
     with st.expander("Scan Annotations", expanded=False):
         with st.form("swv_post_analysis_controls"):
             st.caption(
-                "Apply vlines and titration options together. "
-                "Vlines use the current plotted scan axis, including subsection-relative numbering."
+                "Vlines are written as scan,label. They use the current plotted scan axis, "
+                "including subsection-relative numbering."
+            )
+            st.caption(
+                "For titration, consecutive vlines define steps. The concentration at the left vline "
+                "is used for that step; the last vline simply closes the final interval."
             )
             st.text_area(
-                "scan,label  one per line",
+                "Vline annotations",
                 height=180,
                 key="swv_post_vlines_input",
+                help=VLINE_ANNOTATION_HELP,
+                placeholder=VLINE_ANNOTATION_PLACEHOLDER,
             )
 
             enable_titration_analysis = st.checkbox(
@@ -1760,7 +1912,20 @@ if analysis_mode == "SWV":
                 fit_titration_langmuir = st.checkbox(
                     "Fit Langmuir-style curve to step plateaus",
                     key="swv_fit_titration_langmuir",
-                    help="Only applies to corrected peak-current plateaus and fits a Langmuir-to-saturation curve with an optional post-saturation polynomial tail.",
+                    help="Only reports Kd when titration vline labels include concentrations.",
+                )
+                titration_concentration_unit = st.selectbox(
+                    "Kd/report concentration unit",
+                    options=["pM", "nM", "uM", "mM", "M"],
+                    key="swv_titration_concentration_unit",
+                    help=(
+                        "Vline labels with units are converted into this unit for fitting/reporting. "
+                        "Unitless numeric labels also use this unit."
+                    ),
+                )
+                st.caption(
+                    "Kd labels must start with concentration. Examples: "
+                    "`40,10 uM`, `180,1.28 mM`, or `0,buffer`."
                 )
             else:
                 st.session_state["_swv_titration_trim_initialized_for_toggle"] = False
@@ -1817,21 +1982,6 @@ st.divider()
 if not results:
     st.info("No measurements match the current SWV method filter.")
     st.stop()
-
-metric_cfg = {
-    "Peak current (corrected)": ("peak_current",     "Corrected Peak Height (uA)"),
-    "Peak current (raw)":       ("peak_current_raw", "Raw Current at Peak (uA)"),
-    "Skew":                     ("skew",             "Skew (corrected trace)"),
-    "Peak offset (normalized)": ("peak_offset_norm", "Peak offset from bracket center (normalized)"),
-    "Wavelet energy":           ("wavelet_energy",   "Wavelet Energy (a.u.)"),
-}
-if not compute_skew:
-    metric_cfg.pop("Skew", None)
-    metric_cfg.pop("Peak offset (normalized)", None)
-if not compute_wavelet_energy:
-    metric_cfg.pop("Wavelet energy", None)
-
-titration_ready = enable_titration_analysis and len(vlines) >= 2
 
 # 
 # Tabs
@@ -1997,7 +2147,10 @@ if view == "Metrics":
                 f"estimated from the median of the middle {kept_pct}% of scans in that step."
             )
             if fit_titration_langmuir:
-                st.caption(f"Langmuir fits are only shown for {selected_peak_height_metric_label}.")
+                st.caption(
+                    f"Langmuir fits are only shown for {selected_peak_height_metric_label}; "
+                    "Kd requires concentrations in the vline labels."
+                )
 
     for label in selected_metrics:
         metric, ylabel = metric_cfg[label]
@@ -2082,6 +2235,7 @@ if view == "Metrics":
                         highlight_channel=highlight_ch,
                         fit_langmuir=True,
                         fit_channels=[highlight_ch] if highlight_ch is not None else None,
+                        concentration_unit=titration_concentration_unit,
                     )
                     if fig:
                         st.pyplot(fig)
@@ -2101,6 +2255,7 @@ if view == "Metrics":
                             edge_trim_fraction=titration_edge_trim_fraction,
                             figsize=(5, 3),
                             fit_langmuir=True,
+                            concentration_unit=titration_concentration_unit,
                         )
                         if fig:
                             with cols[i % min(len(channels_display), 3)]:
@@ -2381,11 +2536,16 @@ if view == "Data Table":
                     channels=ch_filter,
                     scan_range=plot_scan_range,
                     edge_trim_fraction=titration_edge_trim_fraction,
+                    concentration_unit=titration_concentration_unit,
                 ):
                     titration_rows.append({
                         "Metric": label,
                         "Channel": row["channel"],
                         "Step #": row["step_index"],
+                        "Step label": row["step_display_label"],
+                        "Concentration": row["step_concentration"],
+                        "Unit": row["step_concentration_unit"],
+                        "Note": row["step_note"],
                         "Left marker": row["left_vline_label"],
                         "Right marker": row["right_vline_label"],
                         "Step start": row["step_start_scan"],
@@ -2416,6 +2576,7 @@ if view == "Data Table":
                     vlines=active_vlines,
                     scan_range=plot_scan_range,
                     edge_trim_fraction=titration_edge_trim_fraction,
+                    concentration_unit=titration_concentration_unit,
                 )
                 if langmuir_rows:
                     langmuir_df = pd.DataFrame([
@@ -2423,10 +2584,12 @@ if view == "Data Table":
                             "Metric": row["metric_label"],
                             "Channel": row["channel"],
                             "Fit status": row["langmuir_fit_status"],
-                            "Apparent Kd (step index)": row["langmuir_kd_step_index"],
+                            f"Kd ({row.get('langmuir_kd_unit') or titration_concentration_unit})": row["langmuir_kd"],
                             "Baseline": row["langmuir_baseline"],
                             "Amplitude": row["langmuir_amplitude"],
                             "Saturation step": row["saturation_step_index"],
+                            "Saturation concentration": row["saturation_concentration"],
+                            "Unit": row["fit_axis_unit"],
                             "Saturation plateau": row["saturation_plateau_value"],
                             "Step count": row["step_count"],
                             "Pre-sat steps": row["pre_saturation_step_count"],
@@ -2439,8 +2602,8 @@ if view == "Data Table":
                     ])
                     st.dataframe(langmuir_df, use_container_width=True, height=220)
                     st.caption(
-                        "Apparent Kd is reported in titration-step units because the current Langmuir x-axis "
-                        "uses step index as a proxy for concentration."
+                        "Kd is reported only when the fitted titration steps have numeric concentrations "
+                        "from their left vline labels."
                     )
                 else:
                     st.info("No Langmuir fit summaries are available for the current filters.")
@@ -2518,108 +2681,126 @@ if view == "Export":
         peak_height_source_label=selected_peak_height_source_label if analysis_mode == "SWV" else None,
         compute_wavelet_denoised_trace=compute_wavelet_denoised_trace if analysis_mode == "SWV" else None,
         use_wavelet_for_correction=use_wavelet_for_correction if analysis_mode == "SWV" else None,
+        titration_concentration_unit=titration_concentration_unit if analysis_mode == "SWV" else None,
+    )
+    export_payload = build_experiment_export_payload(
+        analysis_mode=analysis_mode,
+        results=results,
+        export_metadata=export_metadata,
+        metric_cfg=metric_cfg,
+        channels=channels_display,
+        active_vlines=active_vlines,
+        scan_range=plot_scan_range,
+        enable_titration_analysis=enable_titration_analysis,
+        titration_ready=titration_ready,
+        titration_edge_trim_fraction=titration_edge_trim_fraction,
+        fit_titration_langmuir=fit_titration_langmuir,
+        titration_concentration_unit=titration_concentration_unit,
     )
 
+    st.markdown("#### Save experiment output folder")
+    default_experiment_name = Path(folders[0]).name if folders else f"{analysis_mode.lower()}_analysis"
+    experiment_name = st.text_input(
+        "Experiment name",
+        value=default_experiment_name,
+        help="Used in the output folder name and manifest.",
+        key="export_experiment_name",
+    )
+    experiment_notes = st.text_area(
+        "Experiment notes",
+        height=80,
+        help="Optional notes saved in manifest.json for the future comparison app.",
+        key="export_experiment_notes",
+    )
+    export_root = None
+    if len(folders) == 1:
+        export_root = Path(folders[0])
+    elif len(folders) > 1:
+        selected_export_root = st.selectbox(
+            "Save outputs inside",
+            options=folders,
+            help=(
+                "Multiple data folders are selected. Choose which folder should receive the outputs/ "
+                "subfolder for this combined analysis. All source folders are still recorded in manifest.json."
+            ),
+            key="export_output_root",
+        )
+        export_root = Path(selected_export_root)
+    if export_root is not None:
+        st.caption(f"Output location: `{export_root / 'outputs'}`")
+    else:
+        st.info("Select at least one data folder before saving an experiment output bundle.")
+
+    if st.button(
+        "Save experiment output to outputs/",
+        use_container_width=True,
+        disabled=export_root is None,
+    ):
+        try:
+            bundle_dir = write_experiment_output_bundle(
+                export_root=export_root,
+                experiment_name=experiment_name,
+                experiment_notes=experiment_notes,
+                analysis_mode=analysis_mode,
+                source_folders=folders,
+                export_payload=export_payload,
+                export_metadata=export_metadata,
+            )
+            st.success(f"Saved experiment output bundle: `{bundle_dir}`")
+        except FileExistsError:
+            st.error("An output folder with this timestamp/name already exists. Try again in a moment.")
+        except Exception as e:
+            st.error(f"Could not save experiment output bundle: {e}")
+
+    st.divider()
+
     st.markdown("####  Signal Processing Inputs CSV")
-    signal_processing_csv = pd.DataFrame([export_metadata]).to_csv(index=False).encode()
+    signal_processing_csv = export_payload["signal_processing_inputs"].to_csv(index=False).encode()
     st.download_button(
         "  Download signal_processing_inputs.csv",
         data=signal_processing_csv,
-        file_name=(
-            "cv_signal_processing_inputs.csv"
-            if analysis_mode == "CV" else "swv_signal_processing_inputs.csv"
-        ),
+        file_name=export_file_name(analysis_mode, "signal_processing_inputs"),
         mime="text/csv",
         use_container_width=True,
     )
 
     st.markdown("####  Results CSV")
-    if analysis_mode == "CV":
-        export_keys = [
-            "channel", "ec_label", "measurement_index", "scan_number", "original_scan_number",
-            "cycle_count_in_file", "method_nscans", "timestamp", "file_name", "status",
-            "oxidation_peak_voltage", "oxidation_peak_current", "oxidation_peak_prominence",
-            "reduction_peak_voltage", "reduction_peak_current", "reduction_peak_prominence",
-            "peak_separation_V", "peak_current_ratio", "loop_area_abs",
-            "oxidation_peak_voltage_drift", "reduction_peak_voltage_drift",
-            "peak_separation_drift", "loop_area_abs_drift", "error",
-        ]
-    else:
-        export_keys = [
-            "channel", "swv_method_group", "frequency_hz",
-            "swv_sweep_start_V", "swv_sweep_end_V", "swv_step_size_V", "swv_amplitude_V",
-            "scan_number", "filtered_source_scan_number", "original_scan_number",
-            "timestamp", "file_name", "status",
-            "peak_voltage", "peak_current_selected", "peak_current_background_drift_corrected", "peak_current_background_recentered", "peak_current", "peak_current_smoothed_corrected",
-            "peak_current_raw", "bracket_width_V",
-            "skew", "peak_offset_norm", "wavelet_energy",
-            "background_current_rms", "background_current_median", "background_drift_rms_reference",
-            "background_current_median_reference", "background_current_offset_uA", "background_drift_percent",
-            "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
-        ]
-    csv_rows = []
-    for r in results:
-        row = {}
-        for k in export_keys:
-            if analysis_mode == "SWV" and k == "frequency_hz":
-                row[k] = r.get("swv_frequency_hz")
-            else:
-                row[k] = r.get(k)
-        csv_rows.append(row)
-    csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode()
+    csv_bytes = export_payload["results"].to_csv(index=False).encode()
     st.download_button("  Download results.csv", data=csv_bytes,
-                       file_name="cv_results.csv" if analysis_mode == "CV" else "swv_results.csv", mime="text/csv",
+                       file_name=export_file_name(analysis_mode, "results"), mime="text/csv",
                        use_container_width=True)
 
     if enable_titration_analysis:
         st.markdown("####  Titration step CSV")
         if not titration_ready:
             st.info("Add at least two vertical lines inside the active scan range to export titration steps.")
-        else:
-            titration_export_rows = collect_titration_rows(
-                results,
-                metric_cfg=metric_cfg,
-                channels=channels_display,
-                vlines=active_vlines,
-                scan_range=plot_scan_range,
-                edge_trim_fraction=titration_edge_trim_fraction,
+        elif "titration_steps" in export_payload:
+            titration_csv = export_payload["titration_steps"].to_csv(index=False).encode()
+            st.download_button(
+                "  Download titration_steps.csv",
+                data=titration_csv,
+                file_name=export_file_name(analysis_mode, "titration_steps"),
+                mime="text/csv",
+                use_container_width=True,
             )
-            if titration_export_rows:
-                titration_csv = pd.DataFrame(titration_export_rows).to_csv(index=False).encode()
-                st.download_button(
-                    "  Download titration_steps.csv",
-                    data=titration_csv,
-                    file_name="swv_titration_steps.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            else:
-                st.info("No titration step rows are available for export with the current settings.")
+        else:
+            st.info("No titration step rows are available for export with the current settings.")
 
     if enable_titration_analysis and fit_titration_langmuir:
         st.markdown("####  Langmuir fit summary CSV")
         if not titration_ready:
             st.info("Add at least two vertical lines inside the active scan range to export Langmuir fit summaries.")
-        else:
-            langmuir_export_rows = collect_langmuir_summary_rows(
-                results,
-                metric_cfg=metric_cfg,
-                channels=channels_display,
-                vlines=active_vlines,
-                scan_range=plot_scan_range,
-                edge_trim_fraction=titration_edge_trim_fraction,
+        elif "langmuir_fit_summary" in export_payload:
+            langmuir_csv = export_payload["langmuir_fit_summary"].to_csv(index=False).encode()
+            st.download_button(
+                "  Download langmuir_fit_summary.csv",
+                data=langmuir_csv,
+                file_name=export_file_name(analysis_mode, "langmuir_fit_summary"),
+                mime="text/csv",
+                use_container_width=True,
             )
-            if langmuir_export_rows:
-                langmuir_csv = pd.DataFrame(langmuir_export_rows).to_csv(index=False).encode()
-                st.download_button(
-                    "  Download langmuir_fit_summary.csv",
-                    data=langmuir_csv,
-                    file_name="swv_langmuir_fit_summary.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            else:
-                st.info("No Langmuir fit summary rows are available for export with the current settings.")
+        else:
+            st.info("No Langmuir fit summary rows are available for export with the current settings.")
 
     st.divider()
 
@@ -2719,6 +2900,7 @@ if view == "Export":
                             scan_range=plot_scan_range,
                             edge_trim_fraction=titration_edge_trim_fraction,
                             fit_langmuir=True,
+                            concentration_unit=titration_concentration_unit,
                         )
                         if fig:
                             _save(fig, f"titration/langmuir/{metric}.{fig_format}")
