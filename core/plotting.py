@@ -1258,6 +1258,9 @@ def plot_titration_langmuir(
     step_concentrations: Optional[List[float]] = None,
     concentration_unit: str = "",
 ) -> Optional[plt.Figure]:
+    if metric != "peak_current_selected":
+        return None
+
     step_rows = build_titration_step_table(
         all_results,
         metric=metric,
@@ -1284,6 +1287,8 @@ def plot_titration_langmuir(
     xticks = set()
     fit_notes: List[str] = []
     x_axis_kind = "step_index"
+    concentration_xmax = None
+    langmuir_xmax = None
 
     for ch in channels:
         ch_steps = sorted(
@@ -1301,6 +1306,13 @@ def plot_titration_langmuir(
         )
         if fit_axis_kind == "concentration":
             x_axis_kind = "concentration"
+            channel_xmax = float(np.nanmax(x)) if x.size else None
+            if channel_xmax is not None and np.isfinite(channel_xmax):
+                concentration_xmax = (
+                    channel_xmax
+                    if concentration_xmax is None
+                    else max(concentration_xmax, channel_xmax)
+                )
         y = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float)
         if fit_axis_kind == "step_index":
             xticks.update(int(v) for v in x)
@@ -1394,6 +1406,12 @@ def plot_titration_langmuir(
                     if fit_axis_kind == "concentration":
                         unit_suffix = f" {concentration_unit}" if concentration_unit else ""
                         fit_note = f"Ch{ch}: {pre_sat_label}; sat step {sat_step_index} ({saturation_x:.3g}{unit_suffix})"
+                        if np.isfinite(saturation_x):
+                            langmuir_xmax = (
+                                saturation_x
+                                if langmuir_xmax is None
+                                else max(langmuir_xmax, saturation_x)
+                            )
                     else:
                         fit_note = f"Ch{ch}: {pre_sat_label}; sat step {sat_step_index}"
                     if langmuir_params is not None and fit_axis_kind == "concentration":
@@ -1401,19 +1419,6 @@ def plot_titration_langmuir(
                         fit_note = f"Ch{ch}: Kd = {langmuir_params[2]:.3g}{unit_suffix}; sat step {sat_step_index} ({saturation_x:.3g}{unit_suffix})"
                     elif langmuir_params is not None:
                         fit_note += ", no Kd (missing concentration axis)"
-                    if post_sat_poly is not None and saturation_idx < (x.size - 1):
-                        poly_model, poly_degree = post_sat_poly
-                        x_dense = np.linspace(saturation_x, x.max(), 200)
-                        ax.plot(
-                            x_dense,
-                            poly_model(x_dense),
-                            color=color,
-                            lw=1.9,
-                            linestyle="-.",
-                            alpha=0.25 if dimmed else 0.85,
-                        )
-                        fit_note += f", post-sat poly deg {poly_degree}"
-
                     fit_notes.append(fit_note)
                     ax.axvline(
                         saturation_x,
@@ -1450,6 +1455,9 @@ def plot_titration_langmuir(
     if x_axis_kind == "concentration":
         unit_suffix = f" ({concentration_unit})" if concentration_unit else ""
         ax.set_xlabel(f"Ligand concentration{unit_suffix}")
+        xmax = langmuir_xmax if langmuir_xmax is not None else concentration_xmax
+        if xmax is not None and xmax > 0:
+            ax.set_xlim(left=0, right=xmax)
     else:
         ax.set_xlabel("Titration step index")
     ax.set_ylabel(ylabel or metric)
