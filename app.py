@@ -222,12 +222,26 @@ def _serialize_vlines(vlines: List[Tuple[float, str]]) -> str:
     )
 
 
+def _format_channels(channels: Optional[List[int]]) -> str:
+    if not channels:
+        return ""
+    return ",".join(str(int(ch)) for ch in channels)
+
+
+def _serialize_channels(channels: Optional[List[int]]) -> str:
+    return json.dumps(
+        [int(ch) for ch in channels] if channels else [],
+        separators=(",", ":"),
+    )
+
+
 def build_export_metadata(
     analysis_mode: str,
     crop_range: Tuple[float, float],
     smooth_window: int,
     smooth_polyorder: int,
     active_vlines: List[Tuple[float, str]],
+    selected_channels: Optional[List[int]] = None,
     scan_windows: Optional[List[Tuple[int, int]]] = None,
     scan_range: Optional[Tuple[int, int]] = None,
     minima_search_window_V: Optional[float] = None,
@@ -256,6 +270,11 @@ def build_export_metadata(
         "analysis_scan_windows": format_scan_windows(scan_windows) if scan_windows else "",
         "analysis_vline_count": int(len(active_vlines)),
         "analysis_vlines_json": _serialize_vlines(active_vlines),
+        "analysis_selected_channel_count": (
+            int(len(selected_channels)) if selected_channels is not None else None
+        ),
+        "analysis_selected_channels": _format_channels(selected_channels),
+        "analysis_selected_channels_json": _serialize_channels(selected_channels),
     }
 
     if analysis_mode == "SWV":
@@ -2669,6 +2688,7 @@ if view == "Export":
         smooth_window=smooth_window,
         smooth_polyorder=smooth_polyorder,
         active_vlines=active_vlines,
+        selected_channels=channels_display,
         scan_windows=scan_windows,
         scan_range=plot_scan_range,
         minima_search_window_V=minima_search_window if analysis_mode == "SWV" else None,
