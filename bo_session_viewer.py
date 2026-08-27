@@ -16050,7 +16050,7 @@ def _pdf_metadata_lines(
         *completion_lines,
         f"Candidate count: {state.get('candidate_count', 'unknown')}",
         (
-            f"Best observation: {best.get('group_name', f'Group {best.get('group_id', 1)}')} "
+            f"Best observation: {best.get('group_name') or ('Group ' + str(best.get('group_id', 1)))} "
             f"iteration {best.get('iteration')}"
         ),
         f"Best Q_run: {float(best.get('Q_run', 0)):.6g}",
@@ -28101,6 +28101,531 @@ def _render_app_scrollbar_style() -> None:
     )
 
 
+def _composer_layout_rects(count: int, preset: str) -> list[tuple[float, float, float, float]]:
+    if count <= 0 or preset == "Manual":
+        return []
+    if preset == "Main left + stack" and count >= 2:
+        gap = .045
+        side_rows = count - 1
+        side_height = (.82 - gap * (side_rows - 1)) / side_rows
+        rects = [(.07, .10, .56, .82)]
+        for index in range(side_rows):
+            bottom = .10 + (side_rows - 1 - index) * (side_height + gap)
+            rects.append((.69, bottom, .26, side_height))
+        return rects[:count]
+    if preset == "Top wide + grid" and count >= 3:
+        rects = [(.07, .58, .88, .34)]
+        remaining = count - 1
+        columns = min(3, remaining)
+        rows = int(np.ceil(remaining / columns))
+        gap_x, gap_y = .045, .06
+        width = (.88 - gap_x * (columns - 1)) / columns
+        height = (.40 - gap_y * (rows - 1)) / rows
+        for index in range(remaining):
+            row, column = divmod(index, columns)
+            bottom = .10 + (rows - 1 - row) * (height + gap_y)
+            rects.append((.07 + column * (width + gap_x), bottom, width, height))
+        return rects[:count]
+    columns = int(np.ceil(np.sqrt(count)))
+    rows = int(np.ceil(count / columns))
+    gap_x, gap_y = .055, .075
+    left, bottom, width, height = .07, .10, .88, .82
+    panel_width = (width - gap_x * (columns - 1)) / columns
+    panel_height = (height - gap_y * (rows - 1)) / rows
+    rects = []
+    for index in range(count):
+        row, column = divmod(index, columns)
+        y = bottom + (rows - 1 - row) * (panel_height + gap_y)
+        rects.append((left + column * (panel_width + gap_x), y, panel_width, panel_height))
+    return rects
+
+
+def _composer_metric_series(history: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
+    x = pd.to_numeric(
+        history.get("iteration", pd.Series(range(1, len(history) + 1))),
+        errors="coerce",
+    )
+    y = pd.to_numeric(history[column], errors="coerce")
+    valid = x.notna() & y.notna()
+    return x[valid], y[valid]
+
+
+def _composer_draw_global(ax, history: pd.DataFrame, metric: str, font_size: int) -> None:
+    x, y = _composer_metric_series(history, metric)
+    line_color = _plot_line_color_override() or "#155e63"
+    ax.plot(x, y, marker="o", linewidth=1.5, color=line_color, label=metric)
+    if metric == "Q_run" and len(y):
+        ax.plot(x, y.cummax(), linewidth=1.4, color="#d67b32", label="Best so far")
+        ax.legend(fontsize=max(6, font_size - 2))
+    ax.set(xlabel="BO iteration", ylabel=_metric_label(metric), title=_metric_label(metric))
+    ax.grid(alpha=.25)
+
+
+def _composer_draw_channel(
+    ax,
+    history: pd.DataFrame,
+    channel_metrics: dict[str, dict[str, str]],
+    metric: str,
+    channels: list[str],
+    font_size: int,
+) -> None:
+    if not metric or metric not in channel_metrics or not channels:
+        ax.text(.5, .5, "No channel metric selected", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    line_override = _plot_line_color_override()
+    for index, channel in enumerate(channels):
+        column = channel_metrics[metric].get(channel)
+        if not column:
+            continue
+        x, y = _composer_metric_series(history, column)
+        ax.plot(
+            x,
+            y,
+            marker="o",
+            linewidth=1.2,
+            color=line_override if line_override else None,
+            label=_trace_channel_label(channel),
+        )
+    ax.set(xlabel="BO iteration", ylabel=_metric_label(metric), title=f"{_metric_label(metric)} by channel")
+    if len(channels) <= 10:
+        ax.legend(fontsize=max(6, font_size - 2))
+    ax.grid(alpha=.25)
+
+
+def _composer_draw_paired(
+    ax,
+    observations: list[dict],
+    metric: str,
+    channels: list[str],
+    font_size: int,
+) -> None:
+    series = _paired_trend_values(observations, metric)
+    selected = [channel for channel in channels if channel in series] or sorted(series, key=_channel_sort_key)
+    if not selected:
+        ax.text(.5, .5, "No paired values", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    all_iterations = sorted({
+        iteration
+        for channel in selected
+        for iteration in series[channel]["iteration"]
+    })
+    for phase, color in (("buffer", "#1f77b4"), ("target", "#ff7f0e")):
+        averages = []
+        for iteration in all_iterations:
+            values = []
+            for channel in selected:
+                channel_series = series[channel]
+                for idx, recorded in enumerate(channel_series["iteration"]):
+                    value = channel_series[phase][idx]
+                    if recorded == iteration and pd.notna(value):
+                        values.append(float(value))
+            averages.append(float(np.mean(values)) if values else np.nan)
+        ax.plot(all_iterations, averages, marker="o", color=color, label=phase.title())
+    ax.set(xlabel="BO iteration", ylabel=metric, title=f"Buffer vs target {metric}")
+    ax.legend(fontsize=max(6, font_size - 2))
+    ax.grid(alpha=.25)
+
+
+def _composer_draw_real_map(
+    fig,
+    ax,
+    observations: list[dict],
+    metric: str,
+    phase: str,
+    channels: list[str],
+    average_channels: bool,
+    x_name: str,
+    y_name: str,
+) -> None:
+    points = _real_metric_points(observations, metric, phase, channels, average_channels)
+    if points.empty or not x_name or not y_name or x_name not in points or y_name not in points:
+        ax.text(.5, .5, "No measured points", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    cmap = _plot_colormap_override_value() or "viridis"
+    scatter = ax.scatter(points[x_name], points[y_name], c=points["value"], cmap=cmap, s=26)
+    ax.set(xlabel=x_name, ylabel=y_name, title=f"{phase.title()} {metric}")
+    ax.grid(alpha=.2)
+    fig.colorbar(scatter, ax=ax, fraction=.046, pad=.02)
+
+
+def _composer_surrogate_group_id(session: dict, observation: dict) -> int | None:
+    group_id = session.get("selected_group_id")
+    if group_id is None:
+        group_id = observation.get("group_id")
+    try:
+        return int(group_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _composer_surrogate_files(session: dict, observation: dict) -> dict[int, Path]:
+    group_id = _composer_surrogate_group_id(session, observation)
+    files = _surrogate_files(session["root"], group_id=group_id)
+    return files or _surrogate_files(session["root"])
+
+
+def _composer_draw_surrogate_map(
+    fig,
+    ax,
+    session: dict,
+    observation: dict,
+    iteration: int,
+    value: str,
+    x_name: str,
+    y_name: str,
+) -> None:
+    files = _composer_surrogate_files(session, observation)
+    path = files.get(iteration)
+    if path is None:
+        ax.text(.5, .5, "No surrogate artifact", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    frame = pd.read_csv(path)
+    if not x_name or not y_name or value not in frame or x_name not in frame or y_name not in frame:
+        ax.text(.5, .5, "Choose X/Y/value", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    valid = frame[[x_name, y_name, value]].apply(pd.to_numeric, errors="coerce").dropna()
+    if valid.empty:
+        ax.text(.5, .5, "No surrogate values", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    cmap = _plot_colormap_override_value() or "viridis"
+    try:
+        mesh = ax.tricontourf(valid[x_name], valid[y_name], valid[value], levels=14, cmap=cmap)
+        ax.tricontour(valid[x_name], valid[y_name], valid[value], levels=14, colors="white", linewidths=.25, alpha=.5)
+    except Exception:
+        mesh = ax.scatter(valid[x_name], valid[y_name], c=valid[value], cmap=cmap, s=12)
+    observed = _observed_points(session, iteration, [x_name, y_name])
+    if observed:
+        ax.plot(
+            [obs["params"][x_name] for obs in observed],
+            [obs["params"][y_name] for obs in observed],
+            color="#d67b32",
+            marker="o",
+            linewidth=1.2,
+            markersize=3,
+        )
+    ax.set(xlabel=x_name, ylabel=y_name, title=f"{value} | iter {iteration}")
+    fig.colorbar(mesh, ax=ax, fraction=.046, pad=.02)
+
+
+def _composer_draw_trace(
+    ax,
+    session: dict,
+    observation: dict,
+    corrected: bool,
+    channels: list[str],
+    analysis: dict,
+    corrected_trace_key: str,
+    normalize_to_peak: bool,
+) -> None:
+    traces = [
+        item for item in _trace_paths(session, observation)
+        if _trace_channel_key(item) in channels
+    ]
+    if not traces:
+        ax.text(.5, .5, "No traces for selected channels", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    trace_colors = plt.get_cmap("turbo")(np.linspace(.03, .97, max(len(traces), 2)))
+    line_override = _plot_line_color_override()
+    for trace_index, item in enumerate(traces[:24]):
+        try:
+            voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
+                item["path"],
+                corrected,
+                analysis,
+                corrected_trace_key,
+            )
+            if normalize_to_peak:
+                y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
+            ax.plot(
+                voltage,
+                y,
+                color=line_override or trace_colors[trace_index],
+                linewidth=1.0,
+                alpha=.88,
+                label=f"{str(item.get('phase') or '').title()} {_trace_channel_label(_trace_channel_key(item))}",
+            )
+        except Exception:
+            continue
+    ax.set(
+        xlabel="Voltage (V)",
+        ylabel="Normalized current" if normalize_to_peak else "Current (uA)",
+        title=f"Iteration {observation.get('iteration')} {'corrected' if corrected else 'raw'} SWV traces",
+    )
+    handles, labels = ax.get_legend_handles_labels()
+    if len(labels) <= 10:
+        unique = dict(zip(labels, handles))
+        ax.legend(unique.values(), unique.keys(), fontsize=6)
+    ax.grid(alpha=.25)
+
+
+def _build_composer_figure(
+    session: dict,
+    history: pd.DataFrame,
+    observations: list[dict],
+    observation: dict,
+    trace_analysis: dict,
+    paired_objective: bool,
+    specs: list[dict],
+    aspect: str,
+    font_family: str,
+    font_size: int,
+    label_size: int,
+    title: str,
+) -> plt.Figure:
+    aspect_map = {
+        "4:3": (12, 9),
+        "16:9": (12.8, 7.2),
+        "1:1": (9, 9),
+        "Letter": (8.5, 11),
+    }
+    width, height = aspect_map.get(aspect, (12, 9))
+    with plt.rc_context({"font.family": font_family, "font.size": font_size}):
+        fig = plt.figure(figsize=(width, height), facecolor="white")
+        if title:
+            fig.suptitle(title, fontsize=font_size + 3, y=.985)
+        channel_metrics = {
+            metric: columns
+            for metric, columns in _channel_metric_columns(history).items()
+            if _history_metric_impacts_q(metric, session["config"], paired_objective)
+        }
+        for index, spec in enumerate(specs):
+            ax = fig.add_axes(spec["rect"])
+            kind = spec["kind"]
+            if kind == "Global trend":
+                _composer_draw_global(ax, history, spec["metric"], font_size)
+            elif kind == "Channel trend":
+                _composer_draw_channel(ax, history, channel_metrics, spec["metric"], spec["channels"], font_size)
+            elif kind == "Buffer/target trend":
+                _composer_draw_paired(ax, observations, spec["metric"], spec["channels"], font_size)
+            elif kind == "Measured 2D map":
+                _composer_draw_real_map(fig, ax, observations, spec["metric"], spec["phase"], spec["channels"], spec["average_channels"], spec["x"], spec["y"])
+            elif kind == "Surrogate 2D map":
+                _composer_draw_surrogate_map(fig, ax, session, observation, spec["artifact_iteration"], spec["value"], spec["x"], spec["y"])
+            elif kind == "SWV trace overlay":
+                _composer_draw_trace(ax, session, observation, spec["corrected"], spec["channels"], trace_analysis, spec["corrected_trace_key"], spec["normalize_to_peak"])
+            else:
+                ax.text(.5, .5, "Select a figure", ha="center", va="center")
+                ax.set_axis_off()
+            ax.tick_params(labelsize=max(6, font_size - 2))
+            ax.text(
+                spec.get("label_x", -.08),
+                spec.get("label_y", 1.06),
+                spec.get("label") or chr(ord("A") + index),
+                transform=ax.transAxes,
+                fontsize=label_size,
+                weight="bold",
+                va="top",
+                ha="left",
+            )
+    return fig
+
+
+def _composer_figure_bytes(fig: plt.Figure, fmt: str, dpi: int) -> bytes:
+    output = BytesIO()
+    save_kwargs = {"format": fmt, "bbox_inches": "tight", "facecolor": "white"}
+    if fmt == "png":
+        save_kwargs["dpi"] = dpi
+    fig.savefig(output, **save_kwargs)
+    return output.getvalue()
+
+
+def _render_figure_composer(
+    session: dict,
+    history: pd.DataFrame,
+    observations: list[dict],
+    observation: dict,
+    trace_analysis: dict,
+    paired_objective: bool,
+) -> None:
+    st.subheader("Figure Composer")
+    st.caption(
+        "Assemble a multipanel figure from the active BO scoring/group view. "
+        "Exports are generated only when requested."
+    )
+    channel_metrics = {
+        metric: columns
+        for metric, columns in _channel_metric_columns(history).items()
+        if _history_metric_impacts_q(metric, session["config"], paired_objective)
+    }
+    channel_column_names = {
+        column for columns in channel_metrics.values() for column in columns.values()
+    }
+    global_metrics = [
+        metric for metric in _numeric_columns(history)
+        if metric not in channel_column_names
+        and _history_metric_impacts_q(metric, session["config"], paired_objective)
+    ]
+    real_channels = _real_data_channels(observations)
+    source_options = ["Global trend"]
+    if channel_metrics:
+        source_options.append("Channel trend")
+    if paired_objective:
+        source_options.append("Buffer/target trend")
+    source_options.append("Measured 2D map")
+    if _composer_surrogate_files(session, observation):
+        source_options.append("Surrogate 2D map")
+    source_options.append("SWV trace overlay")
+
+    c1, c2, c3, c4 = st.columns(4)
+    aspect = c1.selectbox("Canvas", ["4:3", "16:9", "1:1", "Letter"], key="bo_composer_aspect")
+    panel_count = int(c2.number_input("Panels", min_value=1, max_value=12, value=4, step=1, key="bo_composer_count"))
+    preset = c3.selectbox("Layout", ["Grid", "Main left + stack", "Top wide + grid", "Manual"], key="bo_composer_layout")
+    dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25, key="bo_composer_dpi"))
+    c5, c6, c7 = st.columns(3)
+    font_family = c5.selectbox("Font", ["Arial", "DejaVu Sans", "Times New Roman", "Calibri"], key="bo_composer_font")
+    font_size = int(c6.slider("Plot font", 6, 18, 9, key="bo_composer_font_size"))
+    label_size = int(c7.slider("Panel label", 8, 30, 16, key="bo_composer_label_size"))
+    title = st.text_input("Figure title", value="", key="bo_composer_title")
+
+    rects = _composer_layout_rects(panel_count, preset)
+    specs = []
+    for index in range(panel_count):
+        default_rect = rects[index] if rects else (.07, .10, .40, .35)
+        with st.expander(f"Panel {chr(ord('A') + index)}", expanded=index < 4):
+            top_cols = st.columns([1.4, .8, .8, .8])
+            kind = top_cols[0].selectbox("Figure", source_options, key=f"bo_composer_kind_{index}")
+            label = top_cols[1].text_input("Label", value=chr(ord("A") + index), key=f"bo_composer_label_{index}")
+            label_x = top_cols[2].number_input("Label X", value=-0.08, step=.02, format="%.2f", key=f"bo_composer_label_x_{index}")
+            label_y = top_cols[3].number_input("Label Y", value=1.06, step=.02, format="%.2f", key=f"bo_composer_label_y_{index}")
+            if preset == "Manual":
+                pos_cols = st.columns(4)
+                left = pos_cols[0].slider("Left", 0.0, .95, float(default_rect[0]), .01, key=f"bo_composer_left_{index}")
+                bottom = pos_cols[1].slider("Bottom", 0.0, .95, float(default_rect[1]), .01, key=f"bo_composer_bottom_{index}")
+                width = pos_cols[2].slider("Width", .05, 1.0, float(default_rect[2]), .01, key=f"bo_composer_width_{index}")
+                height = pos_cols[3].slider("Height", .05, 1.0, float(default_rect[3]), .01, key=f"bo_composer_height_{index}")
+                rect = (left, bottom, min(width, 1 - left), min(height, 1 - bottom))
+            else:
+                rect = default_rect
+            spec = {"kind": kind, "label": label, "label_x": label_x, "label_y": label_y, "rect": rect}
+            if kind == "Global trend":
+                options = global_metrics or _numeric_columns(history)
+                spec["metric"] = st.selectbox("Metric", options, index=options.index("Q_run") if "Q_run" in options else 0, key=f"bo_composer_global_metric_{index}")
+            elif kind == "Channel trend":
+                metric = st.selectbox("Metric", list(channel_metrics), key=f"bo_composer_channel_metric_{index}")
+                available = sorted(channel_metrics.get(metric, {}), key=_channel_sort_key)
+                spec["metric"] = metric
+                spec["channels"] = st.multiselect("Channels", available, default=available[:8], key=f"bo_composer_channel_channels_{index}")
+            elif kind == "Buffer/target trend":
+                metrics = _q_relevant_metrics(PAIRED_TREND_METRICS, session["config"], True) or list(PAIRED_TREND_METRICS)
+                metric = st.selectbox("Metric", metrics, key=f"bo_composer_paired_metric_{index}")
+                spec["metric"] = metric
+                spec["channels"] = st.multiselect("Channels", real_channels, default=real_channels[:8], key=f"bo_composer_paired_channels_{index}")
+            elif kind == "Measured 2D map":
+                phases = ["buffer", "target"] if paired_objective else ["measurement"]
+                phase = st.selectbox("Phase", phases, key=f"bo_composer_real_phase_{index}")
+                metric_options = _q_relevant_metrics(
+                    REAL_DATA_METRICS,
+                    session["config"],
+                    paired_objective,
+                    phase=phase,
+                ) or list(REAL_DATA_METRICS)
+                metric = st.selectbox("Metric", metric_options, key=f"bo_composer_real_metric_{index}")
+                channels = st.multiselect("Channels", real_channels, default=real_channels[:8], key=f"bo_composer_real_channels_{index}")
+                average_channels = st.checkbox("Average channels", value=True, key=f"bo_composer_real_average_{index}")
+                points = _real_metric_points(observations, metric, phase, channels or real_channels, average_channels)
+                dimensions = [name for name in PARAMETERS if name in points.columns and points[name].nunique(dropna=True) > 1]
+                if len(dimensions) < 2:
+                    dimensions = [
+                        name for name in PARAMETERS
+                        if any((obs.get("params") or {}).get(name) is not None for obs in observations)
+                    ][:2]
+                spec.update({"metric": metric, "phase": phase, "channels": channels or real_channels, "average_channels": average_channels})
+                xy_cols = st.columns(2)
+                spec["x"] = xy_cols[0].selectbox("X", dimensions, key=f"bo_composer_real_x_{index}") if dimensions else ""
+                y_options = [name for name in dimensions if name != spec["x"]]
+                spec["y"] = xy_cols[1].selectbox("Y", y_options or dimensions, key=f"bo_composer_real_y_{index}") if dimensions else ""
+            elif kind == "Surrogate 2D map":
+                files = _composer_surrogate_files(session, observation)
+                artifact_iteration = st.selectbox("Artifact", sorted(files), index=len(files) - 1, key=f"bo_composer_sur_iter_{index}")
+                predictions = pd.read_csv(files[artifact_iteration])
+                values = [name for name in SURROGATE_VALUES if name in predictions.columns]
+                numeric_values = list(predictions.select_dtypes(include=np.number).columns)
+                dimensions = [name for name in PARAMETERS if name in predictions.columns and predictions[name].nunique(dropna=True) > 1]
+                spec["artifact_iteration"] = artifact_iteration
+                spec["value"] = st.selectbox("Value", values or numeric_values, key=f"bo_composer_sur_value_{index}")
+                xy_cols = st.columns(2)
+                if len(dimensions) >= 2:
+                    spec["x"] = xy_cols[0].selectbox("X", dimensions, key=f"bo_composer_sur_x_{index}")
+                    spec["y"] = xy_cols[1].selectbox("Y", [name for name in dimensions if name != spec["x"]], key=f"bo_composer_sur_y_{index}")
+                else:
+                    st.info("This surrogate artifact needs at least two varied parameters for a 2D map.")
+                    spec["x"] = dimensions[0] if dimensions else ""
+                    spec["y"] = ""
+            elif kind == "SWV trace overlay":
+                trace_items = _trace_paths(session, observation)
+                available = sorted({_trace_channel_key(item) for item in trace_items}, key=_channel_sort_key)
+                spec["channels"] = st.multiselect("Channels", available, default=available[:8], key=f"bo_composer_trace_channels_{index}")
+                spec["corrected"] = st.checkbox("Corrected", value=True, key=f"bo_composer_trace_corrected_{index}")
+                spec["corrected_trace_key"] = st.selectbox(
+                    "Corrected trace",
+                    ["smoothed_corrected_current", "corrected_current", "wavelet_denoised_current"],
+                    key=f"bo_composer_trace_key_{index}",
+                )
+                spec["normalize_to_peak"] = st.checkbox("Normalize to peak", value=False, key=f"bo_composer_trace_norm_{index}")
+            specs.append(spec)
+
+    if st.checkbox("Render preview", value=True, key="bo_composer_preview"):
+        fig = _build_composer_figure(
+            session,
+            history,
+            observations,
+            observation,
+            trace_analysis,
+            paired_objective,
+            specs,
+            aspect,
+            font_family,
+            font_size,
+            label_size,
+            title,
+        )
+        st.pyplot(fig, clear_figure=True, use_container_width=True)
+        plt.close(fig)
+
+    export_key = f"bo_composer_exports_{session['state'].get('session_id', session['root'].name)}"
+    if st.button("Prepare export files", type="primary", key="bo_composer_prepare_exports"):
+        st.session_state[export_key] = {}
+        for fmt in ("png", "pdf", "svg"):
+            fig = _build_composer_figure(
+                session,
+                history,
+                observations,
+                observation,
+                trace_analysis,
+                paired_objective,
+                specs,
+                aspect,
+                font_family,
+                font_size,
+                label_size,
+                title,
+            )
+            st.session_state[export_key][fmt] = _composer_figure_bytes(fig, fmt, dpi)
+            plt.close(fig)
+    prepared = st.session_state.get(export_key) or {}
+    if prepared:
+        export_cols = st.columns(3)
+        for fmt, mime, column in (
+            ("png", "image/png", export_cols[0]),
+            ("pdf", "application/pdf", export_cols[1]),
+            ("svg", "image/svg+xml", export_cols[2]),
+        ):
+            column.download_button(
+                f"Download {fmt.upper()}",
+                data=prepared[fmt],
+                file_name=f"{session['root'].name}_multipanel.{fmt}",
+                mime=mime,
+                key=f"bo_composer_download_{fmt}",
+            )
+
+
 def render_bo_session_app() -> None:
     """Render the complete BO viewer. Called after Analysis mode is set to BO."""
     _render_app_scrollbar_style()
@@ -29043,7 +29568,7 @@ def render_bo_session_app() -> None:
     observation_is_single = len(selected_observations) == 1
     iteration_options = scoped_iterations
     iteration_state_key = "bo_requested_observation_iteration"
-    overview, rescore_tab, metadata_tab, traces, real_data, surrogate, simulation, gifs, pdf_export = st.tabs(
+    overview, rescore_tab, metadata_tab, traces, real_data, surrogate, simulation, gifs, figure_composer, pdf_export = st.tabs(
         [
             "History & scores",
             "Rescore Q",
@@ -29053,6 +29578,7 @@ def render_bo_session_app() -> None:
             "Surrogate",
             "Simulation",
             "GIFs",
+            "Figure Composer",
             "PDF Export",
         ]
     )
@@ -47002,6 +47528,16 @@ def render_bo_session_app() -> None:
 
 
         _render_simulation_tab()
+    with figure_composer:
+        _render_figure_composer(
+            session,
+            history,
+            observations,
+            observation,
+            trace_analysis,
+            paired_objective,
+        )
+
     with pdf_export:
         st.subheader("Exhaustive BO session report")
         st.write(
