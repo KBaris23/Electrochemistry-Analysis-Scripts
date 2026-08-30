@@ -19,6 +19,7 @@ streamlit run app.py
 Or launch it by double-clicking the file for your operating system:
 
 - Windows: `launch_app_windows.bat`
+- Windows alternate launcher: `Open_SWV_App.cmd`
 - macOS: `launch_app_mac.command`
 
 The macOS launcher creates its virtual environment under
