@@ -36,6 +36,7 @@ from matplotlib.colors import (
     to_rgba,
 )
 from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 from matplotlib.text import Text
 from matplotlib.ticker import FixedFormatter, FixedLocator
 from matplotlib.transforms import Bbox
@@ -29072,6 +29073,468 @@ def _composer_draw_trace(
     ax.grid(alpha=.25)
 
 
+COMPOSER_MEASURED_LANDSCAPE_VIEWS = {
+    "Measured 1D slice": "1D slice",
+    "Measured 3D tensor": "3D tensor",
+}
+COMPOSER_SURROGATE_VIEWS = {
+    "Surrogate 1D slice": "1D slice",
+    "Surrogate 3D tensor": "3D tensor",
+}
+
+
+def _composer_varied_dimensions(frame: pd.DataFrame) -> list[str]:
+    return [
+        name for name in PARAMETERS
+        if name in frame.columns
+        and pd.to_numeric(frame[name], errors="coerce").nunique(dropna=True) > 1
+    ]
+
+
+def _composer_parameter_dimensions_from_observations(
+    observations: Sequence[dict],
+) -> list[str]:
+    return [
+        name for name in PARAMETERS
+        if any((observation.get("params") or {}).get(name) is not None for observation in observations)
+    ]
+
+
+def _composer_trace_entries(
+    session: dict,
+    observations: Sequence[dict],
+) -> list[tuple[dict, dict]]:
+    return [
+        (observation, trace)
+        for observation in observations
+        for trace in _trace_paths(session, observation)
+    ]
+
+
+def _composer_trace_channels(trace_entries: Sequence[tuple[dict, dict]]) -> list[str]:
+    return sorted(
+        {_trace_channel_key(trace) for _observation, trace in trace_entries},
+        key=_channel_sort_key,
+    )
+
+
+def _composer_has_hyperparameter_response(history: pd.DataFrame) -> bool:
+    if history.empty:
+        return False
+    return len(_hyperparameter_response_columns(history)) >= 2
+
+
+def _composer_available_sources(
+    session: dict,
+    history: pd.DataFrame,
+    observations: list[dict],
+    observation: dict,
+    paired_objective: bool,
+    channel_metrics: dict[str, dict[str, str]],
+) -> list[str]:
+    sources = ["Global trend"]
+    if channel_metrics:
+        sources.append("Channel trend")
+    if paired_objective:
+        sources.extend([
+            "Buffer/target trend",
+            "Chronological buffer/target trend",
+        ])
+    sources.append("Measured 2D map")
+    real_channels = _real_data_channels(observations)
+    real_phases = ["buffer", "target"] if paired_objective else ["measurement"]
+    has_real_metric_points = False
+    real_dimension_count = 0
+    for phase in real_phases:
+        metric_options = _q_relevant_metrics(
+            REAL_DATA_METRICS,
+            session["config"],
+            paired_objective,
+            phase=phase,
+        ) or list(REAL_DATA_METRICS)
+        for metric in metric_options:
+            points = _real_metric_points(
+                observations,
+                metric,
+                phase,
+                real_channels,
+                average_channels=True,
+            )
+            if points.empty:
+                continue
+            has_real_metric_points = True
+            real_dimension_count = max(
+                real_dimension_count,
+                len(_composer_varied_dimensions(points)),
+            )
+            break
+    if has_real_metric_points:
+        sources.append("Measured 1D slice")
+        if real_dimension_count >= 2:
+            sources.append("Measured 2D map")
+        if real_dimension_count >= 3:
+            sources.append("Measured 3D tensor")
+        sources.extend([
+            "Measured parallel coordinates",
+            "Channel x iteration heatmap",
+        ])
+    surrogate_files = _composer_surrogate_files(session, observation)
+    if surrogate_files:
+        latest = surrogate_files[sorted(surrogate_files)[-1]]
+        try:
+            surrogate_frame = pd.read_csv(latest)
+        except Exception:
+            surrogate_frame = pd.DataFrame()
+        surrogate_dimensions = _composer_varied_dimensions(surrogate_frame)
+        surrogate_values = [
+            name for name in SURROGATE_VALUES
+            if name in surrogate_frame.columns
+        ]
+        surrogate_numeric_values = list(
+            surrogate_frame.select_dtypes(include=np.number).columns
+        )
+        has_surrogate_values = bool(surrogate_values or surrogate_numeric_values)
+        if surrogate_dimensions and has_surrogate_values:
+            sources.append("Surrogate 1D slice")
+        if len(surrogate_dimensions) >= 2 and has_surrogate_values:
+            sources.append("Surrogate 2D map")
+            if len(surrogate_files) > 1:
+                sources.append("Surrogate chronological 2D stack")
+        if len(surrogate_dimensions) >= 3 and has_surrogate_values:
+            sources.append("Surrogate 3D tensor")
+    trace_entries = _composer_trace_entries(session, observations)
+    sources.append("SWV trace overlay")
+    if trace_entries:
+        sources.append("Chronological SWV stack")
+    if _composer_has_hyperparameter_response(history):
+        hyper_columns = _hyperparameter_response_columns(history)
+        sources.append("Hyperparameter 2D heatmap")
+        if len(hyper_columns) >= 3:
+            sources.append("Hyperparameter 3D heatmap")
+        sources.append("Hyperparameter parallel coordinates")
+    sources.append("Image file")
+    return list(dict.fromkeys(sources))
+
+
+def _composer_error_panel(ax, message: str) -> None:
+    ax.text(.5, .5, message, ha="center", va="center", wrap=True)
+    ax.set_axis_off()
+
+
+def _composer_plotly_message(message: str, height: int = 360) -> go.Figure:
+    fig = go.Figure()
+    fig.add_annotation(
+        text=message,
+        x=.5,
+        y=.5,
+        xref="paper",
+        yref="paper",
+        showarrow=False,
+    )
+    fig.update_layout(height=height)
+    return fig
+
+
+def _composer_panel_pixel_size(
+    fig: plt.Figure,
+    rect: Sequence[float],
+    render_dpi: int,
+) -> tuple[int, int]:
+    figure_width, figure_height = fig.get_size_inches()
+    return (
+        max(240, int(figure_width * float(render_dpi) * float(rect[2]))),
+        max(180, int(figure_height * float(render_dpi) * float(rect[3]))),
+    )
+
+
+def _composer_draw_embedded_figure(
+    target_fig: plt.Figure,
+    ax,
+    panel_figure: go.Figure | plt.Figure,
+    rect: Sequence[float],
+    render_dpi: int,
+) -> None:
+    from PIL import Image
+
+    width_px, height_px = _composer_panel_pixel_size(target_fig, rect, render_dpi)
+    try:
+        if isinstance(panel_figure, go.Figure):
+            png = _plotly_png_bytes(
+                panel_figure,
+                width=width_px,
+                height=height_px,
+                scale=1.5,
+            )
+            buffer = BytesIO(png)
+        else:
+            panel_figure.set_size_inches(
+                width_px / float(render_dpi),
+                height_px / float(render_dpi),
+                forward=True,
+            )
+            buffer = BytesIO()
+            panel_figure.savefig(
+                buffer,
+                format="png",
+                dpi=render_dpi,
+                bbox_inches="tight",
+                facecolor="white",
+            )
+            buffer.seek(0)
+            plt.close(panel_figure)
+        with Image.open(buffer) as image:
+            ax.imshow(image.convert("RGB"))
+        ax.set_axis_off()
+    except Exception as exc:
+        _composer_error_panel(ax, str(exc))
+
+
+def _composer_draw_image_file(ax, path_text: str) -> None:
+    from PIL import Image
+
+    cleaned = str(path_text or "").strip().strip('"')
+    if not cleaned:
+        _composer_error_panel(ax, "Paste an image path.")
+        return
+    path = Path(cleaned).expanduser()
+    if not path.is_file():
+        _composer_error_panel(ax, "Image file was not found.")
+        return
+    try:
+        with Image.open(path) as image:
+            ax.imshow(image.convert("RGB"))
+        ax.set_axis_off()
+    except Exception as exc:
+        _composer_error_panel(ax, f"Could not open image: {exc}")
+
+
+def _composer_real_points(spec: dict, observations: list[dict]) -> pd.DataFrame:
+    return _real_metric_points(
+        observations,
+        spec["metric"],
+        spec["phase"],
+        spec["channels"],
+        spec["average_channels"],
+    )
+
+
+def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.Figure:
+    points = _composer_real_points(spec, observations)
+    view = COMPOSER_MEASURED_LANDSCAPE_VIEWS[spec["kind"]]
+    if points.empty:
+        return _composer_plotly_message("No measured points are available.")
+    if not spec.get("x"):
+        return _composer_plotly_message("Choose an X axis.")
+    if view == "3D tensor" and (not spec.get("y") or not spec.get("z")):
+        return _composer_plotly_message("Choose X, Y, and Z axes.")
+    return _plot_real_data_landscape(
+        points,
+        spec["metric"],
+        spec["phase"],
+        view,
+        spec["x"],
+        spec.get("y"),
+        spec.get("z"),
+        tensor_height=520,
+        dot_size=spec.get("dot_size", 6),
+        dot_opacity=spec.get("dot_opacity", .65),
+        log_frequency=spec.get("log_frequency", False),
+        show_iteration_path=spec.get("show_iteration_path", True),
+        value_colorscale=spec.get("colorscale", "Viridis"),
+        draw_full_cube_edges=spec.get("draw_cube_edges", False),
+    )
+
+
+def _composer_build_real_parallel(spec: dict, observations: list[dict]) -> go.Figure:
+    points = _composer_real_points(spec, observations)
+    if not spec.get("parameters"):
+        return _composer_plotly_message("Choose at least one parameter axis.")
+    return _plot_real_data_parallel_coordinates(
+        points,
+        metric_label=spec["metric"],
+        phase=spec["phase"],
+        parameter_columns=spec["parameters"],
+        line_width=spec.get("line_width", 2.0),
+        line_opacity=spec.get("line_opacity", .76),
+        log_frequency=spec.get("log_frequency", False),
+        value_colorscale=spec.get("colorscale", "Viridis"),
+    )
+
+
+def _composer_build_real_heatmap(spec: dict, observations: list[dict]) -> go.Figure:
+    points = _composer_real_points(spec, observations)
+    if points.empty:
+        return _composer_plotly_message("No channel/iteration values are available.")
+    return _plot_real_channel_iteration_heatmap(
+        points,
+        metric_label=spec["metric"],
+        phase=spec["phase"],
+        value_colorscale=spec.get("colorscale", "Viridis"),
+        group_runs_by_channel=spec.get("group_runs_by_channel", False),
+        max_display_rows=spec.get("max_display_rows", 1000),
+    )
+
+
+def _composer_build_surrogate(spec: dict, session: dict, observation: dict):
+    files = _composer_surrogate_files(session, observation)
+    path = files.get(spec["artifact_iteration"])
+    if path is None:
+        return _composer_plotly_message("No surrogate artifact is available.")
+    predictions = pd.read_csv(path)
+    predictions = _recompute_group_surrogate(
+        session,
+        predictions,
+        int(spec["artifact_iteration"]),
+    )
+    if spec["kind"] == "Surrogate chronological 2D stack":
+        if not spec.get("x") or not spec.get("y"):
+            return _composer_plotly_message("Choose X and Y axes.")
+        figure, errors = _plot_chronological_surrogate_2d_stack(
+            session,
+            files,
+            int(spec["artifact_iteration"]),
+            spec["value"],
+            spec["x"],
+            spec["y"],
+            map_alpha=spec.get("map_alpha", .55),
+            log_frequency=spec.get("log_frequency", False),
+        )
+        if errors:
+            figure.text(.02, .01, " | ".join(errors[:3]), fontsize=6)
+        return figure
+    view = COMPOSER_SURROGATE_VIEWS[spec["kind"]]
+    if not spec.get("x"):
+        return _composer_plotly_message("Choose an X axis.")
+    if view == "3D tensor" and (not spec.get("y") or not spec.get("z")):
+        return _composer_plotly_message("Choose X, Y, and Z axes.")
+    return _plot_surrogate(
+        session,
+        predictions,
+        int(spec["artifact_iteration"]),
+        spec["value"],
+        view,
+        spec["x"],
+        spec.get("y"),
+        spec.get("z"),
+        tensor_height=520,
+        dot_size=spec.get("dot_size", 6),
+        dot_opacity=spec.get("dot_opacity", .45),
+        log_frequency=spec.get("log_frequency", False),
+        show_iteration_path=spec.get("show_iteration_path", True),
+        show_observed_points=spec.get("show_observed_points", True),
+        show_local_pool=spec.get("show_local_pool", False),
+        draw_full_cube_edges=spec.get("draw_cube_edges", False),
+        show_2d_contours=spec.get("show_contours", False),
+    )
+
+
+def _composer_build_paired_plot(
+    spec: dict,
+    observations: list[dict],
+    config: dict,
+) -> go.Figure:
+    channels = spec["channels"]
+    if not channels:
+        return _composer_plotly_message("Choose at least one channel.")
+    if spec["kind"] == "Chronological buffer/target trend":
+        points, transitions = _chronological_points(
+            observations,
+            config,
+            spec["metric"],
+            channels,
+            average_channels=spec.get("average_channels", False),
+        )
+        if points.empty:
+            return _composer_plotly_message("No chronological values are available.")
+        return _plot_chronological(
+            points,
+            transitions,
+            spec["metric"],
+            spec.get("layout", "Overlay selected channels"),
+            spec.get("show_fluid_exchange_lines", True),
+            spec.get("show_iteration_lines", False),
+        )
+    series = _paired_trend_values(observations, spec["metric"])
+    selected = [channel for channel in channels if channel in series]
+    if not selected and not series:
+        return _composer_plotly_message("No buffer/target values are available.")
+    return _plot_paired_phase_trend(
+        series,
+        spec["metric"],
+        selected or sorted(series, key=_channel_sort_key),
+        spec.get("layout", "Average selected channels"),
+        spec.get("plot_difference", False),
+    )
+
+
+def _composer_build_chronological_swv(
+    spec: dict,
+    session: dict,
+    observations: list[dict],
+    trace_analysis: dict,
+):
+    entries = _composer_trace_entries(session, observations)
+    if not spec.get("channels"):
+        fig, ax = plt.subplots(figsize=(8, 4.8))
+        _composer_error_panel(ax, "Choose at least one channel.")
+        return fig
+    figure, errors = _plot_chronological_swv_stack(
+        entries,
+        spec["corrected"],
+        spec["channels"],
+        trace_analysis,
+        session["config"],
+        "corrected" if spec["corrected"] else "raw",
+        "Figure Composer",
+        spec.get("normalize_to_peak", False),
+        spec.get("corrected_trace_key", "smoothed_corrected_current"),
+        spec.get("offset_to_baseline", False),
+        trace_height_scale=spec.get("trace_height_scale", 1.0),
+        selected_phases=tuple(spec.get("phases", [])) or None,
+    )
+    if errors:
+        figure.text(.02, .01, " | ".join(errors[:3]), fontsize=6)
+    return figure
+
+
+def _composer_build_hyperparameter_plot(
+    spec: dict,
+    history: pd.DataFrame,
+) -> go.Figure:
+    if not spec.get("metric"):
+        return _composer_plotly_message("Choose a metric.")
+    response = _hyperparameter_response_frame(
+        history,
+        spec["metric"],
+        spec.get("summary", "Final iteration"),
+        iteration=spec.get("iteration"),
+    )
+    if spec["kind"] == "Hyperparameter parallel coordinates":
+        if not spec.get("parameters"):
+            return _composer_plotly_message("Choose hyperparameter axes.")
+        return _plot_hyperparameter_parallel_coordinates(
+            response,
+            hyperparameter_columns=spec["parameters"],
+            metric_label=_metric_label(spec["metric"]),
+            aggregate=spec.get("aggregate", "Mean"),
+            line_width=spec.get("line_width", 1.5),
+            line_opacity=spec.get("line_opacity", .55),
+        )
+    if not spec.get("x") or not spec.get("y"):
+        return _composer_plotly_message("Choose X and Y axes.")
+    if spec["kind"] == "Hyperparameter 3D heatmap" and not spec.get("z"):
+        return _composer_plotly_message("Choose X, Y, and Z axes.")
+    return _plot_hyperparameter_response(
+        response,
+        x_axis=spec["x"],
+        y_axis=spec["y"],
+        z_axis=spec.get("z"),
+        metric_label=_metric_label(spec["metric"]),
+        aggregate=spec.get("aggregate", "Mean"),
+        draw_cube_edges=spec.get("draw_cube_edges", False),
+    )
+
+
 def _build_composer_figure(
     session: dict,
     history: pd.DataFrame,
@@ -29085,6 +29548,10 @@ def _build_composer_figure(
     font_size: int,
     label_size: int,
     title: str,
+    render_dpi: int = 180,
+    panel_border: bool = False,
+    panel_border_color: str = "#222222",
+    panel_border_width: float = .8,
 ) -> plt.Figure:
     aspect_map = {
         "4:3": (12, 9),
@@ -29117,10 +29584,84 @@ def _build_composer_figure(
                 _composer_draw_surrogate_map(fig, ax, session, observation, spec["artifact_iteration"], spec["value"], spec["x"], spec["y"])
             elif kind == "SWV trace overlay":
                 _composer_draw_trace(ax, session, observation, spec["corrected"], spec["channels"], trace_analysis, spec["corrected_trace_key"], spec["normalize_to_peak"])
+            elif kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS:
+                _composer_draw_embedded_figure(
+                    fig,
+                    ax,
+                    _composer_build_real_landscape(spec, observations),
+                    spec["rect"],
+                    render_dpi,
+                )
+            elif kind == "Measured parallel coordinates":
+                _composer_draw_embedded_figure(
+                    fig,
+                    ax,
+                    _composer_build_real_parallel(spec, observations),
+                    spec["rect"],
+                    render_dpi,
+                )
+            elif kind == "Channel x iteration heatmap":
+                _composer_draw_embedded_figure(
+                    fig,
+                    ax,
+                    _composer_build_real_heatmap(spec, observations),
+                    spec["rect"],
+                    render_dpi,
+                )
+            elif kind in COMPOSER_SURROGATE_VIEWS or kind == "Surrogate chronological 2D stack":
+                _composer_draw_embedded_figure(
+                    fig,
+                    ax,
+                    _composer_build_surrogate(spec, session, observation),
+                    spec["rect"],
+                    render_dpi,
+                )
+            elif kind == "Chronological buffer/target trend":
+                _composer_draw_embedded_figure(
+                    fig,
+                    ax,
+                    _composer_build_paired_plot(spec, observations, session["config"]),
+                    spec["rect"],
+                    render_dpi,
+                )
+            elif kind == "Chronological SWV stack":
+                _composer_draw_embedded_figure(
+                    fig,
+                    ax,
+                    _composer_build_chronological_swv(
+                        spec,
+                        session,
+                        observations,
+                        trace_analysis,
+                    ),
+                    spec["rect"],
+                    render_dpi,
+                )
+            elif kind.startswith("Hyperparameter "):
+                _composer_draw_embedded_figure(
+                    fig,
+                    ax,
+                    _composer_build_hyperparameter_plot(spec, history),
+                    spec["rect"],
+                    render_dpi,
+                )
+            elif kind == "Image file":
+                _composer_draw_image_file(ax, spec.get("path", ""))
             else:
                 ax.text(.5, .5, "Select a figure", ha="center", va="center")
                 ax.set_axis_off()
             ax.tick_params(labelsize=max(6, font_size - 2))
+            if panel_border:
+                fig.add_artist(Rectangle(
+                    (spec["rect"][0], spec["rect"][1]),
+                    spec["rect"][2],
+                    spec["rect"][3],
+                    transform=fig.transFigure,
+                    fill=False,
+                    edgecolor=panel_border_color,
+                    linewidth=panel_border_width,
+                    zorder=20,
+                ))
             ax.text(
                 spec.get("label_x", -.08),
                 spec.get("label_y", 1.06),
@@ -29170,15 +29711,14 @@ def _render_figure_composer(
         and _history_metric_impacts_q(metric, session["config"], paired_objective)
     ]
     real_channels = _real_data_channels(observations)
-    source_options = ["Global trend"]
-    if channel_metrics:
-        source_options.append("Channel trend")
-    if paired_objective:
-        source_options.append("Buffer/target trend")
-    source_options.append("Measured 2D map")
-    if _composer_surrogate_files(session, observation):
-        source_options.append("Surrogate 2D map")
-    source_options.append("SWV trace overlay")
+    source_options = _composer_available_sources(
+        session,
+        history,
+        observations,
+        observation,
+        paired_objective,
+        channel_metrics,
+    )
 
     c1, c2, c3, c4 = st.columns(4)
     aspect = c1.selectbox("Canvas", ["4:3", "16:9", "1:1", "Letter"], key="bo_composer_aspect")
@@ -29189,6 +29729,11 @@ def _render_figure_composer(
     font_family = c5.selectbox("Font", ["Arial", "DejaVu Sans", "Times New Roman", "Calibri"], key="bo_composer_font")
     font_size = int(c6.slider("Plot font", 6, 18, 9, key="bo_composer_font_size"))
     label_size = int(c7.slider("Panel label", 8, 30, 16, key="bo_composer_label_size"))
+    border_cols = st.columns([.9, 1.1, 1.0, 2.0])
+    panel_border = border_cols[0].checkbox("Panel border", value=False, key="bo_composer_panel_border")
+    panel_border_color = border_cols[1].color_picker("Border color", value="#222222", key="bo_composer_panel_border_color")
+    panel_border_width = float(border_cols[2].number_input("Border width", min_value=0.1, max_value=8.0, value=0.8, step=0.1, format="%.1f", key="bo_composer_panel_border_width"))
+    border_cols[3].caption("Plotly-based panels are embedded into the final export at the selected PNG DPI.")
     title = st.text_input("Figure title", value="", key="bo_composer_title")
 
     rects = _composer_layout_rects(panel_count, preset)
@@ -29248,6 +29793,109 @@ def _render_figure_composer(
                 spec["x"] = xy_cols[0].selectbox("X", dimensions, key=f"bo_composer_real_x_{index}") if dimensions else ""
                 y_options = [name for name in dimensions if name != spec["x"]]
                 spec["y"] = xy_cols[1].selectbox("Y", y_options or dimensions, key=f"bo_composer_real_y_{index}") if dimensions else ""
+            elif kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS or kind in {
+                "Measured parallel coordinates",
+                "Channel x iteration heatmap",
+            }:
+                phases = ["buffer", "target"] if paired_objective else ["measurement"]
+                phase = st.selectbox("Phase", phases, key=f"bo_composer_measured_phase_{index}")
+                metric_options = _q_relevant_metrics(
+                    REAL_DATA_METRICS,
+                    session["config"],
+                    paired_objective,
+                    phase=phase,
+                ) or list(REAL_DATA_METRICS)
+                metric = st.selectbox("Metric", metric_options, key=f"bo_composer_measured_metric_{index}")
+                channels = st.multiselect(
+                    "Channels",
+                    real_channels,
+                    default=real_channels[:8],
+                    key=f"bo_composer_measured_channels_{index}",
+                )
+                average_channels = st.checkbox(
+                    "Average channels",
+                    value=kind != "Channel x iteration heatmap",
+                    key=f"bo_composer_measured_average_{index}",
+                    disabled=kind == "Channel x iteration heatmap",
+                )
+                spec.update({
+                    "metric": metric,
+                    "phase": phase,
+                    "channels": channels or real_channels,
+                    "average_channels": average_channels,
+                })
+                points = _real_metric_points(
+                    observations,
+                    metric,
+                    phase,
+                    channels or real_channels,
+                    average_channels,
+                )
+                dimensions = _composer_varied_dimensions(points)
+                if not dimensions:
+                    dimensions = _composer_parameter_dimensions_from_observations(observations)
+                if kind == "Measured parallel coordinates":
+                    preferred = [
+                        name for name in ("frequency", "amplitude", "step_potential")
+                        if name in dimensions
+                    ]
+                    spec["parameters"] = st.multiselect(
+                        "Parameters",
+                        dimensions,
+                        default=preferred or dimensions[:min(4, len(dimensions))],
+                        key=f"bo_composer_measured_parallel_params_{index}",
+                    )
+                    spec["line_width"] = float(st.slider("Line width", 0.5, 5.0, 2.0, 0.1, key=f"bo_composer_measured_parallel_line_{index}"))
+                    spec["line_opacity"] = float(st.slider("Line opacity", 0.05, 1.0, 0.76, 0.05, key=f"bo_composer_measured_parallel_opacity_{index}"))
+                elif kind == "Channel x iteration heatmap":
+                    heat_cols = st.columns(2)
+                    spec["group_runs_by_channel"] = heat_cols[0].checkbox(
+                        "Group repeated runs",
+                        value=False,
+                        key=f"bo_composer_heatmap_group_runs_{index}",
+                    )
+                    spec["max_display_rows"] = int(heat_cols[1].number_input(
+                        "Max rows",
+                        min_value=50,
+                        max_value=10000,
+                        value=1000,
+                        step=50,
+                        key=f"bo_composer_heatmap_max_rows_{index}",
+                    ))
+                else:
+                    spec["log_frequency"] = st.checkbox(
+                        "Log frequency axis",
+                        value=False,
+                        key=f"bo_composer_measured_log_freq_{index}",
+                    )
+                    spec["show_iteration_path"] = st.checkbox(
+                        "Show iteration path",
+                        value=True,
+                        key=f"bo_composer_measured_iteration_path_{index}",
+                    )
+                    spec["dot_size"] = int(st.slider("Marker size", 2, 20, 6, key=f"bo_composer_measured_dot_size_{index}"))
+                    spec["dot_opacity"] = float(st.slider("Marker opacity", 0.05, 1.0, 0.65, 0.05, key=f"bo_composer_measured_dot_opacity_{index}"))
+                    axis_cols = st.columns(3 if kind == "Measured 3D tensor" else 1)
+                    spec["x"] = axis_cols[0].selectbox("X", dimensions, key=f"bo_composer_measured_x_{index}") if dimensions else ""
+                    if kind == "Measured 3D tensor":
+                        y_options = [name for name in dimensions if name != spec["x"]]
+                        spec["y"] = axis_cols[1].selectbox("Y", y_options, key=f"bo_composer_measured_y_{index}") if y_options else ""
+                        z_options = [name for name in dimensions if name not in {spec["x"], spec.get("y")}]
+                        spec["z"] = axis_cols[2].selectbox("Z", z_options, key=f"bo_composer_measured_z_{index}") if z_options else ""
+                        spec["draw_cube_edges"] = st.checkbox(
+                            "Draw cube edges",
+                            value=True,
+                            key=f"bo_composer_measured_cube_edges_{index}",
+                        )
+                if kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS or kind in {
+                    "Measured parallel coordinates",
+                    "Channel x iteration heatmap",
+                }:
+                    spec["colorscale"] = st.selectbox(
+                        "Colorscale",
+                        ["Viridis", "Plasma", "Cividis", "Turbo", "Inferno", "Magma"],
+                        key=f"bo_composer_measured_colorscale_{index}",
+                    )
             elif kind == "Surrogate 2D map":
                 files = _composer_surrogate_files(session, observation)
                 artifact_iteration = st.selectbox("Artifact", sorted(files), index=len(files) - 1, key=f"bo_composer_sur_iter_{index}")
@@ -29265,6 +29913,92 @@ def _render_figure_composer(
                     st.info("This surrogate artifact needs at least two varied parameters for a 2D map.")
                     spec["x"] = dimensions[0] if dimensions else ""
                     spec["y"] = ""
+            elif kind in COMPOSER_SURROGATE_VIEWS or kind == "Surrogate chronological 2D stack":
+                files = _composer_surrogate_files(session, observation)
+                artifact_iteration = st.selectbox(
+                    "Artifact",
+                    sorted(files),
+                    index=len(files) - 1,
+                    key=f"bo_composer_surrogate_iter_{index}",
+                )
+                predictions = pd.read_csv(files[artifact_iteration])
+                values = [name for name in SURROGATE_VALUES if name in predictions.columns]
+                numeric_values = list(predictions.select_dtypes(include=np.number).columns)
+                dimensions = _composer_varied_dimensions(predictions)
+                spec["artifact_iteration"] = artifact_iteration
+                spec["value"] = st.selectbox(
+                    "Value",
+                    values or numeric_values,
+                    key=f"bo_composer_surrogate_value_{index}",
+                )
+                if kind == "Surrogate 1D slice":
+                    spec["x"] = st.selectbox(
+                        "X",
+                        dimensions,
+                        key=f"bo_composer_surrogate_x_{index}",
+                    ) if dimensions else ""
+                else:
+                    axis_cols = st.columns(3 if kind == "Surrogate 3D tensor" else 2)
+                    spec["x"] = axis_cols[0].selectbox(
+                        "X",
+                        dimensions,
+                        key=f"bo_composer_surrogate_x_{index}",
+                    ) if dimensions else ""
+                    y_options = [name for name in dimensions if name != spec.get("x")]
+                    spec["y"] = axis_cols[1].selectbox(
+                        "Y",
+                        y_options,
+                        key=f"bo_composer_surrogate_y_{index}",
+                    ) if y_options else ""
+                    if kind == "Surrogate 3D tensor":
+                        z_options = [
+                            name for name in dimensions
+                            if name not in {spec.get("x"), spec.get("y")}
+                        ]
+                        spec["z"] = axis_cols[2].selectbox(
+                            "Z",
+                            z_options,
+                            key=f"bo_composer_surrogate_z_{index}",
+                        ) if z_options else ""
+                option_cols = st.columns(3)
+                spec["log_frequency"] = option_cols[0].checkbox(
+                    "Log frequency axis",
+                    value=False,
+                    key=f"bo_composer_surrogate_log_freq_{index}",
+                )
+                if kind == "Surrogate chronological 2D stack":
+                    spec["map_alpha"] = float(option_cols[1].slider(
+                        "Map opacity",
+                        0.10,
+                        1.00,
+                        0.55,
+                        0.05,
+                        key=f"bo_composer_surrogate_stack_alpha_{index}",
+                    ))
+                else:
+                    spec["show_iteration_path"] = option_cols[1].checkbox(
+                        "Show iteration path",
+                        value=True,
+                        key=f"bo_composer_surrogate_iteration_path_{index}",
+                    )
+                    spec["show_observed_points"] = option_cols[2].checkbox(
+                        "Show observed points",
+                        value=True,
+                        key=f"bo_composer_surrogate_observed_{index}",
+                    )
+                    spec["show_local_pool"] = st.checkbox(
+                        "Show local-pool candidates",
+                        value=False,
+                        key=f"bo_composer_surrogate_local_pool_{index}",
+                    )
+                    if kind == "Surrogate 3D tensor":
+                        spec["dot_size"] = int(st.slider("Marker size", 2, 20, 6, key=f"bo_composer_surrogate_dot_size_{index}"))
+                        spec["dot_opacity"] = float(st.slider("Marker opacity", 0.05, 1.0, 0.45, 0.05, key=f"bo_composer_surrogate_dot_opacity_{index}"))
+                        spec["draw_cube_edges"] = st.checkbox(
+                            "Draw cube edges",
+                            value=True,
+                            key=f"bo_composer_surrogate_cube_edges_{index}",
+                        )
             elif kind == "SWV trace overlay":
                 trace_items = _trace_paths(session, observation)
                 available = sorted({_trace_channel_key(item) for item in trace_items}, key=_channel_sort_key)
@@ -29276,6 +30010,159 @@ def _render_figure_composer(
                     key=f"bo_composer_trace_key_{index}",
                 )
                 spec["normalize_to_peak"] = st.checkbox("Normalize to peak", value=False, key=f"bo_composer_trace_norm_{index}")
+            elif kind == "Chronological SWV stack":
+                trace_entries = _composer_trace_entries(session, observations)
+                available = _composer_trace_channels(trace_entries)
+                phases = sorted({
+                    str(trace.get("phase", "")).lower()
+                    for _observation, trace in trace_entries
+                    if str(trace.get("phase", "")).strip()
+                })
+                spec["channels"] = st.multiselect(
+                    "Channels",
+                    available,
+                    default=available[:min(4, len(available))],
+                    key=f"bo_composer_stack_channels_{index}",
+                )
+                spec["phases"] = st.multiselect(
+                    "Phases",
+                    phases,
+                    default=phases,
+                    key=f"bo_composer_stack_phases_{index}",
+                )
+                swv_cols = st.columns(4)
+                spec["corrected"] = swv_cols[0].checkbox(
+                    "Corrected",
+                    value=True,
+                    key=f"bo_composer_stack_corrected_{index}",
+                )
+                spec["normalize_to_peak"] = swv_cols[1].checkbox(
+                    "Normalize to peak",
+                    value=False,
+                    key=f"bo_composer_stack_norm_{index}",
+                )
+                spec["offset_to_baseline"] = swv_cols[2].checkbox(
+                    "Offset baseline",
+                    value=False,
+                    key=f"bo_composer_stack_offset_{index}",
+                )
+                spec["trace_height_scale"] = float(swv_cols[3].number_input(
+                    "Height scale",
+                    min_value=0.1,
+                    max_value=10.0,
+                    value=1.0,
+                    step=0.1,
+                    key=f"bo_composer_stack_height_scale_{index}",
+                ))
+                spec["corrected_trace_key"] = st.selectbox(
+                    "Corrected trace",
+                    ["smoothed_corrected_current", "corrected_current", "wavelet_denoised_current"],
+                    key=f"bo_composer_stack_trace_key_{index}",
+                )
+            elif kind == "Chronological buffer/target trend":
+                metrics = _q_relevant_metrics(PAIRED_TREND_METRICS, session["config"], True) or list(PAIRED_TREND_METRICS)
+                metric = st.selectbox("Metric", metrics, key=f"bo_composer_chrono_metric_{index}")
+                spec["metric"] = metric
+                spec["channels"] = st.multiselect(
+                    "Channels",
+                    real_channels,
+                    default=real_channels[:8],
+                    key=f"bo_composer_chrono_channels_{index}",
+                )
+                spec["layout"] = st.selectbox(
+                    "Layout",
+                    ["Overlay selected channels", "Average selected channels", "Separate plots"],
+                    key=f"bo_composer_chrono_layout_{index}",
+                )
+                chrono_cols = st.columns(3)
+                spec["average_channels"] = chrono_cols[0].checkbox(
+                    "Average channels",
+                    value=False,
+                    key=f"bo_composer_chrono_average_{index}",
+                )
+                spec["show_fluid_exchange_lines"] = chrono_cols[1].checkbox(
+                    "Fluid exchange lines",
+                    value=True,
+                    key=f"bo_composer_chrono_fluid_lines_{index}",
+                )
+                spec["show_iteration_lines"] = chrono_cols[2].checkbox(
+                    "Iteration lines",
+                    value=False,
+                    key=f"bo_composer_chrono_iteration_lines_{index}",
+                )
+            elif kind.startswith("Hyperparameter "):
+                hyper_columns = _hyperparameter_response_columns(history)
+                hp_metrics = global_metrics or _numeric_columns(history)
+                if not hp_metrics:
+                    spec["metric"] = ""
+                    st.info("No numeric history metrics are available.")
+                else:
+                    default_metric_index = hp_metrics.index("Q_run") if "Q_run" in hp_metrics else 0
+                    spec["metric"] = st.selectbox(
+                        "Metric",
+                        hp_metrics,
+                        index=default_metric_index,
+                        format_func=_metric_label,
+                        key=f"bo_composer_hp_metric_{index}",
+                    )
+                hp_cols = st.columns(3)
+                spec["summary"] = hp_cols[0].selectbox(
+                    "Run summary",
+                    ["Final iteration", "Best over iterations", "Mean over iterations", "Specific iteration"],
+                    key=f"bo_composer_hp_summary_{index}",
+                )
+                spec["aggregate"] = hp_cols[1].selectbox(
+                    "Repeat aggregation",
+                    ["Mean", "Median", "Maximum", "Minimum"],
+                    key=f"bo_composer_hp_aggregate_{index}",
+                )
+                if spec["summary"] == "Specific iteration":
+                    iteration_values = pd.to_numeric(
+                        history.get("iteration", pd.Series(dtype=float)),
+                        errors="coerce",
+                    ).dropna()
+                    minimum = int(iteration_values.min()) if not iteration_values.empty else 1
+                    maximum = int(iteration_values.max()) if not iteration_values.empty else 1
+                    spec["iteration"] = int(hp_cols[2].number_input(
+                        "Iteration",
+                        min_value=minimum,
+                        max_value=maximum,
+                        value=maximum,
+                        step=1,
+                        key=f"bo_composer_hp_iteration_{index}",
+                    ))
+                if kind == "Hyperparameter parallel coordinates":
+                    spec["parameters"] = st.multiselect(
+                        "Hyperparameters",
+                        hyper_columns,
+                        default=hyper_columns[:min(4, len(hyper_columns))],
+                        key=f"bo_composer_hp_parallel_params_{index}",
+                    )
+                    spec["line_width"] = float(st.slider("Line width", 0.5, 5.0, 1.5, 0.1, key=f"bo_composer_hp_line_{index}"))
+                    spec["line_opacity"] = float(st.slider("Line opacity", 0.05, 1.0, 0.55, 0.05, key=f"bo_composer_hp_opacity_{index}"))
+                else:
+                    axis_cols = st.columns(3 if kind == "Hyperparameter 3D heatmap" else 2)
+                    spec["x"] = axis_cols[0].selectbox("X", hyper_columns, key=f"bo_composer_hp_x_{index}") if hyper_columns else ""
+                    y_options = [name for name in hyper_columns if name != spec.get("x")]
+                    spec["y"] = axis_cols[1].selectbox("Y", y_options, key=f"bo_composer_hp_y_{index}") if y_options else ""
+                    if kind == "Hyperparameter 3D heatmap":
+                        z_options = [
+                            name for name in hyper_columns
+                            if name not in {spec.get("x"), spec.get("y")}
+                        ]
+                        spec["z"] = axis_cols[2].selectbox("Z", z_options, key=f"bo_composer_hp_z_{index}") if z_options else ""
+                        spec["draw_cube_edges"] = st.checkbox(
+                            "Draw cube edges",
+                            value=True,
+                            key=f"bo_composer_hp_cube_edges_{index}",
+                        )
+            elif kind == "Image file":
+                spec["path"] = st.text_input(
+                    "Image path",
+                    value="",
+                    placeholder=r"C:\Users\Asus\Downloads\Titration.jpg",
+                    key=f"bo_composer_image_path_{index}",
+                )
             specs.append(spec)
 
     if st.checkbox("Render preview", value=True, key="bo_composer_preview"):
@@ -29292,6 +30179,10 @@ def _render_figure_composer(
             font_size,
             label_size,
             title,
+            dpi,
+            panel_border,
+            panel_border_color,
+            panel_border_width,
         )
         st.pyplot(fig, clear_figure=True, use_container_width=True)
         plt.close(fig)
@@ -29313,6 +30204,10 @@ def _render_figure_composer(
                 font_size,
                 label_size,
                 title,
+                dpi,
+                panel_border,
+                panel_border_color,
+                panel_border_width,
             )
             st.session_state[export_key][fmt] = _composer_figure_bytes(fig, fmt, dpi)
             plt.close(fig)
