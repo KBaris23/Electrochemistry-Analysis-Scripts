@@ -1,15 +1,40 @@
-.venv64/
-.venv310/
-.venv/
+# Local Python environments
+.venv*/
+venv/
+env/
+
+# Python/test caches
 __pycache__/
 **/__pycache__/
 core/__pycache__
 *.pyc
 **/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local app secrets/config
 .env
 .env.*
+.streamlit/secrets.toml
+secrets.toml
+
+# Editor/OS files
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
+
+# Build/install artifacts
+build/
+dist/
+*.egg-info/
+
+# Generated analysis outputs
 outputs/
 _mat_csv/
+bo_sessions/
+simulation_artifacts/
