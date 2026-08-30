@@ -1,5 +1,6 @@
 .venv64/
 .venv310/
+.venv/
 __pycache__/
 **/__pycache__/
 core/__pycache__
@@ -12,4 +13,3 @@ core/__pycache__
 .vscode/
 outputs/
 _mat_csv/
-.venv
