@@ -64,6 +64,13 @@ _plotly_camera_capture = components.declare_component(
     "plotly_camera_capture",
     path=str(_PLOTLY_CAMERA_COMPONENT_DIR),
 )
+_FIGURE_LAYOUT_EDITOR_COMPONENT_DIR = (
+    Path(__file__).parent / ".streamlit_components" / "figure_layout_editor"
+)
+_figure_layout_editor = components.declare_component(
+    "figure_layout_editor",
+    path=str(_FIGURE_LAYOUT_EDITOR_COMPONENT_DIR),
+)
 _SHARED_3D_CAMERA_STORAGE_KEY = "bo_viewer_camera:latest_3d_perspective"
 _INDIVIDUAL_PLOT_SETTINGS_CLIPBOARD_KEY = (
     "bo_viewer:individual_plot_settings_clipboard"
@@ -28848,6 +28855,64 @@ def _composer_layout_rects(count: int, preset: str) -> list[tuple[float, float, 
     return rects
 
 
+def _composer_normalize_rect(
+    values: Sequence[Any],
+) -> tuple[float, float, float, float] | None:
+    """Validate and clamp a composer rectangle to the normalized canvas."""
+    if not isinstance(values, (list, tuple)) or len(values) != 4:
+        return None
+    try:
+        left, bottom, width, height = (float(value) for value in values)
+    except (TypeError, ValueError):
+        return None
+    if not all(np.isfinite(value) for value in (left, bottom, width, height)):
+        return None
+    left = min(max(left, 0.0), .95)
+    bottom = min(max(bottom, 0.0), .95)
+    width = min(max(width, .05), 1.0 - left)
+    height = min(max(height, .05), 1.0 - bottom)
+    return tuple(round(value, 4) for value in (left, bottom, width, height))
+
+
+def _composer_manual_rects(panel_count: int) -> list[tuple[float, float, float, float]]:
+    """Read manual rectangles from widget state, using a grid on first use."""
+    defaults = _composer_layout_rects(panel_count, "Grid")
+    rects = []
+    for index, default in enumerate(defaults):
+        values = (
+            st.session_state.get(f"bo_composer_left_{index}", default[0]),
+            st.session_state.get(f"bo_composer_bottom_{index}", default[1]),
+            st.session_state.get(f"bo_composer_width_{index}", default[2]),
+            st.session_state.get(f"bo_composer_height_{index}", default[3]),
+        )
+        rects.append(_composer_normalize_rect(values) or default)
+    return rects
+
+
+def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
+    """Copy one new mouse-layout event into the manual coordinate controls."""
+    if not isinstance(result, Mapping):
+        return False
+    event_id = result.get("event_id")
+    seen_key = "bo_composer_layout_editor_seen_event"
+    if event_id is None or event_id == st.session_state.get(seen_key):
+        return False
+    raw_rects = result.get("rects")
+    if not isinstance(raw_rects, list) or len(raw_rects) != panel_count:
+        return False
+    normalized = [_composer_normalize_rect(values) for values in raw_rects]
+    if any(rect is None for rect in normalized):
+        return False
+    for index, rect in enumerate(normalized):
+        left, bottom, width, height = rect
+        st.session_state[f"bo_composer_left_{index}"] = left
+        st.session_state[f"bo_composer_bottom_{index}"] = bottom
+        st.session_state[f"bo_composer_width_{index}"] = width
+        st.session_state[f"bo_composer_height_{index}"] = height
+    st.session_state[seen_key] = event_id
+    return True
+
+
 def _composer_metric_series(history: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
     x = pd.to_numeric(
         history.get("iteration", pd.Series(range(1, len(history) + 1))),
@@ -29692,7 +29757,31 @@ def _render_figure_composer(
     trace_analysis: dict,
     paired_objective: bool,
 ) -> None:
-    st.subheader("Figure Composer")
+    composer_heading, composer_help = st.columns([8, 1])
+    composer_heading.subheader("Figure Composer")
+    with composer_help.popover(
+        "ⓘ",
+        help="How to use the Figure Composer",
+    ):
+        st.markdown(
+            """
+            **Build a figure**
+
+            1. Choose the canvas, panel count, and a layout.
+            2. Open each panel section and choose its plot and data options.
+            3. Enable **Render preview** to inspect the composed figure.
+            4. Click **Prepare export files**, then download PNG, PDF, or SVG.
+
+            **Manual mouse layout**
+
+            - Drag a panel to move it.
+            - Drag its lower-right square to resize it.
+            - Ctrl-click (Cmd-click on macOS) to select multiple panels.
+            - Right-click a selected panel to align, match sizes, or distribute.
+            - Click empty canvas space to clear the selection.
+            - Use the coordinate fields for exact final adjustments.
+            """
+        )
     st.caption(
         "Assemble a multipanel figure from the active BO scoring/group view. "
         "Exports are generated only when requested."
@@ -29736,7 +29825,24 @@ def _render_figure_composer(
     border_cols[3].caption("Plotly-based panels are embedded into the final export at the selected PNG DPI.")
     title = st.text_input("Figure title", value="", key="bo_composer_title")
 
-    rects = _composer_layout_rects(panel_count, preset)
+    if preset == "Manual":
+        manual_rects = _composer_manual_rects(panel_count)
+        editor_result = _figure_layout_editor(
+            rects=[list(rect) for rect in manual_rects],
+            labels=[chr(ord("A") + index) for index in range(panel_count)],
+            aspect=aspect,
+            key="bo_composer_layout_editor",
+            default=None,
+        )
+        if _composer_apply_layout_editor_result(editor_result, panel_count):
+            manual_rects = _composer_manual_rects(panel_count)
+        st.caption(
+            "Drag to move · drag the corner to resize · Ctrl/Cmd-click to "
+            "multi-select · right-click for alignment tools"
+        )
+        rects = manual_rects
+    else:
+        rects = _composer_layout_rects(panel_count, preset)
     specs = []
     for index in range(panel_count):
         default_rect = rects[index] if rects else (.07, .10, .40, .35)
@@ -29748,10 +29854,10 @@ def _render_figure_composer(
             label_y = top_cols[3].number_input("Label Y", value=1.06, step=.02, format="%.2f", key=f"bo_composer_label_y_{index}")
             if preset == "Manual":
                 pos_cols = st.columns(4)
-                left = pos_cols[0].slider("Left", 0.0, .95, float(default_rect[0]), .01, key=f"bo_composer_left_{index}")
-                bottom = pos_cols[1].slider("Bottom", 0.0, .95, float(default_rect[1]), .01, key=f"bo_composer_bottom_{index}")
-                width = pos_cols[2].slider("Width", .05, 1.0, float(default_rect[2]), .01, key=f"bo_composer_width_{index}")
-                height = pos_cols[3].slider("Height", .05, 1.0, float(default_rect[3]), .01, key=f"bo_composer_height_{index}")
+                left = pos_cols[0].number_input("Left", 0.0, .95, float(default_rect[0]), .01, format="%.3f", key=f"bo_composer_left_{index}")
+                bottom = pos_cols[1].number_input("Bottom", 0.0, .95, float(default_rect[1]), .01, format="%.3f", key=f"bo_composer_bottom_{index}")
+                width = pos_cols[2].number_input("Width", .05, 1.0, float(default_rect[2]), .01, format="%.3f", key=f"bo_composer_width_{index}")
+                height = pos_cols[3].number_input("Height", .05, 1.0, float(default_rect[3]), .01, format="%.3f", key=f"bo_composer_height_{index}")
                 rect = (left, bottom, min(width, 1 - left), min(height, 1 - bottom))
             else:
                 rect = default_rect

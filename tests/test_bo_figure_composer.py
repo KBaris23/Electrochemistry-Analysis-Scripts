@@ -9,6 +9,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bo_session_viewer as viewer
 
 
+def test_composer_normalize_rect_clamps_to_canvas():
+    assert viewer._composer_normalize_rect([-.2, .9, .8, .5]) == (
+        0.0,
+        .9,
+        .8,
+        .1,
+    )
+    assert viewer._composer_normalize_rect([.98, -.1, .01, .02]) == (
+        .95,
+        0.0,
+        .05,
+        .05,
+    )
+    assert viewer._composer_normalize_rect([0, 0, "bad", .5]) is None
+
+
 def test_composer_keeps_baseline_sources_for_empty_sessions(tmp_path):
     session = {
         "root": tmp_path,
