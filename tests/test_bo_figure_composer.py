@@ -1,7 +1,11 @@
 import sys
+import json
+from io import BytesIO
 from pathlib import Path
 
+from matplotlib.figure import Figure
 import pandas as pd
+from PIL import Image
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -146,3 +150,50 @@ def test_composer_lists_bo_plot_families_when_session_data_supports_them(tmp_pat
         "Hyperparameter parallel coordinates",
         "Image file",
     }.issubset(sources)
+
+
+def test_composer_png_round_trips_compact_metadata():
+    metadata = viewer._composer_hyperparameter_sweep_preset()
+    encoded = viewer._composer_json_bytes(metadata)
+    assert len(encoded) < 16 * 1024
+
+    figure = Figure(figsize=(2, 2))
+    png = viewer._composer_figure_bytes(
+        figure,
+        "png",
+        72,
+        metadata_json=encoded.decode("utf-8"),
+    )
+    with Image.open(BytesIO(png)) as image:
+        assert viewer.COMPOSER_PNG_METADATA_KEY in image.info
+    restored = viewer._composer_metadata_from_upload(png, "saved.png")
+    assert restored["schema"] == viewer.COMPOSER_METADATA_SCHEMA
+    assert restored["name"] == "Hyperparameter Sweep"
+    assert restored["config"]["state"]["bo_composer_count"] == 10
+
+
+def test_composer_portable_zip_and_preset_store_round_trip(tmp_path):
+    metadata = viewer._composer_hyperparameter_sweep_preset()
+    metadata_bytes = viewer._composer_json_bytes(metadata)
+    package = viewer._composer_portable_zip(
+        b"png-placeholder",
+        metadata_bytes,
+        stem="figure",
+    )
+    restored = viewer._composer_metadata_from_upload(package, "figure.zip")
+    assert restored == json.loads(metadata_bytes)
+
+    store = tmp_path / "presets.json"
+    viewer._composer_save_preset("My preset", metadata, store)
+    assert viewer._composer_load_presets(store)["My preset"] == metadata
+
+
+def test_composer_preset_validation_reports_missing_data():
+    metadata = viewer._composer_hyperparameter_sweep_preset()
+    errors = viewer._composer_validate_saved_config(
+        metadata,
+        ["Global trend", "Measured 3D tensor", "SWV trace overlay"],
+        ["2"],
+    )
+    assert any("Measured 2D map" in error for error in errors)
+    assert any("missing channel(s): 3" in error for error in errors)

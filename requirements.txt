@@ -3,7 +3,9 @@ numpy
 pandas
 scipy
 matplotlib
-plotly
+# Kaleido 0.2.1 is self-contained (no separate Chrome install), but newer
+# Plotly releases have removed support for it. Keep this pair compatible.
+plotly==5.24.1
 streamlit-plotly-events
 kaleido==0.2.1
 Pillow

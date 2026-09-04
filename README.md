@@ -111,6 +111,18 @@ definitions, objective and parameter evolution, channel and phase trends,
 measured 1D/2D/3D landscapes, surrogate evolution for every saved artifact,
 and all locally accessible raw and corrected SWV traces.
 
+The **Figure Composer** tab defers all expensive plot generation until **Render
+figure** is clicked. Panel controls, exact manual coordinates, and mouse
+drag/resize operations only change the pending configuration; exports are
+hidden whenever that configuration is newer than the rendered preview. A
+render prepares PNG, PDF, and SVG files together. Its compact configuration is
+embedded in the PNG and can also be downloaded as a JSON sidecar or portable
+ZIP. Upload any of those formats to reconstruct the layout from its recorded
+experiment path or apply it to a compatible active experiment. Named presets
+persist locally, validate required plot families and channels before loading,
+and include a built-in **Hyperparameter Sweep** layout with optional colored
+zoom connectors.
+
 ## Experiment output bundles
 
 The Export tab can save a data-first bundle into an `outputs/` folder inside the selected data folder. If multiple data folders are selected, the app asks which one should receive the `outputs/` folder. These bundles are meant to be the input format for a future experiment-comparison app.

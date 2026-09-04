@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from typing import Any, Callable, Mapping, Sequence
 
 import matplotlib.pyplot as plt
@@ -115,6 +116,9 @@ PLOTLY_3D_TRACE_TYPES = {
     "surface",
     "volume",
 }
+COMPOSER_METADATA_SCHEMA = "swv.figure-composer/1"
+COMPOSER_PNG_METADATA_KEY = "SWVFigureComposer"
+COMPOSER_PRESET_STORE = Path(__file__).with_name(".figure_composer_presets.json")
 OBSERVED_PATH_COLORS = ("#e31a1c", "#000000")
 SWV_PHASE_COLORS = {
     "buffer": "#1f77b4",
@@ -25427,7 +25431,7 @@ def _plotly_png_bytes(
         )
     except Exception as exc:
         raise RuntimeError(
-            "Plotly PNG export requires kaleido==0.2.1. "
+            "Plotly PNG export requires plotly==5.24.1 with kaleido==0.2.1. "
             "Install the updated requirements and restart the app."
         ) from exc
 
@@ -27220,7 +27224,8 @@ def _figures_to_gif(
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    "Plotly GIF export requires kaleido==0.2.1. "
+                    "Plotly GIF export requires plotly==5.24.1 with "
+                    "kaleido==0.2.1. "
                     "Install the updated requirements and restart the app."
                 ) from exc
             buffer.write(png)
@@ -28816,6 +28821,306 @@ def _render_app_scrollbar_style() -> None:
     )
 
 
+_COMPOSER_STATE_EXCLUSIONS = (
+    "bo_composer_render_",
+    "bo_composer_exports_",
+    "bo_composer_preset_",
+    "bo_composer_import_",
+    "bo_composer_layout_editor",
+)
+
+
+def _composer_json_bytes(value: Any, *, pretty: bool = False) -> bytes:
+    """Encode compact, portable composer metadata."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2 if pretty else None,
+        separators=None if pretty else (",", ":"),
+        default=str,
+    ).encode("utf-8")
+
+
+def _composer_widget_state(panel_count: int) -> dict[str, Any]:
+    """Capture only reproducibility settings, never rendered figures or uploads."""
+    captured: dict[str, Any] = {}
+    for key, value in st.session_state.items():
+        key = str(key)
+        if not key.startswith("bo_composer_"):
+            continue
+        if any(key.startswith(prefix) for prefix in _COMPOSER_STATE_EXCLUSIONS):
+            continue
+        panel_match = re.search(r"_(\d+)$", key)
+        if panel_match and int(panel_match.group(1)) >= panel_count:
+            continue
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            continue
+        captured[key] = value
+    return captured
+
+
+def _composer_clean_panel_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop runtime-only values while retaining every plot and layout parameter."""
+    cleaned = {}
+    for key, value in spec.items():
+        if key in {"image_bytes", "uploaded_file"}:
+            continue
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            continue
+        cleaned[str(key)] = value
+    return cleaned
+
+
+def _composer_config(
+    specs: Sequence[Mapping[str, Any]],
+    panel_count: int,
+) -> dict[str, Any]:
+    return {
+        "state": _composer_widget_state(panel_count),
+        "panels": [_composer_clean_panel_spec(spec) for spec in specs],
+    }
+
+
+def _composer_metadata(
+    session: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    preset_name: str = "",
+) -> dict[str, Any]:
+    state = session.get("state") or {}
+    return {
+        "schema": COMPOSER_METADATA_SCHEMA,
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "name": str(preset_name or "").strip(),
+        "source": {
+            "data_path": str(session.get("root") or ""),
+            "session_id": str(state.get("session_id") or ""),
+            "group_id": session.get("selected_group_id"),
+        },
+        "config": dict(config),
+    }
+
+
+def _composer_config_signature(config: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_composer_json_bytes(config)).hexdigest()[:16]
+
+
+def _composer_metadata_from_upload(data: bytes, file_name: str) -> dict[str, Any]:
+    """Read a JSON sidecar, metadata-bearing PNG, or portable ZIP."""
+    suffix = Path(file_name).suffix.lower()
+    if suffix == ".png":
+        from PIL import Image
+
+        with Image.open(BytesIO(data)) as image:
+            encoded = image.info.get(COMPOSER_PNG_METADATA_KEY)
+        if not encoded:
+            raise ValueError(
+                "This PNG has no Figure Composer metadata. Upload its JSON sidecar."
+            )
+        payload = json.loads(encoded)
+    elif suffix == ".zip":
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            try:
+                payload = json.loads(archive.read("figure-metadata.json"))
+            except KeyError as exc:
+                raise ValueError(
+                    "This ZIP does not contain figure-metadata.json."
+                ) from exc
+    else:
+        payload = json.loads(data.decode("utf-8-sig"))
+    if not isinstance(payload, dict) or payload.get("schema") != COMPOSER_METADATA_SCHEMA:
+        raise ValueError("Unsupported Figure Composer metadata schema.")
+    if not isinstance(payload.get("config"), dict):
+        raise ValueError("Figure Composer metadata has no configuration.")
+    return payload
+
+
+def _composer_apply_config(config: Mapping[str, Any]) -> None:
+    """Stage saved widget values before composer widgets are constructed."""
+    saved_state = config.get("state") or {}
+    if not isinstance(saved_state, Mapping):
+        raise ValueError("The saved configuration has invalid widget state.")
+    for existing_key in list(st.session_state):
+        existing_key = str(existing_key)
+        if (
+            existing_key.startswith("bo_composer_")
+            and not any(
+                existing_key.startswith(prefix)
+                for prefix in _COMPOSER_STATE_EXCLUSIONS
+            )
+        ):
+            del st.session_state[existing_key]
+    for key, value in saved_state.items():
+        if (
+            isinstance(key, str)
+            and key.startswith("bo_composer_")
+            and not any(key.startswith(prefix) for prefix in _COMPOSER_STATE_EXCLUSIONS)
+        ):
+            st.session_state[key] = copy.deepcopy(value)
+
+
+def _composer_open_source(metadata: Mapping[str, Any]) -> None:
+    source_path = str((metadata.get("source") or {}).get("data_path") or "").strip()
+    if not source_path:
+        return
+    _composer_apply_config(metadata.get("config") or {})
+    st.session_state["bo_session_folder"] = source_path
+
+
+def _composer_load_presets(path: Path = COMPOSER_PRESET_STORE) -> dict[str, dict]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(name): metadata
+        for name, metadata in payload.items()
+        if isinstance(metadata, dict)
+        and metadata.get("schema") == COMPOSER_METADATA_SCHEMA
+    }
+
+
+def _composer_save_preset(
+    name: str,
+    metadata: Mapping[str, Any],
+    path: Path = COMPOSER_PRESET_STORE,
+) -> None:
+    cleaned_name = str(name or "").strip()
+    if not cleaned_name:
+        raise ValueError("Enter a preset name.")
+    presets = _composer_load_presets(path)
+    presets[cleaned_name] = dict(metadata)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(_composer_json_bytes(presets, pretty=True))
+    temporary.replace(path)
+
+
+def _composer_hyperparameter_sweep_preset() -> dict[str, Any]:
+    """Built-in approximation of the supplied two-tensor/trace/map layout."""
+    rects = [
+        (.05, .55, .36, .39), (.05, .06, .36, .39),
+        (.48, .73, .47, .20), (.48, .50, .47, .20),
+        (.46, .285, .15, .16), (.63, .285, .15, .16), (.80, .285, .15, .16),
+        (.46, .06, .15, .16), (.63, .06, .15, .16), (.80, .06, .15, .16),
+    ]
+    kinds = (
+        "Measured 3D tensor", "Measured 3D tensor",
+        "SWV trace overlay", "SWV trace overlay",
+        *("Measured 2D map",) * 6,
+    )
+    state: dict[str, Any] = {
+        "bo_composer_aspect": "4:3",
+        "bo_composer_count": 10,
+        "bo_composer_layout": "Manual",
+        "bo_composer_title": "Hyperparameter Sweep",
+        "bo_composer_panel_border": False,
+    }
+    for index, (kind, rect) in enumerate(zip(kinds, rects)):
+        state[f"bo_composer_kind_{index}"] = kind
+        state[f"bo_composer_label_{index}"] = chr(ord("A") + index)
+        for field, value in zip(("left", "bottom", "width", "height"), rect):
+            state[f"bo_composer_{field}_{index}"] = value
+    for index, channel in ((0, "2"), (1, "3")):
+        state[f"bo_composer_measured_channels_{index}"] = [channel]
+        state[f"bo_composer_measured_x_{index}"] = "amplitude"
+        state[f"bo_composer_measured_y_{index}"] = "frequency"
+        state[f"bo_composer_measured_z_{index}"] = "step_potential"
+        state[f"bo_composer_measured_dot_opacity_{index}"] = .60
+        state[f"bo_composer_measured_colorscale_{index}"] = "Viridis"
+    state["bo_composer_trace_channels_2"] = ["2"]
+    state["bo_composer_trace_channels_3"] = ["3"]
+    state["bo_composer_zoom_from_2"] = "A"
+    state["bo_composer_zoom_color_2"] = "#f2cf00"
+    state["bo_composer_zoom_from_3"] = "B"
+    state["bo_composer_zoom_color_3"] = "#283593"
+    for index in range(4, 10):
+        channel = "2" if index < 7 else "3"
+        state[f"bo_composer_real_channels_{index}"] = [channel]
+        state[f"bo_composer_real_x_{index}"] = "amplitude"
+        state[f"bo_composer_real_y_{index}"] = "frequency"
+    config = {"state": state, "panels": []}
+    return {
+        "schema": COMPOSER_METADATA_SCHEMA,
+        "created_utc": "built-in",
+        "name": "Hyperparameter Sweep",
+        "source": {"data_path": "", "session_id": "", "group_id": None},
+        "config": config,
+    }
+
+
+def _composer_validate_saved_config(
+    metadata: Mapping[str, Any],
+    source_options: Sequence[str],
+    available_channels: Sequence[str],
+    available_fields: Sequence[str] = (),
+    artifact_iterations: Sequence[int] = (),
+) -> list[str]:
+    """Return actionable incompatibilities before applying a preset to new data."""
+    config = metadata.get("config") or {}
+    state = config.get("state") or {}
+    errors: list[str] = []
+    try:
+        panel_count = int(state.get("bo_composer_count", len(config.get("panels") or [])))
+    except (TypeError, ValueError):
+        panel_count = 0
+    channel_set = {str(channel) for channel in available_channels}
+    field_set = {str(field) for field in available_fields}
+    artifact_set = {int(value) for value in artifact_iterations}
+    for index in range(max(panel_count, 0)):
+        kind = state.get(f"bo_composer_kind_{index}")
+        if kind and kind not in source_options:
+            errors.append(f"Panel {index + 1} requires unavailable plot type '{kind}'.")
+            continue
+        for key, value in state.items():
+            if not str(key).endswith(f"_{index}") or "channels" not in str(key):
+                continue
+            requested = {str(channel) for channel in (value or [])}
+            missing = sorted(requested - channel_set, key=_channel_sort_key)
+            if missing:
+                errors.append(
+                    f"Panel {index + 1} requires missing channel(s): {', '.join(missing)}."
+                )
+                break
+        for axis in ("x", "y", "z"):
+            axis_values = [
+                value
+                for key, value in state.items()
+                if str(key).endswith(f"_{axis}_{index}") and value
+            ]
+            for value in axis_values:
+                if field_set and str(value) not in field_set:
+                    errors.append(
+                        f"Panel {index + 1} requires missing data field '{value}'."
+                    )
+        saved_artifacts = [
+            value
+            for key, value in state.items()
+            if str(key).endswith(f"_{index}")
+            and ("sur_iter" in str(key) or "surrogate_iter" in str(key))
+        ]
+        for value in saved_artifacts:
+            try:
+                missing_artifact = int(value) not in artifact_set
+            except (TypeError, ValueError):
+                missing_artifact = True
+            if missing_artifact:
+                errors.append(
+                    f"Panel {index + 1} requires unavailable surrogate artifact "
+                    f"iteration {value}."
+                )
+    return list(dict.fromkeys(errors))
+
+
 def _composer_layout_rects(count: int, preset: str) -> list[tuple[float, float, float, float]]:
     if count <= 0 or preset == "Manual":
         return []
@@ -29737,15 +30042,72 @@ def _build_composer_figure(
                 va="top",
                 ha="left",
             )
+        for spec in specs:
+            source_index = spec.get("zoom_from")
+            if not isinstance(source_index, int) or not 0 <= source_index < len(specs):
+                continue
+            source_rect = specs[source_index]["rect"]
+            target_rect = spec["rect"]
+            color = str(spec.get("zoom_color") or "#d4a900")
+            source_x = source_rect[0] + source_rect[2] * float(
+                spec.get("zoom_source_x", .72)
+            )
+            source_y = source_rect[1] + source_rect[3] * float(
+                spec.get("zoom_source_y", .62)
+            )
+            fig.add_artist(Rectangle(
+                (target_rect[0], target_rect[1]),
+                target_rect[2],
+                target_rect[3],
+                transform=fig.transFigure,
+                fill=False,
+                edgecolor=color,
+                linewidth=1.6,
+                zorder=25,
+            ))
+            for target_y in (
+                target_rect[1] + target_rect[3],
+                target_rect[1],
+            ):
+                fig.add_artist(Line2D(
+                    [source_x, target_rect[0]],
+                    [source_y, target_y],
+                    transform=fig.transFigure,
+                    color=color,
+                    linewidth=1.25,
+                    zorder=24,
+                    clip_on=False,
+                ))
     return fig
 
 
-def _composer_figure_bytes(fig: plt.Figure, fmt: str, dpi: int) -> bytes:
+def _composer_figure_bytes(
+    fig: plt.Figure,
+    fmt: str,
+    dpi: int,
+    *,
+    metadata_json: str | None = None,
+) -> bytes:
     output = BytesIO()
     save_kwargs = {"format": fmt, "bbox_inches": "tight", "facecolor": "white"}
     if fmt == "png":
         save_kwargs["dpi"] = dpi
+        if metadata_json:
+            save_kwargs["metadata"] = {COMPOSER_PNG_METADATA_KEY: metadata_json}
     fig.savefig(output, **save_kwargs)
+    return output.getvalue()
+
+
+def _composer_portable_zip(
+    png_bytes: bytes,
+    metadata_bytes: bytes,
+    *,
+    stem: str,
+) -> bytes:
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{stem}.png", png_bytes)
+        archive.writestr("figure-metadata.json", metadata_bytes)
     return output.getvalue()
 
 
@@ -29769,8 +30131,8 @@ def _render_figure_composer(
 
             1. Choose the canvas, panel count, and a layout.
             2. Open each panel section and choose its plot and data options.
-            3. Enable **Render preview** to inspect the composed figure.
-            4. Click **Prepare export files**, then download PNG, PDF, or SVG.
+            3. Adjust settings and arrange panels without waiting for a render.
+            4. Click **Render figure** to update the preview and export files.
 
             **Manual mouse layout**
 
@@ -29780,11 +30142,12 @@ def _render_figure_composer(
             - Right-click a selected panel to align, match sizes, or distribute.
             - Click empty canvas space to clear the selection.
             - Use the coordinate fields for exact final adjustments.
+            - Mouse and coordinate changes remain pending until **Render figure**.
             """
         )
     st.caption(
         "Assemble a multipanel figure from the active BO scoring/group view. "
-        "Exports are generated only when requested."
+        "All edits are lightweight and remain pending until Render figure is clicked."
     )
     channel_metrics = {
         metric: columns
@@ -29808,6 +30171,120 @@ def _render_figure_composer(
         paired_objective,
         channel_metrics,
     )
+
+    available_channels = sorted({
+        *map(str, real_channels),
+        *(
+            str(channel)
+            for columns in channel_metrics.values()
+            for channel in columns
+        ),
+        *_composer_trace_channels(_composer_trace_entries(session, observations)),
+    }, key=_channel_sort_key)
+    composer_artifacts = _composer_surrogate_files(session, observation)
+    available_fields = {
+        *map(str, history.columns),
+        *_composer_parameter_dimensions_from_observations(observations),
+    }
+    if composer_artifacts:
+        try:
+            artifact_columns = pd.read_csv(
+                composer_artifacts[sorted(composer_artifacts)[-1]],
+                nrows=1,
+            ).columns
+            available_fields.update(map(str, artifact_columns))
+        except Exception:
+            pass
+    saved_presets = {
+        "Hyperparameter Sweep": _composer_hyperparameter_sweep_preset(),
+        **_composer_load_presets(),
+    }
+    with st.expander("Load a preset or saved figure", expanded=False):
+        preset_cols = st.columns([2.2, 1])
+        selected_preset_name = preset_cols[0].selectbox(
+            "Named preset",
+            list(saved_presets),
+            key="bo_composer_preset_select",
+        )
+        selected_preset = saved_presets[selected_preset_name]
+        preset_errors = _composer_validate_saved_config(
+            selected_preset,
+            source_options,
+            available_channels,
+            sorted(available_fields),
+            sorted(composer_artifacts),
+        )
+        preset_cols[1].button(
+            "Load preset",
+            key="bo_composer_preset_load",
+            disabled=bool(preset_errors),
+            on_click=_composer_apply_config,
+            args=(selected_preset.get("config") or {},),
+            use_container_width=True,
+        )
+        if preset_errors:
+            st.error("Preset cannot use the active experiment:\n\n" + "\n\n".join(preset_errors))
+
+        uploaded_metadata_file = st.file_uploader(
+            "Upload a saved figure, metadata sidecar, or portable figure package",
+            type=["png", "json", "zip"],
+            key="bo_composer_import_file",
+        )
+        if uploaded_metadata_file is not None:
+            try:
+                imported_metadata = _composer_metadata_from_upload(
+                    uploaded_metadata_file.getvalue(),
+                    uploaded_metadata_file.name,
+                )
+            except Exception as exc:
+                st.error(f"Could not read Figure Composer metadata: {exc}")
+            else:
+                imported_source = str(
+                    (imported_metadata.get("source") or {}).get("data_path") or ""
+                )
+                imported_bytes = _composer_json_bytes(imported_metadata)
+                st.caption(
+                    f"Configuration: {len(imported_bytes) / 1024:.1f} KB · "
+                    f"Original data: {imported_source or 'not recorded'}"
+                )
+                import_errors = _composer_validate_saved_config(
+                    imported_metadata,
+                    source_options,
+                    available_channels,
+                    sorted(available_fields),
+                    sorted(composer_artifacts),
+                )
+                import_cols = st.columns(2)
+                import_cols[0].button(
+                    "Apply to active experiment",
+                    key="bo_composer_import_apply",
+                    disabled=bool(import_errors),
+                    on_click=_composer_apply_config,
+                    args=(imported_metadata.get("config") or {},),
+                    use_container_width=True,
+                )
+                original_path_exists = bool(
+                    imported_source and Path(imported_source).expanduser().exists()
+                )
+                import_cols[1].button(
+                    "Open original experiment",
+                    key="bo_composer_import_open_source",
+                    disabled=not original_path_exists,
+                    on_click=_composer_open_source,
+                    args=(imported_metadata,),
+                    use_container_width=True,
+                )
+                if import_errors:
+                    st.error(
+                        "This configuration needs data that the active experiment "
+                        "does not provide:\n\n" + "\n\n".join(import_errors)
+                    )
+                if imported_source and not original_path_exists:
+                    st.warning(
+                        "The recorded data path is unavailable. Open the experiment "
+                        "manually, then apply this configuration when its requirements "
+                        "are satisfied."
+                    )
 
     c1, c2, c3, c4 = st.columns(4)
     aspect = c1.selectbox("Canvas", ["4:3", "16:9", "1:1", "Letter"], key="bo_composer_aspect")
@@ -30269,35 +30746,93 @@ def _render_figure_composer(
                     placeholder=r"C:\Users\Asus\Downloads\Titration.jpg",
                     key=f"bo_composer_image_path_{index}",
                 )
+            zoom_options = ["None"] + [
+                chr(ord("A") + source_index)
+                for source_index in range(panel_count)
+                if source_index != index
+            ]
+            zoom_from = st.selectbox(
+                "Zoom/link source panel",
+                zoom_options,
+                key=f"bo_composer_zoom_from_{index}",
+                help=(
+                    "Draws a colored frame and two connector lines from another "
+                    "panel to this detail panel."
+                ),
+            )
+            if zoom_from != "None":
+                zoom_cols = st.columns(3)
+                spec["zoom_from"] = ord(zoom_from) - ord("A")
+                spec["zoom_color"] = zoom_cols[0].color_picker(
+                    "Zoom color",
+                    value="#d4a900",
+                    key=f"bo_composer_zoom_color_{index}",
+                )
+                spec["zoom_source_x"] = float(zoom_cols[1].slider(
+                    "Source X",
+                    0.0,
+                    1.0,
+                    .72,
+                    .01,
+                    key=f"bo_composer_zoom_x_{index}",
+                ))
+                spec["zoom_source_y"] = float(zoom_cols[2].slider(
+                    "Source Y",
+                    0.0,
+                    1.0,
+                    .62,
+                    .01,
+                    key=f"bo_composer_zoom_y_{index}",
+                ))
             specs.append(spec)
 
-    if st.checkbox("Render preview", value=True, key="bo_composer_preview"):
-        fig = _build_composer_figure(
-            session,
-            history,
-            observations,
-            observation,
-            trace_analysis,
-            paired_objective,
-            specs,
-            aspect,
-            font_family,
-            font_size,
-            label_size,
-            title,
-            dpi,
-            panel_border,
-            panel_border_color,
-            panel_border_width,
-        )
-        st.pyplot(fig, clear_figure=True, use_container_width=True)
-        plt.close(fig)
+    config = _composer_config(specs, panel_count)
+    config_signature = _composer_config_signature(config)
 
-    export_key = f"bo_composer_exports_{session['state'].get('session_id', session['root'].name)}"
-    if st.button("Prepare export files", type="primary", key="bo_composer_prepare_exports"):
-        st.session_state[export_key] = {}
-        for fmt in ("png", "pdf", "svg"):
-            fig = _build_composer_figure(
+    st.markdown("**Reusable preset**")
+    preset_save_cols = st.columns([2.2, 1])
+    preset_name = preset_save_cols[0].text_input(
+        "Preset name",
+        value="",
+        placeholder="e.g. Hyperparameter Sweep",
+        key="bo_composer_preset_name",
+    )
+    if preset_save_cols[1].button(
+        "Save preset",
+        key="bo_composer_preset_save",
+        use_container_width=True,
+    ):
+        try:
+            _composer_save_preset(
+                preset_name,
+                _composer_metadata(session, config, preset_name=preset_name),
+            )
+        except (OSError, ValueError) as exc:
+            st.error(f"Could not save preset: {exc}")
+        else:
+            st.success(f"Saved preset '{preset_name.strip()}'.")
+
+    render_identity = (
+        f"{session['state'].get('session_id', session['root'].name)}::"
+        f"{session.get('selected_group_id', 'all')}"
+    )
+    render_key = f"bo_composer_render_{render_identity}"
+    if st.button(
+        "Render figure",
+        type="primary",
+        key="bo_composer_render_button",
+        use_container_width=True,
+    ):
+        figure = None
+        try:
+            metadata = _composer_metadata(
+                session,
+                config,
+                preset_name=preset_name or title,
+            )
+            metadata_bytes = _composer_json_bytes(metadata)
+            metadata_json = metadata_bytes.decode("utf-8")
+            figure = _build_composer_figure(
                 session,
                 history,
                 observations,
@@ -30315,11 +30850,55 @@ def _render_figure_composer(
                 panel_border_color,
                 panel_border_width,
             )
-            st.session_state[export_key][fmt] = _composer_figure_bytes(fig, fmt, dpi)
-            plt.close(fig)
-    prepared = st.session_state.get(export_key) or {}
-    if prepared:
-        export_cols = st.columns(3)
+            png_bytes = _composer_figure_bytes(
+                figure,
+                "png",
+                dpi,
+                metadata_json=metadata_json,
+            )
+            stem = _safe_download_stem(
+                preset_name or title or f"{session['root'].name}_multipanel"
+            )
+            st.session_state[render_key] = {
+                "signature": config_signature,
+                "metadata": metadata_bytes,
+                "png": png_bytes,
+                "pdf": _composer_figure_bytes(figure, "pdf", dpi),
+                "svg": _composer_figure_bytes(figure, "svg", dpi),
+                "zip": _composer_portable_zip(
+                    png_bytes,
+                    metadata_bytes,
+                    stem=stem,
+                ),
+                "stem": stem,
+            }
+        except Exception as exc:
+            st.error(f"Figure rendering failed: {exc}")
+        finally:
+            if figure is not None:
+                plt.close(figure)
+
+    rendered = st.session_state.get(render_key) or {}
+    if not rendered:
+        st.warning(
+            "No figure has been generated yet. Click Render figure before saving "
+            "or exporting it."
+        )
+    elif rendered.get("signature") != config_signature:
+        st.image(rendered["png"], caption="Last rendered version", use_container_width=True)
+        st.error(
+            "The configuration has changed since this preview was generated. "
+            "Click Render figure to update it before saving or exporting."
+        )
+    else:
+        st.image(rendered["png"], caption="Rendered figure", use_container_width=True)
+        metadata_kb = len(rendered["metadata"]) / 1024
+        st.caption(
+            f"Reproducibility metadata: {metadata_kb:.1f} KB. It is embedded in "
+            "the PNG and also available as a small JSON sidecar."
+        )
+        export_cols = st.columns(5)
+        stem = rendered["stem"]
         for fmt, mime, column in (
             ("png", "image/png", export_cols[0]),
             ("pdf", "application/pdf", export_cols[1]),
@@ -30327,11 +30906,28 @@ def _render_figure_composer(
         ):
             column.download_button(
                 f"Download {fmt.upper()}",
-                data=prepared[fmt],
-                file_name=f"{session['root'].name}_multipanel.{fmt}",
+                data=rendered[fmt],
+                file_name=f"{stem}.{fmt}",
                 mime=mime,
                 key=f"bo_composer_download_{fmt}",
+                use_container_width=True,
             )
+        export_cols[3].download_button(
+            "Metadata JSON",
+            data=rendered["metadata"],
+            file_name=f"{stem}.figure.json",
+            mime="application/json",
+            key="bo_composer_download_metadata",
+            use_container_width=True,
+        )
+        export_cols[4].download_button(
+            "Portable ZIP",
+            data=rendered["zip"],
+            file_name=f"{stem}.figure.zip",
+            mime="application/zip",
+            key="bo_composer_download_zip",
+            use_container_width=True,
+        )
 
 
 def render_bo_session_app() -> None:

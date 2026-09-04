@@ -39,3 +39,4 @@ _mat_csv/
 bo_sessions/
 simulation_artifacts/
 analysis_outputs/
+.figure_composer_presets.json

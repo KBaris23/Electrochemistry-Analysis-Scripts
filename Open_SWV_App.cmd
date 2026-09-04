@@ -24,13 +24,11 @@ if not defined PYTHON_EXE (
     exit /b 1
 )
 
-"%PYTHON_EXE%" -c "import streamlit" >nul 2>nul
+"%PYTHON_EXE%" -c "import importlib.metadata as m, streamlit; assert m.version('plotly') == '5.24.1'; assert m.version('kaleido') == '0.2.1'" >nul 2>nul
 if errorlevel 1 (
-    echo Streamlit is not installed for:
+    echo Installing missing or incompatible app requirements for:
     echo   %PYTHON_EXE%
     echo.
-    choice /C YN /M "Install the app requirements now"
-    if errorlevel 2 exit /b 1
     "%PYTHON_EXE%" -m pip install -r requirements.txt
     if errorlevel 1 (
         echo.
