@@ -21026,7 +21026,9 @@ def _surrogate_file_metadata(path: Path) -> tuple[int | None, int] | None:
     return group_id, int(iteration_match.group(1))
 
 
+@st.cache_data(show_spinner=False, max_entries=64, ttl=2)
 def _surrogate_files(root: Path, group_id: int | None = None) -> dict[int, Path]:
+    """Index surrogate artifacts, briefly caching repeated rerun scans."""
     result = {}
     surrogate_dir = root / "surrogate"
     if not surrogate_dir.is_dir():
@@ -25429,7 +25431,7 @@ def _render_downloadable_pyplot(
         png_bytes,
         key=key,
         file_stem=file_stem,
-        figure=None,
+        figure=fig,
         settings=capture_settings,
         label=capture_label,
     )
@@ -26547,7 +26549,7 @@ def _queue_plot_for_composer(
     *,
     label: str,
     file_stem: str,
-    figure: go.Figure | None,
+    figure: go.Figure | plt.Figure | None,
     settings: Mapping[str, Any] | None = None,
     camera: Mapping[str, Any] | None = None,
 ) -> str:
@@ -26579,9 +26581,24 @@ def _queue_plot_for_composer(
         "label": str(label or file_stem or "Captured plot"),
         "file_stem": str(file_stem or "captured_plot"),
         "png_bytes": bytes(png_bytes),
-        # The PNG is the exact visual source. Keep only compact structural
-        # metadata here; serializing every trace array caused large captures
-        # to stall the whole Streamlit rerun.
+        # Keep the in-memory source object so the Composer can render it at
+        # the final panel size/DPI and apply presentation overrides. This is
+        # intentionally excluded from portable metadata and is not converted
+        # to JSON on each rerun (which was prohibitively slow for large traces).
+        "source_figure": (
+            figure
+            if isinstance(figure, (go.Figure, plt.Figure))
+            else None
+        ),
+        "source_kind": (
+            "plotly"
+            if isinstance(figure, go.Figure)
+            else "matplotlib"
+            if isinstance(figure, plt.Figure)
+            else "raster"
+        ),
+        # Retain compact structural metadata for diagnostics without copying
+        # every trace array into Composer configuration/export metadata.
         "figure_config": (
             {
                 "layout": json.loads(json.dumps(
@@ -26638,7 +26655,7 @@ def _render_add_to_composer_button(
     *,
     key: str,
     file_stem: str,
-    figure: go.Figure | None,
+    figure: go.Figure | plt.Figure | None,
     settings: Mapping[str, Any] | None = None,
     camera: Mapping[str, Any] | None = None,
     label: str = "",
@@ -26686,7 +26703,7 @@ def _add_plot_to_composer_callback(
     png_bytes: bytes,
     label: str,
     file_stem: str,
-    figure: go.Figure | None,
+    figure: go.Figure | plt.Figure | None,
     settings: Mapping[str, Any] | None,
     camera: Mapping[str, Any] | None,
     flash_key: str,
@@ -29055,6 +29072,8 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_capture_flash",
     "bo_composer_capture_preview_",
     "bo_composer_add_flash_",
+    "bo_composer_auto_render",
+    "bo_composer_move_",
 )
 
 
@@ -29258,6 +29277,57 @@ def _composer_apply_pending_captures() -> tuple[int, int]:
     st.session_state["bo_composer_count"] = max(panel_count, 1)
     skipped = max(0, len(pending) - added)
     return added, skipped
+
+
+def _composer_swap_panels(
+    first_index: int,
+    second_index: int,
+    panel_count: int,
+) -> None:
+    """Swap two panel configurations and keep labels/zoom links meaningful."""
+    if (
+        first_index == second_index
+        or not 0 <= first_index < panel_count
+        or not 0 <= second_index < panel_count
+    ):
+        return
+    moved_state: list[tuple[str, int, Any]] = []
+    for state_key in list(st.session_state):
+        state_key = str(state_key)
+        if any(
+            state_key.startswith(prefix)
+            for prefix in _COMPOSER_STATE_EXCLUSIONS
+        ):
+            continue
+        match = re.fullmatch(r"(bo_composer_.+_)(\d+)", state_key)
+        if match is None:
+            continue
+        old_index = int(match.group(2))
+        if old_index not in {first_index, second_index}:
+            continue
+        moved_state.append((match.group(1), old_index, st.session_state[state_key]))
+        del st.session_state[state_key]
+
+    destinations = {first_index: second_index, second_index: first_index}
+    for prefix, old_index, value in moved_state:
+        new_index = destinations[old_index]
+        if (
+            prefix == "bo_composer_label_"
+            and value == chr(ord("A") + old_index)
+        ):
+            value = chr(ord("A") + new_index)
+        st.session_state[f"{prefix}{new_index}"] = value
+
+    first_letter = chr(ord("A") + first_index)
+    second_letter = chr(ord("A") + second_index)
+    for index in range(panel_count):
+        zoom_key = f"bo_composer_zoom_from_{index}"
+        zoom_from = st.session_state.get(zoom_key)
+        if zoom_from == first_letter:
+            st.session_state[zoom_key] = second_letter
+        elif zoom_from == second_letter:
+            st.session_state[zoom_key] = first_letter
+    st.session_state["bo_composer_auto_render"] = True
 
 
 def _composer_open_source(metadata: Mapping[str, Any]) -> None:
@@ -29769,6 +29839,37 @@ def _composer_surrogate_files(session: dict, observation: dict) -> dict[int, Pat
     return files or _surrogate_files(session["root"])
 
 
+@st.cache_data(show_spinner=False, max_entries=64)
+def _composer_read_csv_cached(
+    path_text: str,
+    modified_ns: int,
+    size_bytes: int,
+    nrows: int | None,
+) -> pd.DataFrame:
+    """Read one Composer CSV once per exact on-disk file version."""
+    del modified_ns, size_bytes
+    return pd.read_csv(path_text, nrows=nrows)
+
+
+def _composer_read_csv(
+    path: str | Path,
+    *,
+    nrows: int | None = None,
+) -> pd.DataFrame:
+    """Fingerprint a CSV before using the bounded Composer read cache."""
+    resolved = Path(path).expanduser().resolve()
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return pd.read_csv(resolved, nrows=nrows)
+    return _composer_read_csv_cached(
+        str(resolved),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+        nrows,
+    )
+
+
 def _composer_draw_surrogate_map(
     fig,
     ax,
@@ -29785,7 +29886,7 @@ def _composer_draw_surrogate_map(
         ax.text(.5, .5, "No surrogate artifact", ha="center", va="center")
         ax.set_axis_off()
         return
-    frame = pd.read_csv(path)
+    frame = _composer_read_csv(path)
     if not x_name or not y_name or value not in frame or x_name not in frame or y_name not in frame:
         ax.text(.5, .5, "Choose X/Y/value", ha="center", va="center")
         ax.set_axis_off()
@@ -29977,7 +30078,7 @@ def _composer_available_sources(
     if surrogate_files:
         latest = surrogate_files[sorted(surrogate_files)[-1]]
         try:
-            surrogate_frame = pd.read_csv(latest)
+            surrogate_frame = _composer_read_csv(latest)
         except Exception:
             surrogate_frame = pd.DataFrame()
         surrogate_dimensions = _composer_varied_dimensions(surrogate_frame)
@@ -30007,8 +30108,11 @@ def _composer_available_sources(
         if len(hyper_columns) >= 3:
             sources.append("Hyperparameter 3D heatmap")
         sources.append("Hyperparameter parallel coordinates")
-    if st.session_state.get("bo_composer_captured_plots"):
-        sources.append("Captured plot")
+    # Keep this option present before and after the first direct capture.
+    # Streamlit includes selectbox options in widget identity; adding the
+    # option only after a capture can recreate every panel's Figure widget
+    # and reset a queued "Captured plot" selection to the first/default item.
+    sources.append("Captured plot")
     sources.append("Image file")
     return list(dict.fromkeys(sources))
 
@@ -30164,15 +30268,177 @@ def _composer_draw_image_file(ax, path_text: str) -> None:
         _composer_error_panel(ax, f"Could not open image: {exc}")
 
 
-def _composer_draw_captured_plot(ax, capture_id: str) -> None:
-    """Draw an exact in-session plot snapshot added from another view."""
+def _composer_capture_format_defaults(
+    capture: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return editable presentation defaults from an in-memory plot source."""
+    source = capture.get("source_figure")
+    defaults = {
+        "title": str(capture.get("label") or ""),
+        "xlabel": "",
+        "ylabel": "",
+        "zlabel": "",
+        "show_legend": True,
+        "show_grid": True,
+    }
+    if isinstance(source, go.Figure):
+        defaults.update({
+            "title": _plain_plotly_text(
+                getattr(source.layout.title, "text", "")
+            ),
+            "xlabel": _plain_plotly_text(
+                getattr(source.layout.xaxis.title, "text", "")
+            ),
+            "ylabel": _plain_plotly_text(
+                getattr(source.layout.yaxis.title, "text", "")
+            ),
+            "zlabel": _plain_plotly_text(
+                getattr(source.layout.scene.zaxis.title, "text", "")
+            ),
+            "show_legend": (
+                bool(source.layout.showlegend)
+                if source.layout.showlegend is not None
+                else any(
+                    getattr(trace, "showlegend", None) is not False
+                    and bool(getattr(trace, "name", None))
+                    for trace in source.data
+                )
+            ),
+            "show_grid": bool(
+                source.layout.xaxis.showgrid is not False
+                and source.layout.yaxis.showgrid is not False
+            ),
+        })
+    elif isinstance(source, plt.Figure):
+        primary_axis = next(
+            (
+                axis for axis in source.axes
+                if not _is_matplotlib_colorbar_axis(axis)
+            ),
+            None,
+        )
+        if primary_axis is not None:
+            legend = primary_axis.get_legend()
+            defaults.update({
+                "title": str(primary_axis.get_title() or defaults["title"]),
+                "xlabel": str(primary_axis.get_xlabel() or ""),
+                "ylabel": str(primary_axis.get_ylabel() or ""),
+                "zlabel": str(
+                    primary_axis.get_zlabel()
+                    if hasattr(primary_axis, "get_zlabel")
+                    else ""
+                ),
+                "show_legend": bool(
+                    legend is not None and legend.get_visible()
+                ),
+                "show_grid": any(
+                    line.get_visible()
+                    for line in (
+                        *primary_axis.get_xgridlines(),
+                        *primary_axis.get_ygridlines(),
+                    )
+                ),
+            })
+    return defaults
+
+
+def _composer_formatted_capture_figure(
+    capture: Mapping[str, Any],
+    spec: Mapping[str, Any],
+) -> go.Figure | plt.Figure | None:
+    """Copy an in-memory source and apply Composer-owned formatting."""
+    source = capture.get("source_figure")
+    line_scale = max(0.1, float(spec.get("capture_line_scale", 1.0)))
+    show_legend = bool(spec.get("capture_show_legend", True))
+    show_grid = bool(spec.get("capture_show_grid", True))
+    title = str(spec.get("capture_title") or "")
+    xlabel = str(spec.get("capture_xlabel") or "")
+    ylabel = str(spec.get("capture_ylabel") or "")
+    zlabel = str(spec.get("capture_zlabel") or "")
+    if isinstance(source, go.Figure):
+        figure = go.Figure(source)
+        figure.update_layout(showlegend=show_legend, title_text=title)
+        figure.update_xaxes(title_text=xlabel, showgrid=show_grid)
+        figure.update_yaxes(title_text=ylabel, showgrid=show_grid)
+        scene_updates = {
+            str(key): {
+                "xaxis": {"showgrid": show_grid, "title": {"text": xlabel}},
+                "yaxis": {"showgrid": show_grid, "title": {"text": ylabel}},
+                "zaxis": {"showgrid": show_grid, "title": {"text": zlabel}},
+            }
+            for key in figure.layout.to_plotly_json()
+            if re.fullmatch(r"scene\d*", str(key))
+        }
+        if scene_updates:
+            figure.update_layout(**scene_updates)
+        for trace in figure.data:
+            line = getattr(trace, "line", None)
+            width = _finite_float(getattr(line, "width", None))
+            if line is not None and width is not None:
+                line.width = max(0.1, width * line_scale)
+        return figure
+    if isinstance(source, plt.Figure):
+        figure = copy.deepcopy(source)
+        primary_axis = next(
+            (
+                axis for axis in figure.axes
+                if not _is_matplotlib_colorbar_axis(axis)
+            ),
+            None,
+        )
+        if primary_axis is not None:
+            primary_axis.set_title(title)
+            primary_axis.set_xlabel(xlabel)
+            primary_axis.set_ylabel(ylabel)
+            if hasattr(primary_axis, "set_zlabel"):
+                primary_axis.set_zlabel(zlabel)
+            primary_axis.grid(show_grid)
+            legend = primary_axis.get_legend()
+            if legend is not None:
+                legend.set_visible(show_legend)
+            for line in primary_axis.lines:
+                line.set_linewidth(max(0.1, line.get_linewidth() * line_scale))
+            for collection in primary_axis.collections:
+                widths = collection.get_linewidths()
+                if len(widths):
+                    collection.set_linewidths(
+                        [max(0.1, float(width) * line_scale) for width in widths]
+                    )
+        return figure
+    return None
+
+
+def _composer_draw_captured_plot(
+    target_fig: plt.Figure,
+    ax,
+    spec: Mapping[str, Any],
+    render_dpi: int,
+    text_size: float,
+) -> None:
+    """Re-render a captured source at panel DPI, with raster fallback."""
     from PIL import Image
 
     registry = st.session_state.get("bo_composer_captured_plots")
-    capture = registry.get(str(capture_id)) if isinstance(registry, Mapping) else None
+    capture_id = str(spec.get("capture_id") or "")
+    capture = registry.get(capture_id) if isinstance(registry, Mapping) else None
     png_bytes = capture.get("png_bytes") if isinstance(capture, Mapping) else None
     if not isinstance(png_bytes, (bytes, bytearray)):
         _composer_error_panel(ax, "This captured plot is no longer in this session.")
+        return
+    source_figure = (
+        _composer_formatted_capture_figure(capture, spec)
+        if bool(spec.get("capture_rerender_source", True))
+        else None
+    )
+    if source_figure is not None:
+        _composer_draw_embedded_figure(
+            target_fig,
+            ax,
+            source_figure,
+            spec["rect"],
+            render_dpi,
+            text_size,
+        )
         return
     try:
         with Image.open(BytesIO(png_bytes)) as image:
@@ -30269,7 +30535,7 @@ def _composer_build_surrogate(spec: dict, session: dict, observation: dict):
     path = files.get(spec["artifact_iteration"])
     if path is None:
         return _composer_plotly_message("No surrogate artifact is available.")
-    predictions = pd.read_csv(path)
+    predictions = _composer_read_csv(path)
     predictions = _recompute_group_surrogate(
         session,
         predictions,
@@ -30551,7 +30817,13 @@ def _build_composer_figure(
             elif kind == "Image file":
                 _composer_draw_image_file(ax, spec.get("path", ""))
             elif kind == "Captured plot":
-                _composer_draw_captured_plot(ax, spec.get("capture_id", ""))
+                _composer_draw_captured_plot(
+                    fig,
+                    ax,
+                    spec,
+                    render_dpi,
+                    spec.get("text_size", font_size),
+                )
             else:
                 ax.text(.5, .5, "Select a figure", ha="center", va="center")
                 ax.set_axis_off()
@@ -30694,6 +30966,9 @@ def _render_figure_composer(
     paired_objective: bool,
 ) -> None:
     added_captures, skipped_captures = _composer_apply_pending_captures()
+    auto_render_requested = bool(
+        st.session_state.pop("bo_composer_auto_render", False)
+    )
     composer_heading, composer_help = st.columns([8, 1])
     composer_heading.subheader("Figure Composer")
     with composer_help.popover(
@@ -30707,7 +30982,8 @@ def _render_figure_composer(
             1. Choose the canvas, panel count, and a layout.
             2. Open each panel section and choose its plot and data options.
             3. Adjust settings and arrange panels without waiting for a render.
-            4. Click **Render figure** to update the preview and export files.
+            4. Direct captures and panel moves update the preview automatically.
+               For other edits, click **Render figure** to update exports.
 
             **Manual mouse layout**
 
@@ -30723,7 +30999,8 @@ def _render_figure_composer(
         )
     st.caption(
         "Assemble a multipanel figure from the active BO scoring/group view. "
-        "All edits are lightweight and remain pending until Render figure is clicked."
+        "Direct captures and panel moves refresh automatically; other edits remain "
+        "pending until Render figure is clicked."
     )
     if added_captures:
         added_labels = ", ".join(
@@ -30805,7 +31082,7 @@ def _render_figure_composer(
     }
     if composer_artifacts:
         try:
-            artifact_columns = pd.read_csv(
+            artifact_columns = _composer_read_csv(
                 composer_artifacts[sorted(composer_artifacts)[-1]],
                 nrows=1,
             ).columns
@@ -30967,8 +31244,50 @@ def _render_figure_composer(
     for index in range(panel_count):
         default_rect = rects[index] if rects else (.07, .10, .40, .35)
         with st.expander(f"Panel {chr(ord('A') + index)}", expanded=index < 4):
+            order_cols = st.columns([1, 1, 4])
+            order_cols[0].button(
+                "← Earlier",
+                key=f"bo_composer_move_earlier_{index}",
+                disabled=index == 0,
+                on_click=_composer_swap_panels,
+                args=(index, index - 1, panel_count),
+                use_container_width=True,
+                help="Move this panel one letter earlier.",
+            )
+            order_cols[1].button(
+                "Later →",
+                key=f"bo_composer_move_later_{index}",
+                disabled=index >= panel_count - 1,
+                on_click=_composer_swap_panels,
+                args=(index, index + 1, panel_count),
+                use_container_width=True,
+                help="Move this panel one letter later.",
+            )
+            order_cols[2].caption(
+                "Moving a panel reassigns its letter and preserves custom labels."
+            )
             top_cols = st.columns([1.4, .8, .8, .8, .9])
             kind = top_cols[0].selectbox("Figure", source_options, key=f"bo_composer_kind_{index}")
+            capture_registry = st.session_state.get("bo_composer_captured_plots")
+            capture_registry = (
+                capture_registry
+                if isinstance(capture_registry, Mapping)
+                else {}
+            )
+            selected_capture_id = st.session_state.get(
+                f"bo_composer_capture_id_{index}"
+            )
+            selected_capture = capture_registry.get(str(selected_capture_id))
+            if not isinstance(selected_capture, Mapping) and capture_registry:
+                selected_capture = next(iter(capture_registry.values()))
+            editable_capture = bool(
+                kind == "Captured plot"
+                and isinstance(selected_capture, Mapping)
+                and isinstance(
+                    selected_capture.get("source_figure"),
+                    (go.Figure, plt.Figure),
+                )
+            )
             label = top_cols[1].text_input("Label", value=chr(ord("A") + index), key=f"bo_composer_label_{index}")
             label_x = top_cols[2].number_input("Label X", value=-0.08, step=.02, format="%.2f", key=f"bo_composer_label_x_{index}")
             label_y = top_cols[3].number_input("Label Y", value=1.06, step=.02, format="%.2f", key=f"bo_composer_label_y_{index}")
@@ -30979,7 +31298,7 @@ def _render_figure_composer(
                 font_size,
                 key=f"bo_composer_text_size_{index}",
                 help="Text size for this panel only, including axes and colorbars.",
-                disabled=kind == "Captured plot",
+                disabled=kind == "Captured plot" and not editable_capture,
             ))
             if preset == "Manual":
                 pos_cols = st.columns(4)
@@ -31190,7 +31509,7 @@ def _render_figure_composer(
             elif kind == "Surrogate 2D map":
                 files = _composer_surrogate_files(session, observation)
                 artifact_iteration = st.selectbox("Artifact", sorted(files), index=len(files) - 1, key=f"bo_composer_sur_iter_{index}")
-                predictions = pd.read_csv(files[artifact_iteration])
+                predictions = _composer_read_csv(files[artifact_iteration])
                 values = [name for name in SURROGATE_VALUES if name in predictions.columns]
                 numeric_values = list(predictions.select_dtypes(include=np.number).columns)
                 dimensions = [name for name in PARAMETERS if name in predictions.columns and predictions[name].nunique(dropna=True) > 1]
@@ -31212,7 +31531,7 @@ def _render_figure_composer(
                     index=len(files) - 1,
                     key=f"bo_composer_surrogate_iter_{index}",
                 )
-                predictions = pd.read_csv(files[artifact_iteration])
+                predictions = _composer_read_csv(files[artifact_iteration])
                 values = [name for name in SURROGATE_VALUES if name in predictions.columns]
                 numeric_values = list(predictions.select_dtypes(include=np.number).columns)
                 dimensions = _composer_varied_dimensions(predictions)
@@ -31448,8 +31767,7 @@ def _render_figure_composer(
                             key=f"bo_composer_hp_cube_edges_{index}",
                         )
             elif kind == "Captured plot":
-                captures = st.session_state.get("bo_composer_captured_plots")
-                captures = captures if isinstance(captures, Mapping) else {}
+                captures = capture_registry
                 capture_ids = list(captures)
                 if capture_ids:
                     spec["capture_id"] = st.selectbox(
@@ -31463,6 +31781,11 @@ def _render_figure_composer(
                     capture = captures[spec["capture_id"]]
                     settings = capture.get("settings") or {}
                     camera = capture.get("camera")
+                    source_figure = capture.get("source_figure")
+                    source_is_editable = isinstance(
+                        source_figure,
+                        (go.Figure, plt.Figure),
+                    )
                     size_text = (
                         f"{settings.get('width')} × {settings.get('height')} px"
                         if settings.get("width") and settings.get("height")
@@ -31473,19 +31796,82 @@ def _render_figure_composer(
                         f"{'cached 3D view included' if camera else 'current view included'} "
                         f"· captured {capture.get('created_utc', '')}"
                     )
-                    if st.button(
-                        "Preview captured Figure " + chr(ord("A") + index),
-                        key=f"bo_composer_capture_preview_{index}",
-                    ):
-                        st.image(
-                            capture["png_bytes"],
-                            caption=f"Figure {chr(ord('A') + index)} preview",
-                            width=520,
-                        )
-                    st.info(
-                        "This panel is an exact snapshot. Return to the source plot "
-                        "and add it again to change its plot-specific settings."
+                    spec["capture_rerender_source"] = st.checkbox(
+                        "Re-render source at Composer DPI",
+                        value=source_is_editable,
+                        key=f"bo_composer_capture_rerender_{index}",
+                        disabled=not source_is_editable,
+                        help=(
+                            "Uses the original in-memory plot instead of enlarging "
+                            "the preview PNG. Available for captures made after this update."
+                        ),
                     )
+                    format_defaults = _composer_capture_format_defaults(capture)
+                    format_cols = st.columns(3)
+                    spec["capture_show_legend"] = format_cols[0].checkbox(
+                        "Show legend",
+                        value=bool(format_defaults["show_legend"]),
+                        key=f"bo_composer_capture_legend_{index}",
+                        disabled=not source_is_editable,
+                    )
+                    spec["capture_show_grid"] = format_cols[1].checkbox(
+                        "Show grid",
+                        value=bool(format_defaults["show_grid"]),
+                        key=f"bo_composer_capture_grid_{index}",
+                        disabled=not source_is_editable,
+                    )
+                    spec["capture_line_scale"] = float(format_cols[2].slider(
+                        "Line width",
+                        0.25,
+                        4.0,
+                        1.0,
+                        0.25,
+                        key=f"bo_composer_capture_line_scale_{index}",
+                        disabled=not source_is_editable,
+                    ))
+                    text_cols = st.columns(4)
+                    spec["capture_title"] = text_cols[0].text_input(
+                        "Plot title",
+                        value=str(format_defaults["title"]),
+                        key=f"bo_composer_capture_title_{index}",
+                        disabled=not source_is_editable,
+                    )
+                    spec["capture_xlabel"] = text_cols[1].text_input(
+                        "X-axis label",
+                        value=str(format_defaults["xlabel"]),
+                        key=f"bo_composer_capture_xlabel_{index}",
+                        disabled=not source_is_editable,
+                    )
+                    spec["capture_ylabel"] = text_cols[2].text_input(
+                        "Y-axis label",
+                        value=str(format_defaults["ylabel"]),
+                        key=f"bo_composer_capture_ylabel_{index}",
+                        disabled=not source_is_editable,
+                    )
+                    spec["capture_zlabel"] = text_cols[3].text_input(
+                        "Z-axis label",
+                        value=str(format_defaults["zlabel"]),
+                        key=f"bo_composer_capture_zlabel_{index}",
+                        disabled=not source_is_editable,
+                    )
+                    st.image(
+                        capture["png_bytes"],
+                        caption=(
+                            f"Figure {chr(ord('A') + index)} preview · "
+                            f"{capture.get('label') or 'Captured plot'}"
+                        ),
+                        width=520,
+                    )
+                    if source_is_editable:
+                        st.info(
+                            "The thumbnail is the captured view; the composed figure "
+                            "is rebuilt from its source at the selected DPI and formatting."
+                        )
+                    else:
+                        st.info(
+                            "This older capture only has a raster snapshot. Add it again "
+                            "from the source plot to enable high-DPI formatting."
+                        )
                 else:
                     spec["capture_id"] = ""
                     st.warning("No captured plots remain in this app session.")
@@ -31586,14 +31972,18 @@ def _render_figure_composer(
         f"{session.get('selected_group_id', 'all')}"
     )
     render_key = f"bo_composer_render_{render_identity}"
-    if st.button(
+    render_clicked = st.button(
         "Render figure",
         type="primary",
         key="bo_composer_render_button",
         use_container_width=True,
-    ):
+    )
+    automatic_render = bool(added_captures or auto_render_requested)
+    if render_clicked or automatic_render:
         figure = None
         try:
+            preview_only = bool(automatic_render and not render_clicked)
+            active_render_dpi = min(dpi, 120) if preview_only else dpi
             metadata = _composer_metadata(
                 session,
                 config,
@@ -31614,7 +32004,7 @@ def _render_figure_composer(
                 font_size,
                 label_size,
                 title,
-                dpi,
+                active_render_dpi,
                 panel_border,
                 panel_border_color,
                 panel_border_width,
@@ -31622,30 +32012,38 @@ def _render_figure_composer(
             png_bytes = _composer_figure_bytes(
                 figure,
                 "png",
-                dpi,
+                active_render_dpi,
                 metadata_json=metadata_json,
             )
             stem = _safe_download_stem(
                 preset_name or title or f"{session['root'].name}_multipanel"
             )
-            st.session_state[render_key] = {
+            rendered_payload = {
                 "signature": config_signature,
                 "metadata": metadata_bytes,
                 "png": png_bytes,
-                "pdf": _composer_figure_bytes(figure, "pdf", dpi),
-                "svg": _composer_figure_bytes(figure, "svg", dpi),
-                "zip": _composer_portable_zip(
-                    png_bytes,
-                    metadata_bytes,
-                    stem=stem,
-                ),
                 "stem": stem,
+                "preview_only": preview_only,
             }
+            if not preview_only:
+                rendered_payload.update({
+                    "pdf": _composer_figure_bytes(figure, "pdf", dpi),
+                    "svg": _composer_figure_bytes(figure, "svg", dpi),
+                    "zip": _composer_portable_zip(
+                        png_bytes,
+                        metadata_bytes,
+                        stem=stem,
+                    ),
+                })
+            st.session_state[render_key] = rendered_payload
         except Exception as exc:
             st.error(f"Figure rendering failed: {exc}")
         finally:
             if figure is not None:
                 plt.close(figure)
+
+    if automatic_render:
+        st.caption("Composer preview refreshed automatically.")
 
     rendered = st.session_state.get(render_key) or {}
     if not rendered:
@@ -31660,7 +32058,18 @@ def _render_figure_composer(
             "Click Render figure to update it before saving or exporting."
         )
     else:
-        st.image(rendered["png"], caption="Rendered figure", use_container_width=True)
+        preview_only = bool(rendered.get("preview_only"))
+        st.image(
+            rendered["png"],
+            caption=("Composer preview" if preview_only else "Rendered figure"),
+            use_container_width=True,
+        )
+        if preview_only:
+            st.info(
+                "This preview is current. Click Render figure when you are ready "
+                "to generate the final-DPI PNG, PDF, SVG, and portable ZIP."
+            )
+            return
         metadata_kb = len(rendered["metadata"]) / 1024
         st.caption(
             f"Reproducibility metadata: {metadata_kb:.1f} KB. It is embedded in "

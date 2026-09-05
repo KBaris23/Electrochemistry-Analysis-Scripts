@@ -50,6 +50,7 @@ def test_composer_keeps_baseline_sources_for_empty_sessions(tmp_path):
     assert "Global trend" in sources
     assert "Measured 2D map" in sources
     assert "SWV trace overlay" in sources
+    assert "Captured plot" in sources
     assert "Image file" in sources
 
 
@@ -416,6 +417,8 @@ def test_add_to_composer_queues_exact_plot_and_current_settings():
     assert capture["settings"]["tick_size"] == 22.5
     assert capture["camera"] == camera
     assert capture["reserved_panel_label"] == "A"
+    assert capture["source_figure"] is figure
+    assert capture["source_kind"] == "plotly"
     assert "figure" not in capture
     assert capture["figure_config"]["traces"] == [
         {"type": "scatter", "name": "", "mode": ""}
@@ -454,3 +457,77 @@ def test_captured_plot_is_inserted_as_figure_a_and_shifts_existing_panels():
     assert state["bo_composer_label_1"] == "B"
     assert state["bo_composer_label_2"] == "C"
     assert state["bo_composer_zoom_from_2"] == "B"
+
+
+def test_composer_swaps_panel_contents_letters_and_zoom_links():
+    state = {
+        "bo_composer_count": 3,
+        "bo_composer_kind_0": "Global trend",
+        "bo_composer_kind_1": "Captured plot",
+        "bo_composer_kind_2": "Measured 2D map",
+        "bo_composer_label_0": "A",
+        "bo_composer_label_1": "B",
+        "bo_composer_label_2": "Custom",
+        "bo_composer_capture_id_1": "capture-1",
+        "bo_composer_zoom_from_2": "B",
+        "bo_composer_captured_plots": {"capture-1": {}},
+    }
+
+    with patch.object(viewer.st, "session_state", state):
+        viewer._composer_swap_panels(0, 1, 3)
+
+    assert state["bo_composer_kind_0"] == "Captured plot"
+    assert state["bo_composer_capture_id_0"] == "capture-1"
+    assert state["bo_composer_label_0"] == "A"
+    assert state["bo_composer_kind_1"] == "Global trend"
+    assert state["bo_composer_label_1"] == "B"
+    assert state["bo_composer_label_2"] == "Custom"
+    assert state["bo_composer_zoom_from_2"] == "A"
+    assert state["bo_composer_auto_render"] is True
+
+
+def test_composer_formats_captured_plotly_source_without_mutating_it():
+    source = viewer.go.Figure(
+        viewer.go.Scatter(
+            x=[1, 2],
+            y=[3, 4],
+            mode="lines",
+            name="series",
+            line={"width": 2},
+        )
+    )
+    source.update_layout(title="Original", xaxis_title="Old X", yaxis_title="Old Y")
+    capture = {"source_figure": source, "label": "Original"}
+    spec = {
+        "capture_title": "Edited",
+        "capture_xlabel": "New X",
+        "capture_ylabel": "New Y",
+        "capture_show_legend": False,
+        "capture_show_grid": False,
+        "capture_line_scale": 1.5,
+    }
+
+    result = viewer._composer_formatted_capture_figure(capture, spec)
+
+    assert result is not source
+    assert result.layout.title.text == "Edited"
+    assert result.layout.xaxis.title.text == "New X"
+    assert result.layout.yaxis.title.text == "New Y"
+    assert result.layout.showlegend is False
+    assert result.layout.xaxis.showgrid is False
+    assert result.data[0].line.width == 3
+    assert source.layout.title.text == "Original"
+    assert source.data[0].line.width == 2
+
+
+def test_composer_csv_cache_invalidates_when_file_changes(tmp_path):
+    path = tmp_path / "surrogate.csv"
+    viewer._composer_read_csv_cached.clear()
+    pd.DataFrame({"value": [1]}).to_csv(path, index=False)
+
+    first = viewer._composer_read_csv(path)
+    pd.DataFrame({"value": [20, 30]}).to_csv(path, index=False)
+    second = viewer._composer_read_csv(path)
+
+    assert first["value"].tolist() == [1]
+    assert second["value"].tolist() == [20, 30]

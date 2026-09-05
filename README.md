@@ -111,11 +111,15 @@ definitions, objective and parameter evolution, channel and phase trends,
 measured 1D/2D/3D landscapes, surrogate evolution for every saved artifact,
 and all locally accessible raw and corrected SWV traces.
 
-The **Figure Composer** tab defers all expensive plot generation until **Render
-figure** is clicked. Panel controls, exact manual coordinates, and mouse
-drag/resize operations only change the pending configuration; exports are
-hidden whenever that configuration is newer than the rendered preview. A
-render prepares PNG, PDF, and SVG files together. Its compact configuration is
+The **Figure Composer** tab keeps most expensive plot generation behind
+**Render figure**. Directly captured plots and panel-order changes refresh a
+lightweight current preview automatically; other controls, exact manual
+coordinates, and mouse drag/resize operations change the pending configuration.
+Use the earlier/later controls to reorder panels and reassign their default
+letters. New in-session captures retain their plot source, so the Composer can
+re-render them at final panel DPI and adjust text, titles, axes, legends, grids,
+and line widths instead of enlarging the thumbnail PNG. A final render prepares
+PNG, PDF, and SVG files together. Its compact configuration is
 embedded in the PNG and can also be downloaded as a JSON sidecar or portable
 ZIP. Upload any of those formats to reconstruct the layout from its recorded
 experiment path or apply it to a compatible active experiment. Named presets

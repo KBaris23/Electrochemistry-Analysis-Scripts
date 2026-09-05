@@ -62,6 +62,9 @@ def test_pyplot_renderer_returns_the_exact_displayed_preview(monkeypatch):
         def markdown(self, *_args, **_kwargs):
             return None
 
+        def button(self, *_args, **_kwargs):
+            return False
+
     container = FakeContainer()
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
     ax.plot([0.0, 1.0], [0.0, 1.0])
