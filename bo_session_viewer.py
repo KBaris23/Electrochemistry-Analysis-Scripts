@@ -25407,6 +25407,32 @@ def _render_downloadable_pyplot(
         file_name=f"{_safe_download_stem(file_stem)}.png",
         mime="image/png",
     )
+    primary_axis = next(
+        (
+            axis for axis in getattr(fig, "axes", [])
+            if not _is_matplotlib_colorbar_axis(axis)
+        ),
+        None,
+    )
+    capture_label = (
+        str(getattr(getattr(fig, "_suptitle", None), "get_text", lambda: "")())
+        or (primary_axis.get_title() if primary_axis is not None else "")
+    )
+    capture_settings = {
+        str(state_key).removeprefix(f"{key}_"): copy.deepcopy(value)
+        for state_key, value in st.session_state.items()
+        if str(state_key).startswith(f"{key}_")
+        and not str(state_key).endswith("_add_to_composer")
+    }
+    _render_add_to_composer_button(
+        download_container,
+        png_bytes,
+        key=key,
+        file_stem=file_stem,
+        figure=None,
+        settings=capture_settings,
+        label=capture_label,
+    )
     plt.close(fig)
     return png_bytes
 
@@ -25417,9 +25443,12 @@ def _plotly_png_bytes(
     width: int = 1200,
     height: int | None = None,
     scale: float = 2,
+    text_size: float | None = None,
 ) -> bytes:
     export_fig = go.Figure(fig)
     _apply_global_plot_style(export_fig)
+    if text_size is not None:
+        _composer_apply_plotly_text_size(export_fig, text_size)
     _apply_plotly_3d_turntable_dragmode(export_fig)
     _prepare_plotly_static_export(export_fig)
     try:
@@ -26513,6 +26542,177 @@ def _history_plotly_to_matplotlib(
     return figure
 
 
+def _queue_plot_for_composer(
+    png_bytes: bytes,
+    *,
+    label: str,
+    file_stem: str,
+    figure: go.Figure | None,
+    settings: Mapping[str, Any] | None = None,
+    camera: Mapping[str, Any] | None = None,
+) -> str:
+    """Cache an exact rendered plot and queue it as a new Composer panel."""
+    pending_key = "bo_composer_pending_captures"
+    pending = st.session_state.get(pending_key)
+    if not isinstance(pending, list):
+        pending = []
+    try:
+        current_panel_count = int(
+            st.session_state.get("bo_composer_count", 0) or 0
+        )
+    except (TypeError, ValueError):
+        current_panel_count = 0
+    if current_panel_count + len(pending) >= 12:
+        raise ValueError("Figure Composer already has 12 panels queued or in use.")
+    reserved_index = len(pending)
+    reserved_label = chr(ord("A") + reserved_index)
+    capture_id = hashlib.sha256(
+        png_bytes
+        + str(file_stem).encode("utf-8", errors="replace")
+        + reserved_label.encode("ascii")
+    ).hexdigest()[:16]
+    registry_key = "bo_composer_captured_plots"
+    registry = st.session_state.get(registry_key)
+    if not isinstance(registry, dict):
+        registry = {}
+    registry[capture_id] = {
+        "label": str(label or file_stem or "Captured plot"),
+        "file_stem": str(file_stem or "captured_plot"),
+        "png_bytes": bytes(png_bytes),
+        # The PNG is the exact visual source. Keep only compact structural
+        # metadata here; serializing every trace array caused large captures
+        # to stall the whole Streamlit rerun.
+        "figure_config": (
+            {
+                "layout": json.loads(json.dumps(
+                    figure.layout.to_plotly_json(),
+                    cls=PlotlyJSONEncoder,
+                )),
+                "traces": [
+                    {
+                        "type": str(getattr(trace, "type", "") or ""),
+                        "name": str(getattr(trace, "name", "") or ""),
+                        "mode": str(getattr(trace, "mode", "") or ""),
+                    }
+                    for trace in figure.data
+                ],
+            }
+            if isinstance(figure, go.Figure)
+            else None
+        ),
+        "settings": (
+            _copyable_individual_plot_settings(settings)
+            if isinstance(settings, Mapping)
+            else {}
+        ),
+        "camera": _valid_plotly_camera(camera),
+        "reserved_panel_label": reserved_label,
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    referenced_capture_ids = {
+        str(value)
+        for state_key, value in st.session_state.items()
+        if str(state_key).startswith("bo_composer_capture_id_") and value
+    }
+    while len(registry) > 24:
+        removable = next(
+            (
+                existing_id for existing_id in registry
+                if existing_id not in referenced_capture_ids
+                and existing_id != capture_id
+            ),
+            None,
+        )
+        if removable is None:
+            break
+        del registry[removable]
+    st.session_state[registry_key] = registry
+    pending.append(capture_id)
+    st.session_state[pending_key] = pending
+    return capture_id
+
+
+def _render_add_to_composer_button(
+    container,
+    png_bytes: bytes,
+    *,
+    key: str,
+    file_stem: str,
+    figure: go.Figure | None,
+    settings: Mapping[str, Any] | None = None,
+    camera: Mapping[str, Any] | None = None,
+    label: str = "",
+) -> None:
+    """Render a reusable action that snapshots the current configured plot."""
+    title = (
+        _plain_plotly_text(getattr(figure.layout.title, "text", ""))
+        if isinstance(figure, go.Figure)
+        else ""
+    )
+    resolved_label = (
+        str(label).strip()
+        or title
+        or str(file_stem).replace("_", " ").strip().title()
+    )
+    flash_key = f"bo_composer_add_flash_{key}"
+    flash = st.session_state.pop(flash_key, None)
+    if isinstance(flash, Mapping):
+        if flash.get("error"):
+            container.warning(str(flash["error"]))
+        elif flash.get("success"):
+            container.success(str(flash["success"]))
+    container.button(
+        "Add to Composer",
+        key=f"{key}_add_to_composer",
+        help=(
+            "Adds the currently rendered plot as a new Figure Composer panel, "
+            "including its current plot settings and cached 3D view."
+        ),
+        on_click=_add_plot_to_composer_callback,
+        kwargs={
+            "png_bytes": png_bytes,
+            "label": resolved_label,
+            "file_stem": file_stem,
+            "figure": figure,
+            "settings": settings,
+            "camera": camera,
+            "flash_key": flash_key,
+        },
+    )
+
+
+def _add_plot_to_composer_callback(
+    *,
+    png_bytes: bytes,
+    label: str,
+    file_stem: str,
+    figure: go.Figure | None,
+    settings: Mapping[str, Any] | None,
+    camera: Mapping[str, Any] | None,
+    flash_key: str,
+) -> None:
+    """Queue a capture before the rerun constructs any Composer widgets."""
+    try:
+        capture_id = _queue_plot_for_composer(
+            png_bytes,
+            label=label,
+            file_stem=file_stem,
+            figure=figure,
+            settings=settings,
+            camera=camera,
+        )
+    except ValueError as exc:
+        st.session_state[flash_key] = {"error": str(exc)}
+        return
+    capture = st.session_state["bo_composer_captured_plots"][capture_id]
+    panel_label = capture["reserved_panel_label"]
+    st.session_state[flash_key] = {
+        "success": (
+            f"Added as Figure {panel_label}. Open Figure Composer to arrange it."
+        )
+    }
+
+
 def _render_downloadable_plotly(
     container,
     fig: go.Figure,
@@ -26628,6 +26828,14 @@ def _render_downloadable_plotly(
             file_name=f"{_safe_download_stem(file_stem)}.png",
             mime="image/png",
         )
+        _render_add_to_composer_button(
+            plot_column,
+            png_bytes,
+            key=key,
+            file_stem=file_stem,
+            figure=fig,
+            settings=individual_settings,
+        )
         plt.close(matplotlib_figure)
         settings_submitted = _render_individual_plotly_settings_form(
             plot_column,
@@ -26674,6 +26882,14 @@ def _render_downloadable_plotly(
                 file_name=f"{_safe_download_stem(file_stem)}.png",
                 mime="image/png",
             )
+            _render_add_to_composer_button(
+                plot_column,
+                png_bytes,
+                key=key,
+                file_stem=file_stem,
+                figure=download_fig,
+                camera=download_camera,
+            )
             if download_camera is None:
                 plot_column.caption(
                     "Click Cache view after rotating to export the current perspective."
@@ -26702,6 +26918,13 @@ def _render_downloadable_plotly(
                 png_bytes,
                 file_name=f"{_safe_download_stem(file_stem)}.png",
                 mime="image/png",
+            )
+            _render_add_to_composer_button(
+                plot_column,
+                png_bytes,
+                key=key,
+                file_stem=file_stem,
+                figure=fig,
             )
         except RuntimeError as exc:
             plot_column.caption(str(exc))
@@ -28827,6 +29050,11 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_preset_",
     "bo_composer_import_",
     "bo_composer_layout_editor",
+    "bo_composer_captured_plots",
+    "bo_composer_pending_captures",
+    "bo_composer_capture_flash",
+    "bo_composer_capture_preview_",
+    "bo_composer_add_flash_",
 )
 
 
@@ -28964,6 +29192,74 @@ def _composer_apply_config(config: Mapping[str, Any]) -> None:
             st.session_state[key] = copy.deepcopy(value)
 
 
+def _composer_apply_pending_captures() -> tuple[int, int]:
+    """Insert queued snapshots as visible leading Composer panels."""
+    pending_key = "bo_composer_pending_captures"
+    pending = st.session_state.pop(pending_key, [])
+    registry = st.session_state.get("bo_composer_captured_plots")
+    if not isinstance(pending, list) or not isinstance(registry, Mapping):
+        return 0, 0
+    try:
+        panel_count = int(st.session_state.get("bo_composer_count", 0) or 0)
+    except (TypeError, ValueError):
+        panel_count = 0
+    valid_pending = [
+        str(capture_id)
+        for capture_id in pending
+        if isinstance(registry.get(str(capture_id)), Mapping)
+    ]
+    capacity = max(0, 12 - panel_count)
+    accepted = valid_pending[:capacity]
+    shift = len(accepted)
+    if shift:
+        panel_state: list[tuple[str, int, Any]] = []
+        for state_key in list(st.session_state):
+            if any(
+                str(state_key).startswith(prefix)
+                for prefix in _COMPOSER_STATE_EXCLUSIONS
+            ):
+                continue
+            match = re.fullmatch(r"(bo_composer_.+_)(\d+)", str(state_key))
+            if match is None:
+                continue
+            old_index = int(match.group(2))
+            if old_index >= panel_count:
+                continue
+            panel_state.append((match.group(1), old_index, st.session_state[state_key]))
+            del st.session_state[state_key]
+        for prefix, old_index, value in sorted(
+            panel_state,
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            new_index = old_index + shift
+            if prefix == "bo_composer_label_" and value == chr(ord("A") + old_index):
+                value = chr(ord("A") + new_index)
+            elif prefix == "bo_composer_zoom_from_" and value not in {None, "None"}:
+                source_index = ord(str(value)) - ord("A")
+                if 0 <= source_index < 12 - shift:
+                    value = chr(ord("A") + source_index + shift)
+            st.session_state[f"{prefix}{new_index}"] = value
+    added = 0
+    for index, capture_id in enumerate(accepted):
+        capture = registry.get(str(capture_id))
+        st.session_state[f"bo_composer_kind_{index}"] = "Captured plot"
+        st.session_state[f"bo_composer_capture_id_{index}"] = str(capture_id)
+        st.session_state[f"bo_composer_label_{index}"] = chr(ord("A") + index)
+        settings = capture.get("settings")
+        if isinstance(settings, Mapping):
+            text_size = _finite_float(settings.get("text_size"))
+            if text_size is not None:
+                st.session_state[f"bo_composer_text_size_{index}"] = int(
+                    min(30, max(4, round(text_size)))
+                )
+        added += 1
+    panel_count += added
+    st.session_state["bo_composer_count"] = max(panel_count, 1)
+    skipped = max(0, len(pending) - added)
+    return added, skipped
+
+
 def _composer_open_source(metadata: Mapping[str, Any]) -> None:
     source_path = str((metadata.get("source") or {}).get("data_path") or "").strip()
     if not source_path:
@@ -29005,7 +29301,11 @@ def _composer_save_preset(
     temporary.replace(path)
 
 
-def _composer_hyperparameter_sweep_preset() -> dict[str, Any]:
+def _composer_hyperparameter_sweep_preset(
+    observations: Sequence[dict] = (),
+    real_channels: Sequence[str] = (),
+    trace_channels: Sequence[str] = (),
+) -> dict[str, Any]:
     """Built-in approximation of the supplied two-tensor/trace/map layout."""
     rects = [
         (.05, .55, .36, .39), (.05, .06, .36, .39),
@@ -29013,8 +29313,12 @@ def _composer_hyperparameter_sweep_preset() -> dict[str, Any]:
         (.46, .285, .15, .16), (.63, .285, .15, .16), (.80, .285, .15, .16),
         (.46, .06, .15, .16), (.63, .06, .15, .16), (.80, .06, .15, .16),
     ]
+    normalized_real_channels = list(dict.fromkeys(map(str, real_channels)))
+    normalized_trace_channels = list(dict.fromkeys(map(str, trace_channels)))
+    single_real_channel = len(normalized_real_channels) == 1
     kinds = (
-        "Measured 3D tensor", "Measured 3D tensor",
+        "Measured 3D tensor",
+        "Measured 1D slice" if single_real_channel else "Measured 3D tensor",
         "SWV trace overlay", "SWV trace overlay",
         *("Measured 2D map",) * 6,
     )
@@ -29030,24 +29334,66 @@ def _composer_hyperparameter_sweep_preset() -> dict[str, Any]:
         state[f"bo_composer_label_{index}"] = chr(ord("A") + index)
         for field, value in zip(("left", "bottom", "width", "height"), rect):
             state[f"bo_composer_{field}_{index}"] = value
-    for index, channel in ((0, "2"), (1, "3")):
+    tensor_channels = (
+        [normalized_real_channels[0], normalized_real_channels[0]]
+        if single_real_channel
+        else (normalized_real_channels[:2] or ["2", "3"])
+    )
+    if len(tensor_channels) == 1:
+        tensor_channels = [tensor_channels[0], tensor_channels[0]]
+    for index, channel in enumerate(tensor_channels[:2]):
         state[f"bo_composer_measured_channels_{index}"] = [channel]
         state[f"bo_composer_measured_x_{index}"] = "amplitude"
         state[f"bo_composer_measured_y_{index}"] = "frequency"
         state[f"bo_composer_measured_z_{index}"] = "step_potential"
-        state[f"bo_composer_measured_dot_opacity_{index}"] = .60
+        state[f"bo_composer_measured_dot_size_{index}"] = 6
+        state[f"bo_composer_measured_dot_opacity_{index}"] = .45
         state[f"bo_composer_measured_colorscale_{index}"] = "Viridis"
-    state["bo_composer_trace_channels_2"] = ["2"]
-    state["bo_composer_trace_channels_3"] = ["3"]
-    state["bo_composer_zoom_from_2"] = "A"
-    state["bo_composer_zoom_color_2"] = "#f2cf00"
-    state["bo_composer_zoom_from_3"] = "B"
-    state["bo_composer_zoom_color_3"] = "#283593"
+    selected_trace_channels = normalized_trace_channels[:2] or ["2", "3"]
+    if len(selected_trace_channels) == 1:
+        selected_trace_channels *= 2
+        state["bo_composer_trace_norm_3"] = True
+    state["bo_composer_trace_channels_2"] = [selected_trace_channels[0]]
+    state["bo_composer_trace_channels_3"] = [selected_trace_channels[1]]
+    slice_values = sorted({
+        float(value)
+        for observation in observations
+        for value in [(observation.get("params") or {}).get("step_potential")]
+        if _finite_float(value) is not None
+    })
+    if slice_values:
+        requested_count = 6 if single_real_channel else 3
+        selected_indices = np.linspace(
+            0,
+            len(slice_values) - 1,
+            min(requested_count, len(slice_values)),
+        ).round().astype(int)
+        selected_slices = list(dict.fromkeys(slice_values[i] for i in selected_indices))
+    else:
+        selected_slices = []
     for index in range(4, 10):
-        channel = "2" if index < 7 else "3"
+        if normalized_real_channels:
+            channel = normalized_real_channels[
+                min((index - 4) // 3, len(normalized_real_channels) - 1)
+            ]
+        else:
+            channel = "2" if index < 7 else "3"
         state[f"bo_composer_real_channels_{index}"] = [channel]
         state[f"bo_composer_real_x_{index}"] = "amplitude"
         state[f"bo_composer_real_y_{index}"] = "frequency"
+        state[f"bo_composer_real_dot_size_{index}"] = 6
+        state[f"bo_composer_real_dot_opacity_{index}"] = .45
+        state[f"bo_composer_real_show_points_{index}"] = True
+        if selected_slices:
+            slice_index = (
+                index - 4
+                if single_real_channel
+                else (index - 4) % 3
+            ) % len(selected_slices)
+            state[f"bo_composer_real_slice_axis_{index}"] = "step_potential"
+            state[f"bo_composer_real_slice_value_{index}"] = selected_slices[
+                slice_index
+            ]
     config = {"state": state, "panels": []}
     return {
         "schema": COMPOSER_METADATA_SCHEMA,
@@ -29058,10 +29404,75 @@ def _composer_hyperparameter_sweep_preset() -> dict[str, Any]:
     }
 
 
+def _composer_channel_options_by_kind(
+    real_channels: Sequence[str],
+    trace_channels: Sequence[str],
+    chronological_trace_channels: Sequence[str],
+    channel_metric_channels: Sequence[str],
+) -> dict[str, list[str]]:
+    """Return the channels each plot family can actually consume."""
+    real = list(map(str, real_channels))
+    trace = list(map(str, trace_channels))
+    chronological = list(map(str, chronological_trace_channels))
+    metric = list(map(str, channel_metric_channels))
+    return {
+        "Channel trend": metric,
+        "Buffer/target trend": real,
+        "Chronological buffer/target trend": real,
+        "Measured 1D slice": real,
+        "Measured 2D map": real,
+        "Measured 3D tensor": real,
+        "Measured parallel coordinates": real,
+        "Channel x iteration heatmap": real,
+        "SWV trace overlay": trace,
+        "Chronological SWV stack": chronological,
+    }
+
+
+def _composer_adapt_config_channels(
+    config: Mapping[str, Any],
+    channel_options: Mapping[str, Sequence[str]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Remap unavailable saved channels to valid choices for each panel."""
+    adapted = copy.deepcopy(dict(config))
+    state = adapted.get("state") or {}
+    if not isinstance(state, dict):
+        return adapted, []
+    try:
+        panel_count = int(state.get("bo_composer_count", 0))
+    except (TypeError, ValueError):
+        panel_count = 0
+    changes: list[str] = []
+    for index in range(max(panel_count, 0)):
+        kind = str(state.get(f"bo_composer_kind_{index}") or "")
+        if kind not in channel_options:
+            continue
+        allowed = list(dict.fromkeys(map(str, channel_options[kind])))
+        if not allowed:
+            continue
+        allowed_set = set(allowed)
+        for key in list(state):
+            if not str(key).endswith(f"_{index}") or "channels" not in str(key):
+                continue
+            requested = [str(value) for value in (state.get(key) or [])]
+            valid = [value for value in requested if value in allowed_set]
+            if requested and not valid and allowed:
+                valid = [allowed[index % len(allowed)]]
+            if valid != requested:
+                state[key] = valid
+                changes.append(
+                    f"Panel {index + 1} ({kind}): "
+                    f"{', '.join(requested) or 'no channel'} → "
+                    f"{', '.join(valid) or 'no available channel'}"
+                )
+    adapted["state"] = state
+    return adapted, changes
+
+
 def _composer_validate_saved_config(
     metadata: Mapping[str, Any],
     source_options: Sequence[str],
-    available_channels: Sequence[str],
+    available_channels: Sequence[str] | Mapping[str, Sequence[str]],
     available_fields: Sequence[str] = (),
     artifact_iterations: Sequence[int] = (),
 ) -> list[str]:
@@ -29073,7 +29484,19 @@ def _composer_validate_saved_config(
         panel_count = int(state.get("bo_composer_count", len(config.get("panels") or [])))
     except (TypeError, ValueError):
         panel_count = 0
-    channel_set = {str(channel) for channel in available_channels}
+    channel_sets = (
+        {
+            str(kind): {str(channel) for channel in channels}
+            for kind, channels in available_channels.items()
+        }
+        if isinstance(available_channels, Mapping)
+        else {}
+    )
+    channel_set = (
+        set().union(*channel_sets.values())
+        if channel_sets
+        else {str(channel) for channel in available_channels}
+    )
     field_set = {str(field) for field in available_fields}
     artifact_set = {int(value) for value in artifact_iterations}
     for index in range(max(panel_count, 0)):
@@ -29081,11 +29504,12 @@ def _composer_validate_saved_config(
         if kind and kind not in source_options:
             errors.append(f"Panel {index + 1} requires unavailable plot type '{kind}'.")
             continue
+        panel_channel_set = channel_sets.get(str(kind), channel_set)
         for key, value in state.items():
             if not str(key).endswith(f"_{index}") or "channels" not in str(key):
                 continue
             requested = {str(channel) for channel in (value or [])}
-            missing = sorted(requested - channel_set, key=_channel_sort_key)
+            missing = sorted(requested - panel_channel_set, key=_channel_sort_key)
             if missing:
                 errors.append(
                     f"Panel {index + 1} requires missing channel(s): {', '.join(missing)}."
@@ -29445,6 +29869,7 @@ def _composer_draw_trace(
 
 COMPOSER_MEASURED_LANDSCAPE_VIEWS = {
     "Measured 1D slice": "1D slice",
+    "Measured 2D map": "2D map",
     "Measured 3D tensor": "3D tensor",
 }
 COMPOSER_SURROGATE_VIEWS = {
@@ -29582,6 +30007,8 @@ def _composer_available_sources(
         if len(hyper_columns) >= 3:
             sources.append("Hyperparameter 3D heatmap")
         sources.append("Hyperparameter parallel coordinates")
+    if st.session_state.get("bo_composer_captured_plots"):
+        sources.append("Captured plot")
     sources.append("Image file")
     return list(dict.fromkeys(sources))
 
@@ -29617,12 +30044,68 @@ def _composer_panel_pixel_size(
     )
 
 
+def _composer_apply_plotly_text_size(fig: go.Figure, size: float) -> go.Figure:
+    """Apply one panel-local text size after global export styling."""
+    text_size = max(4.0, float(size))
+    tick_size = max(4.0, text_size * .88)
+    axis_update = {
+        "title": {"font": {"size": text_size}},
+        "tickfont": {"size": tick_size},
+    }
+    layout_json = fig.layout.to_plotly_json()
+    updates: dict[str, Any] = {}
+    for key, value in layout_json.items():
+        if re.fullmatch(r"[xy]axis\d*", str(key)):
+            updates[str(key)] = axis_update
+        elif re.fullmatch(r"scene\d*", str(key)):
+            scene_payload = value if isinstance(value, Mapping) else {}
+            updates[str(key)] = {
+                axis: axis_update
+                for axis in ("xaxis", "yaxis", "zaxis")
+                if axis in scene_payload
+            }
+    fig.update_layout(
+        font={"size": text_size},
+        title={"font": {"size": text_size * 1.25}},
+        legend={
+            "font": {"size": text_size * .9},
+            "title": {"font": {"size": text_size}},
+        },
+        **updates,
+    )
+    for annotation in fig.layout.annotations or ():
+        annotation.font = {
+            **(annotation.font.to_plotly_json() if annotation.font else {}),
+            "size": text_size,
+        }
+    for trace in fig.data:
+        for colorbar in (
+            getattr(trace, "colorbar", None),
+            getattr(getattr(trace, "marker", None), "colorbar", None),
+        ):
+            if colorbar is not None:
+                _apply_plotly_colorbar_text_style(
+                    colorbar,
+                    text_size=text_size,
+                    tick_text_size=tick_size,
+                )
+    return fig
+
+
+def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
+    """Scale all text in one embedded Matplotlib panel independently."""
+    scale = max(4.0, float(size)) / 10.0
+    for text_artist in fig.findobj(match=Text):
+        text_artist.set_fontsize(max(1.0, text_artist.get_fontsize() * scale))
+
+
 def _composer_draw_embedded_figure(
     target_fig: plt.Figure,
     ax,
     panel_figure: go.Figure | plt.Figure,
     rect: Sequence[float],
     render_dpi: int,
+    text_size: float | None = None,
 ) -> None:
     from PIL import Image
 
@@ -29634,9 +30117,12 @@ def _composer_draw_embedded_figure(
                 width=width_px,
                 height=height_px,
                 scale=1.5,
+                text_size=text_size,
             )
             buffer = BytesIO(png)
         else:
+            if text_size is not None:
+                _composer_apply_matplotlib_text_size(panel_figure, text_size)
             panel_figure.set_size_inches(
                 width_px / float(render_dpi),
                 height_px / float(render_dpi),
@@ -29678,6 +30164,24 @@ def _composer_draw_image_file(ax, path_text: str) -> None:
         _composer_error_panel(ax, f"Could not open image: {exc}")
 
 
+def _composer_draw_captured_plot(ax, capture_id: str) -> None:
+    """Draw an exact in-session plot snapshot added from another view."""
+    from PIL import Image
+
+    registry = st.session_state.get("bo_composer_captured_plots")
+    capture = registry.get(str(capture_id)) if isinstance(registry, Mapping) else None
+    png_bytes = capture.get("png_bytes") if isinstance(capture, Mapping) else None
+    if not isinstance(png_bytes, (bytes, bytearray)):
+        _composer_error_panel(ax, "This captured plot is no longer in this session.")
+        return
+    try:
+        with Image.open(BytesIO(png_bytes)) as image:
+            ax.imshow(image.convert("RGB"))
+        ax.set_axis_off()
+    except Exception as exc:
+        _composer_error_panel(ax, f"Could not open captured plot: {exc}")
+
+
 def _composer_real_points(spec: dict, observations: list[dict]) -> pd.DataFrame:
     return _real_metric_points(
         observations,
@@ -29697,7 +30201,7 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
         return _composer_plotly_message("Choose an X axis.")
     if view == "3D tensor" and (not spec.get("y") or not spec.get("z")):
         return _composer_plotly_message("Choose X, Y, and Z axes.")
-    return _plot_real_data_landscape(
+    figure = _plot_real_data_landscape(
         points,
         spec["metric"],
         spec["phase"],
@@ -29712,7 +30216,22 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
         show_iteration_path=spec.get("show_iteration_path", True),
         value_colorscale=spec.get("colorscale", "Viridis"),
         draw_full_cube_edges=spec.get("draw_cube_edges", False),
+        slice_axis=spec.get("slice_axis"),
+        slice_value=spec.get("slice_value"),
+        tensor_interpolation_source=(
+            points if view == "2D map" and spec.get("slice_axis") else None
+        ),
+        show_measured_points=spec.get("show_measured_points", True),
     )
+    if view == "2D map":
+        for trace in figure.data:
+            if str(getattr(trace, "name", "") or "").lower() != "measured points":
+                continue
+            trace.marker.size = spec.get("dot_size", 6)
+            trace.marker.opacity = spec.get("dot_opacity", .45)
+    if view == "3D tensor":
+        _apply_plotly_camera(figure, _stored_plotly_camera(None))
+    return figure
 
 
 def _composer_build_real_parallel(spec: dict, observations: list[dict]) -> go.Figure:
@@ -29949,7 +30468,14 @@ def _build_composer_figure(
             elif kind == "Buffer/target trend":
                 _composer_draw_paired(ax, observations, spec["metric"], spec["channels"], font_size)
             elif kind == "Measured 2D map":
-                _composer_draw_real_map(fig, ax, observations, spec["metric"], spec["phase"], spec["channels"], spec["average_channels"], spec["x"], spec["y"])
+                _composer_draw_embedded_figure(
+                    fig,
+                    ax,
+                    _composer_build_real_landscape(spec, observations),
+                    spec["rect"],
+                    render_dpi,
+                    spec.get("text_size", font_size),
+                )
             elif kind == "Surrogate 2D map":
                 _composer_draw_surrogate_map(fig, ax, session, observation, spec["artifact_iteration"], spec["value"], spec["x"], spec["y"])
             elif kind == "SWV trace overlay":
@@ -29961,6 +30487,7 @@ def _build_composer_figure(
                     _composer_build_real_landscape(spec, observations),
                     spec["rect"],
                     render_dpi,
+                    spec.get("text_size", font_size),
                 )
             elif kind == "Measured parallel coordinates":
                 _composer_draw_embedded_figure(
@@ -29969,6 +30496,7 @@ def _build_composer_figure(
                     _composer_build_real_parallel(spec, observations),
                     spec["rect"],
                     render_dpi,
+                    spec.get("text_size", font_size),
                 )
             elif kind == "Channel x iteration heatmap":
                 _composer_draw_embedded_figure(
@@ -29977,6 +30505,7 @@ def _build_composer_figure(
                     _composer_build_real_heatmap(spec, observations),
                     spec["rect"],
                     render_dpi,
+                    spec.get("text_size", font_size),
                 )
             elif kind in COMPOSER_SURROGATE_VIEWS or kind == "Surrogate chronological 2D stack":
                 _composer_draw_embedded_figure(
@@ -29985,6 +30514,7 @@ def _build_composer_figure(
                     _composer_build_surrogate(spec, session, observation),
                     spec["rect"],
                     render_dpi,
+                    spec.get("text_size", font_size),
                 )
             elif kind == "Chronological buffer/target trend":
                 _composer_draw_embedded_figure(
@@ -29993,6 +30523,7 @@ def _build_composer_figure(
                     _composer_build_paired_plot(spec, observations, session["config"]),
                     spec["rect"],
                     render_dpi,
+                    spec.get("text_size", font_size),
                 )
             elif kind == "Chronological SWV stack":
                 _composer_draw_embedded_figure(
@@ -30006,6 +30537,7 @@ def _build_composer_figure(
                     ),
                     spec["rect"],
                     render_dpi,
+                    spec.get("text_size", font_size),
                 )
             elif kind.startswith("Hyperparameter "):
                 _composer_draw_embedded_figure(
@@ -30014,13 +30546,25 @@ def _build_composer_figure(
                     _composer_build_hyperparameter_plot(spec, history),
                     spec["rect"],
                     render_dpi,
+                    spec.get("text_size", font_size),
                 )
             elif kind == "Image file":
                 _composer_draw_image_file(ax, spec.get("path", ""))
+            elif kind == "Captured plot":
+                _composer_draw_captured_plot(ax, spec.get("capture_id", ""))
             else:
                 ax.text(.5, .5, "Select a figure", ha="center", va="center")
                 ax.set_axis_off()
-            ax.tick_params(labelsize=max(6, font_size - 2))
+            panel_text_size = max(4.0, float(spec.get("text_size", font_size)))
+            ax.title.set_fontsize(panel_text_size * 1.2)
+            ax.xaxis.label.set_fontsize(panel_text_size)
+            ax.yaxis.label.set_fontsize(panel_text_size)
+            ax.tick_params(labelsize=max(4.0, panel_text_size * .88))
+            legend = ax.get_legend()
+            if legend is not None:
+                for legend_text in legend.get_texts():
+                    legend_text.set_fontsize(max(4.0, panel_text_size * .85))
+                legend.get_title().set_fontsize(panel_text_size)
             if panel_border:
                 fig.add_artist(Rectangle(
                     (spec["rect"][0], spec["rect"][1]),
@@ -30049,12 +30593,36 @@ def _build_composer_figure(
             source_rect = specs[source_index]["rect"]
             target_rect = spec["rect"]
             color = str(spec.get("zoom_color") or "#d4a900")
-            source_x = source_rect[0] + source_rect[2] * float(
+            source_center_x = source_rect[0] + source_rect[2] * float(
                 spec.get("zoom_source_x", .72)
             )
-            source_y = source_rect[1] + source_rect[3] * float(
+            source_center_y = source_rect[1] + source_rect[3] * float(
                 spec.get("zoom_source_y", .62)
             )
+            source_width = source_rect[2] * float(
+                spec.get("zoom_source_width", .18)
+            )
+            source_height = source_rect[3] * float(
+                spec.get("zoom_source_height", .18)
+            )
+            source_left = min(
+                max(source_center_x - source_width / 2, source_rect[0]),
+                source_rect[0] + source_rect[2] - source_width,
+            )
+            source_bottom = min(
+                max(source_center_y - source_height / 2, source_rect[1]),
+                source_rect[1] + source_rect[3] - source_height,
+            )
+            fig.add_artist(Rectangle(
+                (source_left, source_bottom),
+                source_width,
+                source_height,
+                transform=fig.transFigure,
+                fill=False,
+                edgecolor=color,
+                linewidth=1.6,
+                zorder=25,
+            ))
             fig.add_artist(Rectangle(
                 (target_rect[0], target_rect[1]),
                 target_rect[2],
@@ -30065,12 +30633,18 @@ def _build_composer_figure(
                 linewidth=1.6,
                 zorder=25,
             ))
-            for target_y in (
-                target_rect[1] + target_rect[3],
-                target_rect[1],
+            source_is_left = (
+                source_left + source_width / 2
+                <= target_rect[0] + target_rect[2] / 2
+            )
+            source_x = source_left + source_width if source_is_left else source_left
+            target_x = target_rect[0] if source_is_left else target_rect[0] + target_rect[2]
+            for source_y, target_y in zip(
+                (source_bottom + source_height, source_bottom),
+                (target_rect[1] + target_rect[3], target_rect[1]),
             ):
                 fig.add_artist(Line2D(
-                    [source_x, target_rect[0]],
+                    [source_x, target_x],
                     [source_y, target_y],
                     transform=fig.transFigure,
                     color=color,
@@ -30119,6 +30693,7 @@ def _render_figure_composer(
     trace_analysis: dict,
     paired_objective: bool,
 ) -> None:
+    added_captures, skipped_captures = _composer_apply_pending_captures()
     composer_heading, composer_help = st.columns([8, 1])
     composer_heading.subheader("Figure Composer")
     with composer_help.popover(
@@ -30138,6 +30713,7 @@ def _render_figure_composer(
 
             - Drag a panel to move it.
             - Drag its lower-right square to resize it.
+            - Make as many mouse edits as needed, then click **Apply layout** once.
             - Ctrl-click (Cmd-click on macOS) to select multiple panels.
             - Right-click a selected panel to align, match sizes, or distribute.
             - Click empty canvas space to clear the selection.
@@ -30149,6 +30725,40 @@ def _render_figure_composer(
         "Assemble a multipanel figure from the active BO scoring/group view. "
         "All edits are lightweight and remain pending until Render figure is clicked."
     )
+    if added_captures:
+        added_labels = ", ".join(
+            f"Figure {chr(ord('A') + index)}"
+            for index in range(added_captures)
+        )
+        st.success(
+            f"{added_labels} added at the top of the Composer. "
+            "Existing panels were shifted down."
+        )
+        captures = st.session_state.get("bo_composer_captured_plots")
+        first_capture_id = st.session_state.get("bo_composer_capture_id_0")
+        first_capture = (
+            captures.get(str(first_capture_id))
+            if isinstance(captures, Mapping)
+            else None
+        )
+        if isinstance(first_capture, Mapping) and isinstance(
+            first_capture.get("png_bytes"),
+            (bytes, bytearray),
+        ):
+            st.image(
+                first_capture["png_bytes"],
+                caption=(
+                    "Figure A preview · "
+                    f"{first_capture.get('label') or 'Captured plot'}"
+                ),
+                width=520,
+            )
+    if skipped_captures:
+        st.warning(
+            f"Could not add {skipped_captures} captured plot"
+            f"{'s' if skipped_captures != 1 else ''}: the Composer supports "
+            "at most 12 panels."
+        )
     channel_metrics = {
         metric: columns
         for metric, columns in _channel_metric_columns(history).items()
@@ -30172,15 +30782,22 @@ def _render_figure_composer(
         channel_metrics,
     )
 
-    available_channels = sorted({
-        *map(str, real_channels),
-        *(
+    current_trace_channels = sorted({
+        _trace_channel_key(item) for item in _trace_paths(session, observation)
+    }, key=_channel_sort_key)
+    chronological_trace_channels = _composer_trace_channels(
+        _composer_trace_entries(session, observations)
+    )
+    channel_options_by_kind = _composer_channel_options_by_kind(
+        real_channels,
+        current_trace_channels,
+        chronological_trace_channels,
+        sorted({
             str(channel)
             for columns in channel_metrics.values()
             for channel in columns
-        ),
-        *_composer_trace_channels(_composer_trace_entries(session, observations)),
-    }, key=_channel_sort_key)
+        }, key=_channel_sort_key),
+    )
     composer_artifacts = _composer_surrogate_files(session, observation)
     available_fields = {
         *map(str, history.columns),
@@ -30196,7 +30813,11 @@ def _render_figure_composer(
         except Exception:
             pass
     saved_presets = {
-        "Hyperparameter Sweep": _composer_hyperparameter_sweep_preset(),
+        "Hyperparameter Sweep": _composer_hyperparameter_sweep_preset(
+            observations,
+            real_channels,
+            current_trace_channels,
+        ),
         **_composer_load_presets(),
     }
     with st.expander("Load a preset or saved figure", expanded=False):
@@ -30207,10 +30828,16 @@ def _render_figure_composer(
             key="bo_composer_preset_select",
         )
         selected_preset = saved_presets[selected_preset_name]
+        adapted_config, channel_adaptations = _composer_adapt_config_channels(
+            selected_preset.get("config") or {},
+            channel_options_by_kind,
+        )
+        active_preset = copy.deepcopy(selected_preset)
+        active_preset["config"] = adapted_config
         preset_errors = _composer_validate_saved_config(
-            selected_preset,
+            active_preset,
             source_options,
-            available_channels,
+            channel_options_by_kind,
             sorted(available_fields),
             sorted(composer_artifacts),
         )
@@ -30219,9 +30846,14 @@ def _render_figure_composer(
             key="bo_composer_preset_load",
             disabled=bool(preset_errors),
             on_click=_composer_apply_config,
-            args=(selected_preset.get("config") or {},),
+            args=(adapted_config,),
             use_container_width=True,
         )
+        if channel_adaptations:
+            st.info(
+                "Channel selections will be adapted to this experiment:\n\n"
+                + "\n\n".join(channel_adaptations)
+            )
         if preset_errors:
             st.error("Preset cannot use the active experiment:\n\n" + "\n\n".join(preset_errors))
 
@@ -30247,10 +30879,16 @@ def _render_figure_composer(
                     f"Configuration: {len(imported_bytes) / 1024:.1f} KB · "
                     f"Original data: {imported_source or 'not recorded'}"
                 )
+                adapted_import_config, import_channel_adaptations = (
+                    _composer_adapt_config_channels(
+                        imported_metadata.get("config") or {},
+                        channel_options_by_kind,
+                    )
+                )
                 import_errors = _composer_validate_saved_config(
-                    imported_metadata,
+                    {**imported_metadata, "config": adapted_import_config},
                     source_options,
-                    available_channels,
+                    channel_options_by_kind,
                     sorted(available_fields),
                     sorted(composer_artifacts),
                 )
@@ -30260,9 +30898,14 @@ def _render_figure_composer(
                     key="bo_composer_import_apply",
                     disabled=bool(import_errors),
                     on_click=_composer_apply_config,
-                    args=(imported_metadata.get("config") or {},),
+                    args=(adapted_import_config,),
                     use_container_width=True,
                 )
+                if import_channel_adaptations:
+                    st.info(
+                        "Imported channel selections will be adapted:\n\n"
+                        + "\n\n".join(import_channel_adaptations)
+                    )
                 original_path_exists = bool(
                     imported_source and Path(imported_source).expanduser().exists()
                 )
@@ -30315,7 +30958,7 @@ def _render_figure_composer(
             manual_rects = _composer_manual_rects(panel_count)
         st.caption(
             "Drag to move · drag the corner to resize · Ctrl/Cmd-click to "
-            "multi-select · right-click for alignment tools"
+            "multi-select · right-click for alignment tools · Apply layout when done"
         )
         rects = manual_rects
     else:
@@ -30324,11 +30967,20 @@ def _render_figure_composer(
     for index in range(panel_count):
         default_rect = rects[index] if rects else (.07, .10, .40, .35)
         with st.expander(f"Panel {chr(ord('A') + index)}", expanded=index < 4):
-            top_cols = st.columns([1.4, .8, .8, .8])
+            top_cols = st.columns([1.4, .8, .8, .8, .9])
             kind = top_cols[0].selectbox("Figure", source_options, key=f"bo_composer_kind_{index}")
             label = top_cols[1].text_input("Label", value=chr(ord("A") + index), key=f"bo_composer_label_{index}")
             label_x = top_cols[2].number_input("Label X", value=-0.08, step=.02, format="%.2f", key=f"bo_composer_label_x_{index}")
             label_y = top_cols[3].number_input("Label Y", value=1.06, step=.02, format="%.2f", key=f"bo_composer_label_y_{index}")
+            panel_text_size = float(top_cols[4].slider(
+                "Plot text",
+                4,
+                30,
+                font_size,
+                key=f"bo_composer_text_size_{index}",
+                help="Text size for this panel only, including axes and colorbars.",
+                disabled=kind == "Captured plot",
+            ))
             if preset == "Manual":
                 pos_cols = st.columns(4)
                 left = pos_cols[0].number_input("Left", 0.0, .95, float(default_rect[0]), .01, format="%.3f", key=f"bo_composer_left_{index}")
@@ -30338,7 +30990,14 @@ def _render_figure_composer(
                 rect = (left, bottom, min(width, 1 - left), min(height, 1 - bottom))
             else:
                 rect = default_rect
-            spec = {"kind": kind, "label": label, "label_x": label_x, "label_y": label_y, "rect": rect}
+            spec = {
+                "kind": kind,
+                "label": label,
+                "label_x": label_x,
+                "label_y": label_y,
+                "text_size": panel_text_size,
+                "rect": rect,
+            }
             if kind == "Global trend":
                 options = global_metrics or _numeric_columns(history)
                 spec["metric"] = st.selectbox("Metric", options, index=options.index("Q_run") if "Q_run" in options else 0, key=f"bo_composer_global_metric_{index}")
@@ -30376,6 +31035,55 @@ def _render_figure_composer(
                 spec["x"] = xy_cols[0].selectbox("X", dimensions, key=f"bo_composer_real_x_{index}") if dimensions else ""
                 y_options = [name for name in dimensions if name != spec["x"]]
                 spec["y"] = xy_cols[1].selectbox("Y", y_options or dimensions, key=f"bo_composer_real_y_{index}") if dimensions else ""
+                slice_options = [
+                    name for name in dimensions
+                    if name not in {spec.get("x"), spec.get("y")}
+                ]
+                spec["slice_axis"] = st.selectbox(
+                    "Tensor slice axis",
+                    ["None", *slice_options],
+                    key=f"bo_composer_real_slice_axis_{index}",
+                    help=(
+                        "Fixes the third parameter and renders a true 2D slice "
+                        "of the interpolated measured tensor."
+                    ),
+                ) if slice_options else "None"
+                if spec["slice_axis"] != "None":
+                    slice_values = _numeric_slice_values(points, spec["slice_axis"])
+                    spec["slice_value"] = st.selectbox(
+                        "Slice value",
+                        slice_values,
+                        key=f"bo_composer_real_slice_value_{index}",
+                    ) if slice_values else None
+                else:
+                    spec["slice_axis"] = None
+                    spec["slice_value"] = None
+                map_style_cols = st.columns(3)
+                spec["dot_size"] = int(map_style_cols[0].slider(
+                    "Measured point size",
+                    2,
+                    20,
+                    6,
+                    key=f"bo_composer_real_dot_size_{index}",
+                ))
+                spec["dot_opacity"] = float(map_style_cols[1].slider(
+                    "Point opacity",
+                    0.05,
+                    1.0,
+                    .65,
+                    .05,
+                    key=f"bo_composer_real_dot_opacity_{index}",
+                ))
+                spec["show_measured_points"] = map_style_cols[2].checkbox(
+                    "Show measured points",
+                    value=True,
+                    key=f"bo_composer_real_show_points_{index}",
+                )
+                spec["colorscale"] = st.selectbox(
+                    "Colorscale",
+                    ["Viridis", "Plasma", "Cividis", "Turbo", "Inferno", "Magma"],
+                    key=f"bo_composer_real_colorscale_{index}",
+                )
             elif kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS or kind in {
                 "Measured parallel coordinates",
                 "Channel x iteration heatmap",
@@ -30739,6 +31447,48 @@ def _render_figure_composer(
                             value=True,
                             key=f"bo_composer_hp_cube_edges_{index}",
                         )
+            elif kind == "Captured plot":
+                captures = st.session_state.get("bo_composer_captured_plots")
+                captures = captures if isinstance(captures, Mapping) else {}
+                capture_ids = list(captures)
+                if capture_ids:
+                    spec["capture_id"] = st.selectbox(
+                        "Captured plot",
+                        capture_ids,
+                        format_func=lambda capture_id: str(
+                            captures[capture_id].get("label") or capture_id
+                        ),
+                        key=f"bo_composer_capture_id_{index}",
+                    )
+                    capture = captures[spec["capture_id"]]
+                    settings = capture.get("settings") or {}
+                    camera = capture.get("camera")
+                    size_text = (
+                        f"{settings.get('width')} × {settings.get('height')} px"
+                        if settings.get("width") and settings.get("height")
+                        else "rendered snapshot"
+                    )
+                    st.caption(
+                        f"{size_text} · "
+                        f"{'cached 3D view included' if camera else 'current view included'} "
+                        f"· captured {capture.get('created_utc', '')}"
+                    )
+                    if st.button(
+                        "Preview captured Figure " + chr(ord("A") + index),
+                        key=f"bo_composer_capture_preview_{index}",
+                    ):
+                        st.image(
+                            capture["png_bytes"],
+                            caption=f"Figure {chr(ord('A') + index)} preview",
+                            width=520,
+                        )
+                    st.info(
+                        "This panel is an exact snapshot. Return to the source plot "
+                        "and add it again to change its plot-specific settings."
+                    )
+                else:
+                    spec["capture_id"] = ""
+                    st.warning("No captured plots remain in this app session.")
             elif kind == "Image file":
                 spec["path"] = st.text_input(
                     "Image path",
@@ -30756,8 +31506,8 @@ def _render_figure_composer(
                 zoom_options,
                 key=f"bo_composer_zoom_from_{index}",
                 help=(
-                    "Draws a colored frame and two connector lines from another "
-                    "panel to this detail panel."
+                    "Highlights a source region in another panel and connects it "
+                    "to this detail panel with a matching frame and two lines."
                 ),
             )
             if zoom_from != "None":
@@ -30769,7 +31519,7 @@ def _render_figure_composer(
                     key=f"bo_composer_zoom_color_{index}",
                 )
                 spec["zoom_source_x"] = float(zoom_cols[1].slider(
-                    "Source X",
+                    "Source center X",
                     0.0,
                     1.0,
                     .72,
@@ -30777,12 +31527,31 @@ def _render_figure_composer(
                     key=f"bo_composer_zoom_x_{index}",
                 ))
                 spec["zoom_source_y"] = float(zoom_cols[2].slider(
-                    "Source Y",
+                    "Source center Y",
                     0.0,
                     1.0,
                     .62,
                     .01,
                     key=f"bo_composer_zoom_y_{index}",
+                ))
+                zoom_size_cols = st.columns(2)
+                spec["zoom_source_width"] = float(zoom_size_cols[0].slider(
+                    "Source box width",
+                    0.02,
+                    1.0,
+                    .18,
+                    .01,
+                    key=f"bo_composer_zoom_width_{index}",
+                    help="Width of the highlighted region, relative to the source panel.",
+                ))
+                spec["zoom_source_height"] = float(zoom_size_cols[1].slider(
+                    "Source box height",
+                    0.02,
+                    1.0,
+                    .18,
+                    .01,
+                    key=f"bo_composer_zoom_height_{index}",
+                    help="Height of the highlighted region, relative to the source panel.",
                 ))
             specs.append(spec)
 

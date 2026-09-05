@@ -26,6 +26,22 @@
       color: #1d4ed8;
       font-weight: 600;
     }
+    #apply-layout {
+      margin-left: auto;
+      padding: 4px 10px;
+      border: 1px solid #2563eb;
+      border-radius: 5px;
+      background: #2563eb;
+      color: #fff;
+      font: 12px/1.2 inherit;
+      cursor: pointer;
+    }
+    #apply-layout:disabled {
+      border-color: #cbd5e1;
+      background: #e5e7eb;
+      color: #6b7280;
+      cursor: default;
+    }
     #canvas {
       position: relative;
       box-sizing: border-box;
@@ -127,6 +143,7 @@
     <span>Mouse layout editor</span>
     <span id="selection-count"></span>
     <span id="status"></span>
+    <button id="apply-layout" type="button" disabled>Apply layout</button>
   </div>
   <div id="canvas"></div>
   <div id="context-menu">
@@ -149,11 +166,14 @@
     const menu = document.getElementById("context-menu");
     const selectionCount = document.getElementById("selection-count");
     const status = document.getElementById("status");
+    const applyButton = document.getElementById("apply-layout");
     let args = {};
     let rects = [];
     let selected = new Set();
     let gesture = null;
     let contextAnchor = null;
+    let dirty = false;
+    let lastInputSignature = "";
 
     function streamlitMessage(type, data = {}) {
       window.parent.postMessage({isStreamlitMessage: true, type, ...data}, "*");
@@ -167,6 +187,13 @@
         event_id: `${Date.now()}-${Math.random()}`,
         rects: rects.map(rect => [...rect]),
       });
+      dirty = false;
+      applyButton.disabled = true;
+    }
+    function markDirty(message) {
+      dirty = true;
+      applyButton.disabled = false;
+      status.textContent = `— ${message}; click Apply layout`;
     }
     function setComponentValue(value) {
       streamlitMessage("streamlit:setComponentValue", {value});
@@ -309,7 +336,7 @@
       finished.panel.removeEventListener("pointerup", endGesture);
       finished.panel.removeEventListener("pointercancel", endGesture);
       gesture = null;
-      publishLayout(finished.mode === "resize" ? "panel resized" : "panel moved");
+      markDirty(finished.mode === "resize" ? "resize pending" : "move pending");
     }
     function openContextMenu(event) {
       event.preventDefault();
@@ -375,12 +402,15 @@
       rects = rects.map(normalizedRect);
       hideContextMenu();
       draw();
-      publishLayout("alignment applied");
+      markDirty("alignment pending");
     }
     menu.querySelectorAll("button").forEach(button => {
       button.addEventListener("click", () => {
         if (!button.disabled) applyCommand(button.dataset.command);
       });
+    });
+    applyButton.addEventListener("click", () => {
+      if (dirty) publishLayout("layout applied");
     });
     canvas.addEventListener("pointerdown", event => {
       if (event.target === canvas) {
@@ -403,7 +433,15 @@
       if (!event.data || event.data.type !== "streamlit:render") return;
       args = event.data.args || {};
       if (!gesture) {
-        rects = (args.rects || []).map(normalizedRect);
+        const incoming = (args.rects || []).map(normalizedRect);
+        const incomingSignature = JSON.stringify(incoming);
+        // Preserve local edits through unrelated Streamlit renders until Apply.
+        if (!dirty || !lastInputSignature || incomingSignature !== lastInputSignature) {
+          rects = incoming;
+          dirty = false;
+          applyButton.disabled = true;
+          lastInputSignature = incomingSignature;
+        }
         sizeCanvas();
         draw();
       }
