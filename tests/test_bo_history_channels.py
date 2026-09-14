@@ -245,3 +245,162 @@ def test_split_direction_channels_retains_records_without_direction():
     legacy = history.drop(columns="optimization_direction")
     _, columns = viewer._history_channels_by_direction(legacy, {"1": "Q_ch1"})
     assert columns == {"1": "Q_ch1"}
+
+
+def _click(trace, index=0):
+    return {"selection": {"points": [{"customdata": trace.customdata[index]}]}}
+
+
+def test_history_click_loads_exact_group_channel_and_direction():
+    session = _mixed_direction_session()
+    other_group = [dict(obs, group_id=2) for obs in session["observations"]]
+    session["observations"].extend(other_group)
+    session["history"] = pd.DataFrame()
+    history = viewer._observation_table(session)
+    frame, columns = viewer._history_channels_by_direction(
+        history, viewer._channel_metric_columns(history)["Q_channel"],
+    )
+    figure = viewer._plot_channel_trend(
+        frame, "Q_channel", columns, ["1 · Minimize"], "Separate plots",
+    )
+    for trace in figure.data:
+        selection = viewer._history_swv_selection(_click(trace), session["observations"])
+        assert selection["channel"] == "1"
+        assert selection["direction"] == "minimize"
+        assert selection["iteration"] == 1
+        matches = [obs for obs in session["observations"]
+                   if viewer._history_swv_observation_matches(obs, selection)]
+        assert len(matches) == 1
+        assert matches[0]["group_id"] == trace.customdata[0][2]
+        assert matches[0]["method_id"] == "minimize-1"
+
+
+def test_run_level_click_preserves_method_and_direction():
+    session = _mixed_direction_session()
+    figure = viewer._plot_trend(viewer._observation_table(session), "Q_run")
+    for index, data in enumerate(figure.data[0].customdata):
+        selection = viewer._history_swv_selection(_click(figure.data[0], index), session["observations"])
+        assert selection["method_id"] == data[5]
+        assert selection["direction"] == data[4]
+
+
+def test_history_averages_and_ambiguous_points_do_not_select_an_observation():
+    session = _mixed_direction_session()
+    history = viewer._observation_table(session)
+    figure = viewer._plot_channel_trend(
+        history, "Q_channel", {"1": "ch1_Q_channel"}, ["1"], "Average selected channels",
+    )
+    assert viewer._history_swv_selection(_click(figure.data[0]), session["observations"]) is None
+    figure = viewer._plot_channel_trend(
+        history, "Q_channel", {"1": "ch1_Q_channel"}, ["1"], "Separate plots",
+    )
+    assert viewer._history_swv_selection(_click(figure.data[0]), session["observations"] * 2) is None
+    assert viewer._history_swv_selection(None, session["observations"]) is None
+
+
+def test_interactive_history_renderer_returns_selection_and_keeps_png_download(monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    from matplotlib.figure import Figure
+    monkeypatch.setattr(viewer, "_history_plotly_to_matplotlib", lambda *args: Figure())
+    downloads = []
+    monkeypatch.setattr(viewer, "_matplotlib_png_bytes", lambda *args, **kwargs: b"png")
+    monkeypatch.setattr(viewer, "_render_browser_download_link", lambda *args, **kwargs: downloads.append(kwargs))
+    app = AppTest.from_string('''
+import streamlit as st
+import plotly.graph_objects as go
+from bo_session_viewer import _render_downloadable_plotly
+result = _render_downloadable_plotly(
+    st, go.Figure(go.Scatter(x=[1, 2], y=[2, 3])), key="history_test",
+    file_stem="history", width_percent=800, individual_plot_settings=True,
+    interactive_history=True, on_select="rerun",
+)
+st.text(str(result["selection"]["points"]))
+''').run()
+    assert not app.exception
+    assert len(app.get("plotly_chart")) == 1
+    assert app.text[0].value == "[]"
+    assert downloads[0]["file_name"] == "history.png"
+
+
+def test_swv_navigation_preserves_shared_history_widgets():
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_string('''
+import streamlit as st
+from bo_session_viewer import _consume_history_swv_request
+request = _consume_history_swv_request()
+st.selectbox("Observation group", ["all", 1, 2], key="bo_observation_group_scope")
+st.selectbox("Observation iteration", ["all", 1, 2], key="bo_observation_iteration_all")
+st.multiselect("History channels", ["1", "2"], default=["1", "2"], key="history_channels")
+st.slider("History range", 1, 20, (2, 18), key="history_range")
+if st.button("Click iteration"):
+    st.session_state["bo_history_swv_request"] = {
+        "group_id": 2, "iteration": 1, "channel": "2",
+        "direction": "minimize", "method_id": "min-1",
+    }
+    st.rerun()
+''').run()
+    app.multiselect[0].set_value(["2"]).run()
+    app.slider[0].set_value((4, 15)).run()
+    app.button[0].click().run()
+    assert not app.exception
+    assert app.selectbox[0].value == "all"
+    assert app.selectbox[1].value == "all"
+    assert app.multiselect[0].value == ["2"]
+    assert app.slider[0].value == (4, 15)
+    assert app.session_state["bo_history_swv_focus"]["group_id"] == 2
+    assert app.session_state["bo_history_swv_render_request"]["direction"] == "minimize"
+    app.run()
+    assert app.selectbox[0].value == "all"
+    assert app.session_state["bo_history_swv_focus"]["iteration"] == 1
+
+
+def test_history_selection_callback_updates_each_click_and_ignores_other_charts(monkeypatch):
+    session = _mixed_direction_session()
+    history = viewer._observation_table(session)
+    figure = viewer._plot_channel_trend(
+        history, "Q_channel", {"1": "ch1_Q_channel"}, ["1"], "Separate plots",
+    )
+    state = {}
+    monkeypatch.setattr(viewer.st, "session_state", state)
+    first, second = figure.data[:2]
+    # A later chart can fire while an earlier chart still has a saved selection.
+    for key, trace, index in [
+        ("chart_a", first, 0), ("chart_a", first, 1),
+        ("chart_b", second, 1), ("chart_a", first, 0),
+    ]:
+        state[key] = _click(trace, index)
+        viewer._handle_history_swv_selection(key, session["observations"])
+        request = viewer._consume_history_swv_request()
+        assert request["iteration"] == trace.customdata[index][1]
+        assert request["direction"] == trace.customdata[index][4]
+        assert state.pop("bo_history_swv_render_request") == request
+        assert state["bo_history_swv_focus"] == request
+        assert viewer._consume_history_swv_request() is None
+
+
+def test_history_selection_callback_resolves_new_point_in_retained_selection(monkeypatch):
+    session = _mixed_direction_session()
+    history = viewer._observation_table(session)
+    figure = viewer._plot_channel_trend(
+        history, "Q_channel", {"1": "ch1_Q_channel"}, ["1"], "Separate plots",
+    )
+    state = {"chart": _click(figure.data[0])}
+    monkeypatch.setattr(viewer.st, "session_state", state)
+    viewer._handle_history_swv_selection("chart", session["observations"])
+    viewer._consume_history_swv_request()
+    old_point = state["chart"]["selection"]["points"][0]
+    new_point = _click(figure.data[1], 1)["selection"]["points"][0]
+    state["chart"] = {"selection": {"points": [new_point, old_point]}}
+    viewer._handle_history_swv_selection("chart", session["observations"])
+    request = viewer._consume_history_swv_request()
+    assert request["iteration"] == new_point["customdata"][1]
+    assert request["direction"] == new_point["customdata"][4]
+    # Removing a point and clearing a selection must not reopen an old trace.
+    state["chart"] = {"selection": {"points": [old_point]}}
+    viewer._handle_history_swv_selection("chart", session["observations"])
+    assert viewer._consume_history_swv_request() is None
+    state["chart"] = {"selection": {"points": []}}
+    viewer._handle_history_swv_selection("chart", session["observations"])
+    assert viewer._consume_history_swv_request() is None

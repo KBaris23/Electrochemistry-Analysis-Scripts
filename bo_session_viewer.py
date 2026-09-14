@@ -3171,6 +3171,125 @@ def _add_moving_average_traces(
     return fig
 
 
+def _history_point_data(rows: pd.DataFrame, *, channel_series: bool = False) -> list[list]:
+    """Attach source identity only to points representing actual observations."""
+    result = []
+    for row in rows.to_dict("records"):
+        group = _finite_float(row.get("group_id", 1))
+        channel = str(row.get("channel", "")) if channel_series else ""
+        raw_direction = row.get("direction", row.get("optimization_direction"))
+        direction = "" if pd.isna(raw_direction) else str(raw_direction)
+        method = row.get("method_id")
+        method = "" if pd.isna(method) else str(method)
+        if channel == "average" or group is None:
+            result.append([])
+            continue
+        result.append([
+            "bo_history", int(row["iteration"]), int(group),
+            channel.split(" · ")[0], direction.lower(),
+            method if not channel_series else "",
+        ])
+    return result
+
+
+def _history_swv_selection(event: Any, observations: list[dict]) -> dict | None:
+    """Resolve a clicked raw point without guessing between duplicate runs."""
+    points = (event or {}).get("selection", {}).get("points", [])
+    if len(points) != 1:
+        return None
+    data = points[0].get("customdata")
+    if not isinstance(data, (list, tuple)) or len(data) != 6 or data[0] != "bo_history":
+        return None
+    _, iteration, group, channel, direction, method = data
+    matches = [obs for obs in observations if (
+        obs.get("group_id", 1) == group and obs.get("iteration") == iteration
+        and (not direction or str(obs.get("optimization_direction") or "").lower() == direction)
+        and (not method or str(obs.get("method_id") or "") == method)
+    )]
+    if len(matches) != 1:
+        return None
+    return {"group_id": group, "iteration": iteration, "channel": channel,
+            "direction": direction, "method_id": str(matches[0].get("method_id") or "")}
+
+
+def _handle_history_swv_selection(chart_key: str, observations: list[dict]) -> None:
+    """Handle the chart that fired the event, rather than replaying saved selections."""
+    event = st.session_state.get(chart_key) or {}
+    points = event.get("selection", {}).get("points", [])
+    previous_key = f"bo_history_selection_{chart_key}"
+    previous_points = st.session_state.get(previous_key, [])
+    st.session_state[previous_key] = points
+    st.session_state.pop("bo_history_swv_selection_message", None)
+    if not points:
+        return
+    # Plotly can retain selections from other traces. A single newly added
+    # point identifies this click even when the event includes earlier points.
+    added_points = [point for point in points if point not in previous_points]
+    if not added_points:
+        return
+    clicked_points = added_points if len(points) > 1 else points
+    selection = _history_swv_selection(
+        {"selection": {"points": clicked_points}}, observations,
+    )
+    if selection is not None:
+        st.session_state["bo_history_swv_request"] = selection
+    elif added_points:
+        st.session_state["bo_history_swv_selection_message"] = (
+            "This selection does not identify a single observation. "
+            "Choose an individual channel and group point to load SWV traces."
+        )
+
+
+def _consume_history_swv_request() -> dict | None:
+    """Keep click navigation separate from the shared observation/history controls."""
+    selection = st.session_state.pop("bo_history_swv_request", None)
+    if selection is not None:
+        st.session_state["bo_history_swv_focus"] = selection
+        st.session_state["bo_history_swv_render_request"] = selection
+    return selection
+
+
+def _activate_swv_traces_tab() -> None:
+    # Streamlit 1.40 has no programmatic tab-selection API. This one-shot
+    # component selects the existing BO tab without rebuilding the tab group.
+    # A nonce allows repeated clicks to issue distinct navigation requests.
+    components.html(
+        """
+        <script>
+        // Navigation request: NAVIGATION_NONCE
+        const doc = window.parent.document;
+        let attempts = 0;
+        function activate() {
+            const tabLists = [...doc.querySelectorAll('[role="tablist"]')];
+            for (const list of tabLists) {
+                const tabs = [...list.querySelectorAll('[role="tab"]')];
+                if (!tabs.some(tab => tab.textContent.trim() === 'History & scores')) continue;
+                const target = tabs.find(tab => tab.textContent.trim() === 'SWV traces');
+                if (!target) continue;
+                target.click();
+                target.scrollIntoView({block: 'start', behavior: 'smooth'});
+                return;
+            }
+            if (++attempts < 100) window.setTimeout(activate, 50);
+        }
+        activate();
+        </script>
+        """.replace("NAVIGATION_NONCE", str(time.time_ns())),
+        height=0,
+    )
+
+
+def _history_swv_observation_matches(observation: dict, selection: dict) -> bool:
+    return (
+        observation.get("group_id", 1) == selection["group_id"]
+        and observation.get("iteration") == selection["iteration"]
+        and (not selection["direction"] or
+             str(observation.get("optimization_direction") or "").lower() == selection["direction"])
+        and (not selection["method_id"] or
+             str(observation.get("method_id") or "") == selection["method_id"])
+    )
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _plot_trend(
     frame: pd.DataFrame,
@@ -3415,7 +3534,7 @@ def _plot_trend(
                     marker=marker or None,
                     line={"color": group_color} if group_color else None,
                     opacity=trace_opacity,
-                    customdata=iterations,
+                    customdata=_history_point_data(rows),
                     hovertemplate=(
                         f"{group_name}<br>Iteration %{{x}}<br>"
                         f"{metric}: %{{y:.4g}}<extra></extra>"
@@ -3513,7 +3632,7 @@ def _plot_trend(
             marker=marker,
             line={"color": group_color} if group_color else None,
             opacity=trace_opacity,
-            customdata=iterations,
+            customdata=_history_point_data(rows),
             hovertemplate=(
                 f"{group_name}<br>Iteration %{{x}}<br>"
                 f"{metric}: %{{y:.4g}}<extra></extra>"
@@ -5749,7 +5868,7 @@ def _plot_channel_trend(
                     "dash": "dash" if direction == "minimize" else "solid",
                 },
                 opacity=trace_opacity,
-                customdata=rows["iteration"],
+                customdata=_history_point_data(rows, channel_series=True),
                 hovertemplate=(
                     f"{trace_name}<br>Iteration %{{x}}<br>"
                     f"{label}: %{{y:.4g}}<extra></extra>"
@@ -10009,7 +10128,7 @@ def _clicked_iteration(event: Any) -> int | None:
     point = points[-1]
     raw = point.get("customdata", point.get("x"))
     if isinstance(raw, (list, tuple)):
-        raw = raw[0] if raw else None
+        raw = raw[1] if len(raw) == 6 and raw[0] == "bo_history" else (raw[0] if raw else None)
     try:
         return int(raw)
     except (TypeError, ValueError):
@@ -23355,13 +23474,13 @@ def _plot_colormap_override_is_valid() -> bool:
 
 
 def _plot_height_px(kind: str) -> int:
-    defaults = {"1d": 420, "2d": 560, "3d": 620}
+    defaults = {"1d": 600, "2d": 560, "3d": 620}
     key = f"bo_plot_{kind}_height"
     return int(max(220, min(1800, float(st.session_state.get(key, defaults.get(kind, 420)) or defaults.get(kind, 420)))))
 
 
 def _plot_width_px() -> int:
-    return int(max(500, min(2600, float(st.session_state.get("bo_plot_width_px", 960) or 960))))
+    return int(max(500, min(2600, float(st.session_state.get("bo_plot_width_px", 1200) or 1200))))
 
 
 def _plot_perimeter_width() -> float:
@@ -26660,6 +26779,8 @@ def _render_downloadable_plotly(
     eager_png: bool = True,
     individual_plot_settings: bool = False,
     individual_plot_settings_heading: str = "Plot settings",
+    interactive_history: bool = False,
+    history_observations: list[dict] | None = None,
 ) -> Any:
     settings_prefix = f"{key}_individual_plot"
     default_height = min(
@@ -26750,7 +26871,23 @@ def _render_downloadable_plotly(
             dpi=100,
             apply_global_style=False,
         )
-        plot_column.image(png_bytes, width=effective_export_width)
+        event = None
+        if interactive_history:
+            fig.update_layout(
+                width=effective_export_width, clickmode="event+select", uirevision=key,
+            )
+            chart_key = f"{key}_interactive"
+
+            def history_selection_callback() -> None:
+                _handle_history_swv_selection(chart_key, history_observations)
+
+            event = plot_column.plotly_chart(
+                fig, use_container_width=False,
+                on_select=(history_selection_callback if history_observations is not None else on_select),
+                selection_mode=selection_mode, key=chart_key,
+            )
+        else:
+            plot_column.image(png_bytes, width=effective_export_width)
         _render_browser_download_link(
             plot_column,
             "Download plot",
@@ -26767,7 +26904,7 @@ def _render_downloadable_plotly(
         )
         if settings_submitted:
             st.rerun()
-        return None
+        return event
     _apply_plotly_colorbar_height(fig)
     fig.update_layout(width=effective_export_width, autosize=False)
     if not individual_plot_settings:
@@ -26974,6 +27111,10 @@ def _reset_bo_group_channel_selector_defaults(session_token: str) -> None:
     exact_keys = {
         "bo_channel_group_scope",
         "bo_channel_group_scope__preferred",
+        "bo_history_swv_focus",
+        "bo_history_swv_request",
+        "bo_history_swv_render_request",
+        "bo_history_swv_selection_message",
         "bo_observation_group_scope",
         "bo_observation_group_scope__preferred",
         "bo_observation_group_scope_compact_session",
@@ -26981,6 +27122,7 @@ def _reset_bo_group_channel_selector_defaults(session_token: str) -> None:
         "bo_surrogate_pref_groups",
     }
     prefixes = (
+        "bo_history_selection_",
         "bo_trend_channels_",
         "bo_hp_response_channels_",
         "bo_paired_channels_",
@@ -29211,16 +29353,16 @@ def render_bo_session_app() -> None:
             legacy_width_percent = _finite_float(
                 st.session_state.get(
                     "bo_plot_width_percent__preferred",
-                    st.session_state.get("bo_plot_width_percent", 80),
+                    st.session_state.get("bo_plot_width_percent", 100),
                 )
             )
             st.session_state["bo_plot_width_px"] = int(
-                round(1200 * float(legacy_width_percent or 80) / 100)
+                round(1200 * float(legacy_width_percent or 100) / 100)
             )
         _prepare_numeric_widget_preference(
             "bo_plot_width_px",
             "bo_plot_width_px__preferred",
-            default=960,
+            default=1200,
             minimum=500,
             maximum=2200,
             cast=int,
@@ -29229,7 +29371,7 @@ def render_bo_session_app() -> None:
             "Plot width",
             min_value=500,
             max_value=2200,
-            value=960,
+            value=1200,
             step=20,
             format="%d px",
             help="Exact plot width in pixels for both browser display and downloaded PNGs.",
@@ -29239,7 +29381,7 @@ def render_bo_session_app() -> None:
         _prepare_numeric_widget_preference(
             "bo_plot_1d_height",
             "bo_plot_1d_height__preferred",
-            default=420,
+            default=600,
             minimum=240,
             maximum=1200,
             cast=int,
@@ -29248,7 +29390,7 @@ def render_bo_session_app() -> None:
             "1D plot height",
             min_value=240,
             max_value=1200,
-            value=420,
+            value=600,
             step=20,
             format="%d px",
             help="Canvas height used for line, trend, trace, and other 1D-style plots.",
@@ -29801,6 +29943,7 @@ def render_bo_session_app() -> None:
         observation_group_metadata,
         set(observation_group_ids),
     )
+    history_swv_request = _consume_history_swv_request()
     observation_selector_columns = st.columns(2)
     with observation_selector_columns[0]:
         observation_group_options = [
@@ -29905,6 +30048,8 @@ def render_bo_session_app() -> None:
             "PDF Export",
         ]
     )
+    if history_swv_request is not None:
+        _activate_swv_traces_tab()
     with rescore_tab:
         _render_rescore_q_tab(source_session)
     with metadata_tab:
@@ -30227,6 +30372,13 @@ def render_bo_session_app() -> None:
     with overview:
         @st.fragment
         def _render_history_scores_tab() -> None:
+            # A selection callback runs before this fragment. Refresh the app
+            # so the SWV fragment receives a fresh scope and render request.
+            if st.session_state.get("bo_history_swv_request") is not None:
+                st.rerun(scope="app")
+            selection_message = st.session_state.pop("bo_history_swv_selection_message", None)
+            if selection_message:
+                st.info(selection_message)
             show_trend_observation_group_filter = (
                 bool(
                     ((full_session.get("config") or {}).get("records") or {}).get(
@@ -30941,7 +31093,6 @@ def render_bo_session_app() -> None:
             trend_render_gate_key = "bo_history_scores_large_plot_render_signature"
             trend_figure = None
             trend_figures: list[tuple[str, go.Figure]] = []
-            trend_events = []
             skip_large_trend_render = False
 
             def _history_trend_render_allowed(
@@ -31216,7 +31367,8 @@ def render_bo_session_app() -> None:
                     for label, figure in trend_figures
                 ]
             if trend_figures:
-                trend_events = []
+                st.caption("Click an iteration point to open its SWV traces in the SWV traces tab. "
+                           "Channel or group averages do not identify a single trace.")
                 for figure_index, (figure_label, figure) in enumerate(
                     trend_figures,
                     start=1,
@@ -31240,7 +31392,7 @@ def render_bo_session_app() -> None:
                         _apply_y_axis_range(figure, *trend_y_limits)
                     else:
                         _fit_y_axis_to_figure(figure)
-                    trend_events.append(_render_downloadable_plotly(
+                    _render_downloadable_plotly(
                         st,
                         figure,
                         key=(
@@ -31257,7 +31409,9 @@ def render_bo_session_app() -> None:
                         selection_mode="points",
                         individual_plot_settings=True,
                         individual_plot_settings_heading="Trend plot settings",
-                    ))
+                        interactive_history=True,
+                        history_observations=observations,
+                    )
                 trend_q_kind = _metric_q_kind(metric, paired_objective)
                 if trend_q_kind:
                     _render_q_equation(session["config"], trend_q_kind)
@@ -33009,37 +33163,6 @@ def render_bo_session_app() -> None:
                     config=full_session.get("config", {}),
                     scope_key=trend_scope_key,
                 )
-            clicked_iteration = next(
-                (
-                    iteration
-                    for iteration in (_clicked_iteration(event) for event in trend_events)
-                    if iteration is not None
-                ),
-                None,
-            )
-            click_state_key = (
-                f"bo_last_trend_click_{session['state'].get('session_id', 'session')}_"
-                f"{selected_group_id}_{chart_key_suffix}"
-            )
-            last_clicked_iteration = st.session_state.get(click_state_key)
-            if clicked_iteration is not None and clicked_iteration != last_clicked_iteration:
-                st.session_state[click_state_key] = clicked_iteration
-            is_new_plot_click = (
-                clicked_iteration is not None
-                and clicked_iteration != last_clicked_iteration
-            )
-            if (
-                not all_groups_scope
-                and
-                is_new_plot_click
-                and clicked_iteration in iteration_options
-                and clicked_iteration != selected_iteration
-            ):
-                st.session_state[iteration_state_key] = (
-                    f"g{selected_observation_group}:i{clicked_iteration}"
-                )
-                st.rerun()
-
             if any(
                 str(obs.get("objective", "")).lower() == "paired_response"
                 for obs in plot_observations
@@ -33797,11 +33920,34 @@ def render_bo_session_app() -> None:
     with traces:
         @st.fragment
         def _render_swv_traces_tab() -> None:
+            history_swv_request = st.session_state.pop("bo_history_swv_render_request", None)
+            history_focus = st.session_state.get("bo_history_swv_focus")
+            swv_group_scope = selected_observation_group_scope
+            swv_iteration_scope = selected_iteration_scope
+            swv_observations = group_scoped_observations
+            swv_iterations = scoped_iterations
             selected_group_label = selected_observation_group_scope_label
+            if history_focus:
+                swv_group_scope = history_focus["group_id"]
+                swv_iteration_scope = history_focus["iteration"]
+                swv_observations = [obs for obs in observations
+                                    if obs.get("group_id", 1) == swv_group_scope]
+                swv_iterations = sorted({int(obs["iteration"]) for obs in swv_observations})
+                selected_group_label = observation_group_scope_label(swv_group_scope)
+                st.caption(
+                    f"History selection: {selected_group_label} · iteration {history_focus['iteration']}"
+                    + (f" · Channel {history_focus['channel']}" if history_focus['channel'] else "")
+                    + (f" · {history_focus['direction'].capitalize()}" if history_focus['direction'] else "")
+                )
+                if st.button("Use observation selectors", key="bo_swv_clear_history_focus"):
+                    st.session_state.pop("bo_history_swv_focus", None)
+                    st.rerun(scope="fragment")
+            if history_swv_request is not None:
+                st.session_state[f"bo_trace_iteration_mode_{swv_group_scope}"] = "Selected observation iteration"
             trace_settings_form = st.form(
                 key=(
                     "bo_swv_trace_settings_form_"
-                    f"{selected_observation_group_scope}"
+                    f"{swv_group_scope}"
                 ),
                 clear_on_submit=False,
                 enter_to_submit=False,
@@ -33815,17 +33961,17 @@ def render_bo_session_app() -> None:
                 "Iteration range",
                 "All iterations",
             ]
-            if len(scoped_iterations) < 2:
+            if len(swv_iterations) < 2:
                 trace_iteration_mode_options.remove("Iteration range")
             default_trace_iteration_mode = (
                 "All iterations"
-                if selected_iteration_scope == "all"
+                if swv_iteration_scope == "all"
                 else "Selected observation iteration"
             )
             if default_trace_iteration_mode not in trace_iteration_mode_options:
                 default_trace_iteration_mode = trace_iteration_mode_options[-1]
             trace_iteration_mode_key = (
-                f"bo_trace_iteration_mode_{selected_observation_group_scope}"
+                f"bo_trace_iteration_mode_{swv_group_scope}"
             )
             _preserve_valid_widget_value(
                 trace_iteration_mode_key,
@@ -33838,45 +33984,45 @@ def render_bo_session_app() -> None:
                 horizontal=True,
                 key=trace_iteration_mode_key,
             )
-            trace_iteration_start = int(scoped_iterations[0])
-            trace_iteration_end = int(scoped_iterations[-1])
-            if len(scoped_iterations) >= 2:
+            trace_iteration_start = int(swv_iterations[0])
+            trace_iteration_end = int(swv_iterations[-1])
+            if len(swv_iterations) >= 2:
                 selected_iteration_for_default = (
-                    int(selected_iteration_scope)
-                    if selected_iteration_scope != "all"
-                    else scoped_iterations[-1]
+                    int(swv_iteration_scope)
+                    if swv_iteration_scope != "all"
+                    else swv_iterations[-1]
                 )
                 default_iteration_start = (
-                    scoped_iterations[0]
-                    if selected_iteration_scope == "all"
+                    swv_iterations[0]
+                    if swv_iteration_scope == "all"
                     else selected_iteration_for_default
                 )
                 default_iteration_end = (
-                    scoped_iterations[-1]
-                    if selected_iteration_scope == "all"
+                    swv_iterations[-1]
+                    if swv_iteration_scope == "all"
                     else selected_iteration_for_default
                 )
                 range_columns = trace_settings_form.columns(2)
                 trace_iteration_start_input = range_columns[0].number_input(
                     "Iteration start",
-                    min_value=int(scoped_iterations[0]),
-                    max_value=int(scoped_iterations[-1]),
+                    min_value=int(swv_iterations[0]),
+                    max_value=int(swv_iterations[-1]),
                     value=int(default_iteration_start),
                     step=1,
                     key=(
                         f"bo_trace_iteration_start_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                 )
                 trace_iteration_end_input = range_columns[1].number_input(
                     "Iteration end",
-                    min_value=int(scoped_iterations[0]),
-                    max_value=int(scoped_iterations[-1]),
+                    min_value=int(swv_iterations[0]),
+                    max_value=int(swv_iterations[-1]),
                     value=int(default_iteration_end),
                     step=1,
                     key=(
                         f"bo_trace_iteration_end_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                 )
                 trace_iteration_start, trace_iteration_end = sorted(
@@ -33890,7 +34036,7 @@ def render_bo_session_app() -> None:
                 )
             if trace_iteration_mode == "Iteration range":
                 trace_observations = [
-                    obs for obs in group_scoped_observations
+                    obs for obs in swv_observations
                     if trace_iteration_start
                     <= int(obs.get("iteration", 0))
                     <= trace_iteration_end
@@ -33902,21 +34048,24 @@ def render_bo_session_app() -> None:
                     f"range_{trace_iteration_start}_{trace_iteration_end}"
                 )
             elif trace_iteration_mode == "All iterations":
-                trace_observations = list(group_scoped_observations)
+                trace_observations = list(swv_observations)
                 selected_iteration_label = "all iterations"
                 trace_iteration_token = "all"
             else:
                 trace_iteration_value = (
-                    int(selected_iteration_scope)
-                    if selected_iteration_scope != "all"
-                    else int(scoped_iterations[-1])
+                    int(swv_iteration_scope)
+                    if swv_iteration_scope != "all"
+                    else int(swv_iterations[-1])
                 )
                 trace_observations = [
-                    obs for obs in group_scoped_observations
+                    obs for obs in swv_observations
                     if int(obs.get("iteration", 0)) == trace_iteration_value
                 ]
                 selected_iteration_label = f"iteration {trace_iteration_value}"
                 trace_iteration_token = f"iter_{trace_iteration_value}"
+            if history_focus and trace_iteration_mode == "Selected observation iteration":
+                trace_observations = [obs for obs in trace_observations
+                                      if _history_swv_observation_matches(obs, history_focus)]
             trace_observations = sorted(
                 trace_observations,
                 key=lambda item: (
@@ -33987,7 +34136,7 @@ def render_bo_session_app() -> None:
                 selected_trace_phases = None
                 if trace_has_paired_phases:
                     trace_phase_key = (
-                        f"bo_trace_phase_filter_{selected_observation_group_scope}"
+                        f"bo_trace_phase_filter_{swv_group_scope}"
                     )
                     _preserve_valid_widget_value(
                         trace_phase_key,
@@ -34021,13 +34170,24 @@ def render_bo_session_app() -> None:
                     trace for _observation, trace in display_trace_entries
                 ]
                 trace_channels_key = (
-                    f"bo_trace_channels_{selected_observation_group_scope}_"
+                    f"bo_trace_channels_{swv_group_scope}_"
                     f"{selected_trace_phase_label}"
                 )
                 available_channels = sorted(
                     {_trace_channel_key(item) for item in display_available_traces},
                     key=_channel_sort_key,
                 )
+                if history_swv_request is not None:
+                    focused_channels = sorted({
+                        _trace_channel_key(trace) for trace in display_available_traces
+                        if (not history_swv_request["channel"] or
+                            str(trace["channel"]) == history_swv_request["channel"])
+                        and (not history_swv_request["direction"] or
+                             not trace.get("optimization_direction") or
+                             str(trace["optimization_direction"]).lower() == history_swv_request["direction"])
+                    }, key=_channel_sort_key)
+                    st.session_state[trace_channels_key] = focused_channels
+                    st.session_state[f"{trace_channels_key}__preferred"] = focused_channels
                 trace_channels_valid, trace_channels_display = (
                     _prepare_preferred_multiselect_value(
                         trace_channels_key,
@@ -34054,7 +34214,7 @@ def render_bo_session_app() -> None:
                     "Plot channels separately",
                 ]
                 trace_channel_layout_key = (
-                    f"bo_trace_channel_layout_{selected_observation_group_scope}"
+                    f"bo_trace_channel_layout_{swv_group_scope}"
                 )
                 _preserve_valid_widget_value(
                     trace_channel_layout_key,
@@ -34072,10 +34232,10 @@ def render_bo_session_app() -> None:
                     "Plot each iteration separately",
                     "Overlay SWV traces",
                 ]
-                if len(group_scoped_observations) > 1:
+                if len(swv_observations) > 1:
                     trace_layout_options.append("Chronological diagonal stack")
                 trace_layout_key = (
-                    f"bo_trace_layout_{selected_observation_group_scope}"
+                    f"bo_trace_layout_{swv_group_scope}"
                 )
                 _preserve_valid_widget_value(
                     trace_layout_key,
@@ -34096,13 +34256,13 @@ def render_bo_session_app() -> None:
                     "Normalized raw",
                 ]
                 trace_types_key = (
-                    f"bo_trace_types_{selected_observation_group_scope}"
+                    f"bo_trace_types_{swv_group_scope}"
                 )
                 trace_types_preference_key = (
                     f"{trace_types_key}__preferred"
                 )
                 legacy_trace_type_key = (
-                    f"bo_trace_type_{selected_observation_group_scope}"
+                    f"bo_trace_type_{swv_group_scope}"
                 )
                 if (
                     trace_types_key not in st.session_state
@@ -34120,7 +34280,7 @@ def render_bo_session_app() -> None:
                         trace_types_key,
                         trace_types_preference_key,
                         trace_type_options,
-                        ["Corrected"],
+                        ["Corrected", "Raw"],
                     )
                 )
                 selected_trace_types = trace_settings_form.multiselect(
@@ -34190,7 +34350,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_voltage_min_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                 ))
                 trace_voltage_max = float(trace_voltage_columns[1].number_input(
@@ -34200,7 +34360,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_voltage_max_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                 ))
                 if trace_voltage_min > trace_voltage_max:
@@ -34218,12 +34378,12 @@ def render_bo_session_app() -> None:
                 default_trace_y_max = 1.2 if normalize_to_peak else 1.0
                 trace_y_min_key = (
                     f"bo_trace_y_min_"
-                    f"{selected_observation_group_scope}_"
+                    f"{swv_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 trace_y_max_key = (
                     f"bo_trace_y_max_"
-                    f"{selected_observation_group_scope}_"
+                    f"{swv_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 st.session_state.setdefault(trace_y_min_key, default_trace_y_min)
@@ -34233,7 +34393,7 @@ def render_bo_session_app() -> None:
                     "Set SWV y-axis limits manually",
                     key=(
                         f"bo_trace_manual_y_limits_"
-                        f"{selected_observation_group_scope}_"
+                        f"{swv_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                     help=(
@@ -34296,7 +34456,7 @@ def render_bo_session_app() -> None:
                         horizontal=True,
                         key=(
                             f"bo_trace_stack_phase_display_"
-                            f"{selected_observation_group_scope}"
+                            f"{swv_group_scope}"
                         ),
                     )
                 offset_columns = stack_settings.columns(3)
@@ -34307,7 +34467,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_stack_x_offset_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                     help="Positive values shift newer traces to the right; negative values shift them left.",
                 )
@@ -34318,7 +34478,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_stack_y_offset_"
-                        f"{selected_observation_group_scope}_"
+                        f"{swv_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                     help="Positive values shift newer traces upward; negative values shift them downward.",
@@ -34331,7 +34491,7 @@ def render_bo_session_app() -> None:
                     step=0.1,
                     key=(
                         f"bo_trace_stack_height_"
-                        f"{selected_observation_group_scope}_"
+                        f"{swv_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                     help="Scales each SWV vertically before applying the chronological offset.",
@@ -34340,7 +34500,7 @@ def render_bo_session_app() -> None:
                     "Crop each SWV trace by current before stacking",
                     key=(
                         f"bo_trace_stack_manual_y_limits_"
-                        f"{selected_observation_group_scope}_"
+                        f"{swv_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                 )
@@ -34349,12 +34509,12 @@ def render_bo_session_app() -> None:
                 y_limit_columns = stack_settings.columns(2)
                 stack_y_min_key = (
                     f"bo_trace_stack_trace_y_min_"
-                    f"{selected_observation_group_scope}_"
+                    f"{swv_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 stack_y_max_key = (
                     f"bo_trace_stack_trace_y_max_"
-                    f"{selected_observation_group_scope}_"
+                    f"{swv_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 st.session_state.setdefault(
@@ -34396,15 +34556,16 @@ def render_bo_session_app() -> None:
                     value=350,
                     step=50,
                     key=(
-                        f"bo_trace_gif_duration_{selected_observation_group_scope}"
+                        f"bo_trace_gif_duration_{swv_group_scope}"
                     ),
                     help="Used when the rendered selection contains multiple iterations.",
                 )
 
                 trace_render_signature = (
                     session["state"].get("session_id", session["root"].name),
-                    selected_observation_group_scope,
+                    swv_group_scope,
                     trace_iteration_token,
+                    tuple(history_focus.items()) if history_focus else (),
                     selected_trace_phase_label,
                     tuple(selected_trace_phases or ()),
                     tuple(selected_channels),
@@ -34428,6 +34589,8 @@ def render_bo_session_app() -> None:
                     "Render SWV settings",
                     use_container_width=True,
                 ):
+                    st.session_state[trace_render_key] = trace_render_signature
+                if history_swv_request is not None:
                     st.session_state[trace_render_key] = trace_render_signature
                 render_swv_traces = (
                     st.session_state.get(trace_render_key)
@@ -34610,7 +34773,7 @@ def render_bo_session_app() -> None:
                                             figure,
                                             key=(
                                                 f"bo_trace_plot_single_"
-                                                f"{selected_observation_group_scope}_"
+                                                f"{swv_group_scope}_"
                                                 f"{trace_iteration_token}_"
                                                 f"{selected_trace_type}_"
                                                 f"{trace_index}_{trace_iteration}_"
@@ -34761,7 +34924,7 @@ def render_bo_session_app() -> None:
                                             figure,
                                             key=(
                                                 f"bo_trace_plot_iteration_"
-                                                f"{selected_observation_group_scope}_"
+                                                f"{swv_group_scope}_"
                                                 f"{trace_iteration_token}_"
                                                 f"{iteration_plot_index}_"
                                                 f"{iteration_group_id}_"
@@ -34868,7 +35031,7 @@ def render_bo_session_app() -> None:
                                     st,
                                     figure,
                                     key=(
-                                        f"bo_trace_plot_{selected_observation_group_scope}_"
+                                        f"bo_trace_plot_{swv_group_scope}_"
                                         f"{trace_iteration_token}_{trace_layout}_"
                                         f"{selected_trace_type}_{phase_label or 'all'}_"
                                         f"{selected_trace_phase_label}_"
@@ -34922,7 +35085,7 @@ def render_bo_session_app() -> None:
                             _trace_transform_key,
                         ) = _selected_trace_type_settings(selected_trace_type)
                         trace_gif_key = (
-                            f"bo_trace_gif_{selected_observation_group_scope}_"
+                            f"bo_trace_gif_{swv_group_scope}_"
                             f"{trace_iteration_token}_{trace_layout}_{selected_trace_type}_"
                             f"{selected_trace_phase_label}_"
                             f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
