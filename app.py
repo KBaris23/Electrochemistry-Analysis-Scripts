@@ -1210,13 +1210,20 @@ def render_downloadable_pyplot(
                 and reconstruction_x_min >= reconstruction_x_max
             ):
                 st.caption("X minimum must be smaller than X maximum.")
+
+        if primary_axis is not None:
+            y_limits_require_positive = (
+                reconstruction_concentration_scale == "Logarithmic"
+                if plot_kind == "concentration_reconstruction"
+                else primary_axis.get_yscale() == "log"
+            )
             manual_reconstruction_y_limits = st.checkbox(
                 "Manual y-axis limits",
                 key=f"{key}_manual_y_limits",
                 help=(
                     "Overrides the displayed doubling-level range for this plot only."
                     if reconstruction_uses_doubling_levels
-                    else "Overrides the reconstructed concentration range for this plot only."
+                    else "Overrides the y-axis range for this plot and its download."
                 ),
             )
             default_y_min, default_y_max = primary_axis.get_ylim()
@@ -1243,7 +1250,7 @@ def render_downloadable_pyplot(
                 and (
                     reconstruction_y_min >= reconstruction_y_max
                     or (
-                        reconstruction_concentration_scale == "Logarithmic"
+                        y_limits_require_positive
                         and reconstruction_y_min <= 0
                     )
                 )
@@ -1251,7 +1258,7 @@ def render_downloadable_pyplot(
                 st.caption(
                     "Y minimum must be positive for logarithmic scaling and "
                     "smaller than Y maximum."
-                    if reconstruction_concentration_scale == "Logarithmic"
+                    if y_limits_require_positive
                     else "Y minimum must be smaller than Y maximum."
                 )
 
@@ -1455,7 +1462,7 @@ def render_downloadable_pyplot(
             and reconstruction_y_max is not None
             and reconstruction_y_min < reconstruction_y_max
             and (
-                reconstruction_concentration_scale != "Logarithmic"
+                not y_limits_require_positive
                 or reconstruction_y_min > 0
             )
         ):
@@ -2689,10 +2696,15 @@ def parse_vlines(text: str) -> Tuple[List[Tuple[float, str]], List[str]]:
     return vlines, errors
 
 
-AUTOTITRATION_VLINE_DETECTION_VERSION = 2
+AUTOTITRATION_VLINE_DETECTION_VERSION = 3
+
+_AUTOTITRATION_QUEUE_ITEM_RE = re.compile(
+    r"(?:Queue start ->|Queue step\s+\d+\s*/\s*\d+:)\s*",
+    re.IGNORECASE,
+)
 
 _AUTOTITRATION_MEASUREMENT_RE = re.compile(
-    r"Queue start ->\s*"
+    _AUTOTITRATION_QUEUE_ITEM_RE.pattern +
     r"(?P<label>[^|]+?)\s*\|"
     r".*?MUX ch\s*(?P<channel>\d+)"
     r".*?rep\s*(?P<replicate>\d+)\s*/\s*(?P<replicate_count>\d+)",
@@ -2704,7 +2716,7 @@ _AUTOTITRATION_CONCENTRATION_RE = re.compile(
     re.IGNORECASE,
 )
 _AUTOTITRATION_TAG_RE = re.compile(
-    r"\[Tag\].*?_(?P<scan>\d+)_ch(?P<channel>\d+)\s*$",
+    r"\[Tag\].*?_(?P<scan>\d+)_ch(?P<channel>\d+)(?:_(?:max|min))?\s*$",
     re.IGNORECASE,
 )
 
@@ -2774,7 +2786,7 @@ def detect_autotitration_vlines(
             # A tag belongs only to the latest queue item. In particular, do
             # not let an unrecognized queue item inherit a preceding target
             # concentration.
-            if "queue start ->" in line.lower():
+            if _AUTOTITRATION_QUEUE_ITEM_RE.search(line):
                 pending_measurement = None
             measurement_match = _AUTOTITRATION_MEASUREMENT_RE.search(line)
             if measurement_match:
@@ -3565,6 +3577,11 @@ def reindex_swv_results_for_display(
 
 
 # 
+def _apply_swv_annotations_without_fitting():
+    """Apply submitted display controls with Langmuir fitting disabled."""
+    st.session_state["swv_fit_titration_langmuir"] = False
+
+
 # Session state
 # 
 for k, v in dict(
@@ -3586,7 +3603,7 @@ for k, v in dict(
     swv_show_titration_uloq=False,
     swv_show_titration_lod=False,
     swv_show_titration_fit_details=False,
-    swv_fit_titration_langmuir=True,
+    swv_fit_titration_langmuir=False,
     swv_titration_concentration_unit="uM",
     mat_conversion_report=None,
 ).items():
@@ -4406,7 +4423,7 @@ if run_clicked and folders and not folder_errors:
                 bool(use_prominent_minima),
                 bool(use_double_correction),
                 min_peak_height,
-                float(min_start_voltage),
+                float(min_start_voltage) if min_start_voltage is not None else None,
                 tuple(scan_windows),
                 None if scan_windows else scan_range,
                 time_range,
@@ -5035,7 +5052,11 @@ if analysis_mode == "SWV":
                 fit_titration_langmuir = st.checkbox(
                     "Fit Langmuir-style curve to step plateaus",
                     key="swv_fit_titration_langmuir",
-                    help="Only reports Kd when titration vline labels include concentrations.",
+                    help=(
+                        "Optional: enable to fit step plateaus when applying display controls. "
+                        "Vline annotations do not require fitting. Only reports Kd when "
+                        "titration vline labels include concentrations."
+                    ),
                 )
                 show_titration_fit_details = st.checkbox(
                     "Show Kd and fit details on Langmuir plots",
@@ -5147,6 +5168,12 @@ if analysis_mode == "SWV":
                 )
             else:
                 st.session_state["_swv_titration_trim_initialized_for_toggle"] = False
+            st.form_submit_button(
+                "Apply annotations only",
+                on_click=_apply_swv_annotations_without_fitting,
+                use_container_width=True,
+                help="Apply vline annotations and display controls with Langmuir fitting turned off.",
+            )
             st.form_submit_button("Apply Display Controls", use_container_width=True)
 
         vlines, vline_errors = parse_vlines(st.session_state.get("swv_post_vlines_input", DEFAULT_SWV_VLINES_TEXT))

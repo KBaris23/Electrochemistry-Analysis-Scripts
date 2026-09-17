@@ -2098,8 +2098,8 @@ def _channel_metric_columns(frame: pd.DataFrame) -> dict[str, dict[str, str]]:
     """Return numeric channel series, including constant and single-point series."""
     metrics: dict[str, dict[str, str]] = {}
     for column in frame.columns:
-        q_match = re.fullmatch(r"Q_ch(\d+)", str(column), re.IGNORECASE)
-        component_match = re.fullmatch(r"ch(\d+)_(.+)", str(column), re.IGNORECASE)
+        q_match = re.fullmatch(r"Q_ch(\d+(?:_(?:max|min))?)", str(column), re.IGNORECASE)
+        component_match = re.fullmatch(r"ch(\d+(?:_(?:max|min))?)_(.+)", str(column), re.IGNORECASE)
         if q_match:
             channel, metric = q_match.group(1), "Q_channel"
         elif component_match:
@@ -2235,9 +2235,9 @@ def _best_q_parameters_by_channel_frame(
     )
     for preferred_metric in preferred_metrics:
         for column in history.columns:
-            q_match = re.fullmatch(r"Q_ch(\d+)", str(column), re.IGNORECASE)
+            q_match = re.fullmatch(r"Q_ch(\d+(?:_(?:max|min))?)", str(column), re.IGNORECASE)
             component_match = re.fullmatch(
-                r"ch(\d+)_(.+)",
+                r"ch(\d+(?:_(?:max|min))?)_(.+)",
                 str(column),
                 re.IGNORECASE,
             )
@@ -5981,13 +5981,29 @@ def _plot_channel_trend(
     return _apply_plotly_colorbar_height(fig)
 
 
+def _plotly_array_values(values: Any) -> np.ndarray:
+    """Read ordinary arrays and Plotly's JSON-encoded numeric arrays."""
+    if values is None:
+        return np.asarray([])
+    if isinstance(values, Mapping) and "bdata" in values and "dtype" in values:
+        decoded = np.frombuffer(
+            base64.b64decode(values["bdata"]), dtype=np.dtype(values["dtype"]),
+        )
+        shape = values.get("shape")
+        if shape is not None:
+            dimensions = shape.split(",") if isinstance(shape, str) else shape
+            decoded = decoded.reshape(tuple(int(size) for size in dimensions))
+        return decoded
+    return np.asarray(values)
+
+
 def _figure_y_bounds(fig: go.Figure) -> tuple[float, float] | None:
     values = []
     for trace in fig.data:
         y_values = getattr(trace, "y", None)
         if y_values is None:
             continue
-        numeric = pd.to_numeric(pd.Series(y_values), errors="coerce")
+        numeric = pd.to_numeric(pd.Series(_plotly_array_values(y_values)), errors="coerce")
         values.extend(numeric[np.isfinite(numeric)].tolist())
     if not values:
         return None
@@ -26639,9 +26655,9 @@ def _history_plotly_to_matplotlib(
         ))
         if axis is None:
             continue
-        x_values = list(trace.x) if trace.x is not None else []
+        x_values = _plotly_array_values(trace.x)
         y_values = pd.to_numeric(
-            pd.Series(list(trace.y) if trace.y is not None else []),
+            pd.Series(_plotly_array_values(trace.y)),
             errors="coerce",
         ).to_numpy()
         if len(x_values) != len(y_values):
@@ -30687,7 +30703,7 @@ def render_bo_session_app() -> None:
             channel_column_names = {
                 column for column in trend_history.columns
                 if (
-                    re.fullmatch(r"Q_ch\d+", str(column), re.IGNORECASE)
+                    re.fullmatch(r"Q_ch\d+(?:_(?:max|min))?", str(column), re.IGNORECASE)
                     or re.fullmatch(r"ch\d+_.+", str(column), re.IGNORECASE)
                 )
             }

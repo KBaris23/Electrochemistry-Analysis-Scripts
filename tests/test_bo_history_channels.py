@@ -404,3 +404,54 @@ def test_history_selection_callback_resolves_new_point_in_retained_selection(mon
     state["chart"] = {"selection": {"points": []}}
     viewer._handle_history_swv_selection("chart", session["observations"])
     assert viewer._consume_history_swv_request() is None
+
+
+def test_direction_suffixed_channels_keep_scores_metrics_and_click_identity():
+    observations = []
+    rows = []
+    for channel, direction, score in [
+        ("2", "minimize", 0.2),
+        ("4_max", "maximize", 0.8),
+        ("4_min", "minimize", 0.1),
+        ("10_max", "maximize", 0.9),
+    ]:
+        group = int(channel.split("_")[0])
+        observations.append({
+            "iteration": 1, "group_id": group, "channels": [group],
+            "optimization_direction": direction, "method_id": channel,
+            "Q_run": score, "params": {"frequency": 100},
+            "quality": {"channel_components": {
+                channel: {"Q_channel": score, "peak_prominence": score * 10},
+            }},
+        })
+        rows.append({
+            "iteration": 1, "group_id": group,
+            "optimization_direction": direction, "method_id": channel,
+            "frequency": 100, "amplitude": 0.036, "step_potential": 0.002,
+            f"Q_ch{channel}": score,
+            f"ch{channel}_peak_prominence": score * 10,
+        })
+    # Both CSV-only and observation-enriched sessions must recognize suffixes.
+    for saved_observations in ([], observations):
+        history = viewer._observation_table({
+            "history": pd.DataFrame(rows), "observations": saved_observations,
+        })
+        metrics = viewer._channel_metric_columns(history)
+        expected = {"2", "4_max", "4_min", "10_max"}
+        assert set(metrics["Q_channel"]) == expected
+        assert set(metrics["peak_prominence"]) == expected
+        assert "max_peak_prominence" not in metrics
+        assert "min_peak_prominence" not in metrics
+        extrema = viewer._best_q_parameters_by_channel_frame(history)
+        assert set(extrema["Channel"]) == expected
+        frame, columns = viewer._history_channels_by_direction(history, metrics["Q_channel"])
+        figure = viewer._plot_channel_trend(
+            frame, "Q_channel", columns, list(columns), "Separate plots",
+        )
+        assert len(figure.data) == 4
+        for trace in figure.data:
+            selection = viewer._history_swv_selection(_click(trace), observations)
+            assert selection is not None
+            assert selection["channel"] in expected
+            observation = next(o for o in observations if o["method_id"] == selection["method_id"])
+            assert list(trace.y) == [observation["Q_run"]]

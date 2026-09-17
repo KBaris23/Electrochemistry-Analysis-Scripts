@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.integrate import trapezoid
 from scipy.signal import find_peaks
 
 from .io import (
@@ -363,7 +364,7 @@ def _loop_area_abs(
     grid = np.linspace(lo, hi, grid_count)
     f_interp = np.interp(grid, fv, fy)
     r_interp = np.interp(grid, rv, ry)
-    return float(np.trapz(np.abs(f_interp - r_interp), grid))
+    return float(trapezoid(np.abs(f_interp - r_interp), grid))
 
 
 def analyze_cv_arrays(
