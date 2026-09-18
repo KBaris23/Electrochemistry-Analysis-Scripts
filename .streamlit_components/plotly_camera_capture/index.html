@@ -266,7 +266,7 @@
       };
       requestPlotResize();
       window.setTimeout(function() {
-        const camera = (
+        const camera = latestArgs.camera_enabled === false ? null : (
           lastCamera ||
           loadCamera(latestArgs && latestArgs.storage_key) ||
           renderedCamera()
@@ -353,10 +353,15 @@
 
       const figure = latestArgs.figure || {};
       figure.layout = figure.layout || {};
-      figure.layout.scene = figure.layout.scene || {};
-      figure.layout.scene.dragmode = "turntable";
-      const storedCamera = loadCamera(latestArgs.storage_key);
-      const initialCamera = latestArgs.sync_camera || storedCamera || latestArgs.camera;
+      const cameraEnabled = latestArgs.camera_enabled !== false;
+      if (cameraEnabled) {
+        figure.layout.scene = figure.layout.scene || {};
+        figure.layout.scene.dragmode = "turntable";
+      }
+      const storedCamera = cameraEnabled ? loadCamera(latestArgs.storage_key) : null;
+      const initialCamera = cameraEnabled
+        ? latestArgs.sync_camera || storedCamera || latestArgs.camera
+        : null;
       if (initialCamera) {
         lastCamera = JSON.parse(JSON.stringify(initialCamera));
         figure.layout.scene.camera = initialCamera;

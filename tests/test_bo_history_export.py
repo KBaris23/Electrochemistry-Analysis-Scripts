@@ -52,3 +52,87 @@ def test_history_png_preserves_data_after_plotly_json_roundtrip(layout):
     finally:
         plt.close(original_export)
         plt.close(restored_export)
+
+
+def test_3d_download_does_not_require_server_png_export(monkeypatch):
+    import plotly.graph_objects as go
+
+    component_calls = []
+    container = object()
+    monkeypatch.setattr(viewer, "_sized_plot_container", lambda *_args: container)
+    monkeypatch.setattr(viewer, "_apply_plotly_colorbar_height", lambda fig: fig)
+    monkeypatch.setattr(viewer, "_apply_global_plot_style", lambda fig: fig)
+    monkeypatch.setattr(
+        viewer, "_render_camera_persistent_plotly",
+        lambda *args, **kwargs: component_calls.append(kwargs),
+    )
+
+    def unavailable_png_export(*args, **kwargs):
+        pytest.fail("Interactive 3D downloads must not require server PNG export")
+
+    monkeypatch.setattr(viewer, "_plotly_png_bytes", unavailable_png_export)
+    fig = go.Figure(go.Scatter3d(x=[1], y=[2], z=[3]))
+    viewer._render_downloadable_plotly(
+        container, fig, key="real_landscape", file_stem="real_landscape",
+        width_percent=1200, export_width=1200, export_height=620,
+        camera_storage_key="real_landscape_camera",
+    )
+    assert len(component_calls) == 1
+    assert component_calls[0]["show_download"] is True
+    assert component_calls[0]["file_stem"] == "real_landscape"
+    assert component_calls[0]["export_width"] == 1200
+    assert component_calls[0]["export_height"] == 620
+
+
+@pytest.mark.parametrize("plot_type", ["scatter", "heatmap", "parcoords"])
+@pytest.mark.parametrize("container_type", ["streamlit", "column"])
+def test_2d_download_does_not_require_server_png_export(monkeypatch, plot_type, container_type):
+    from contextlib import contextmanager
+    import plotly.graph_objects as go
+
+    component_calls = []
+    active_containers = []
+
+    @contextmanager
+    def column():
+        active_containers.append("column")
+        try:
+            yield
+        finally:
+            active_containers.pop()
+
+    container = viewer.st if container_type == "streamlit" else column()
+    monkeypatch.setattr(viewer, "_apply_plotly_colorbar_height", lambda fig: fig)
+    monkeypatch.setattr(viewer, "_apply_global_plot_style", lambda fig: fig)
+    def capture_component(**kwargs):
+        assert active_containers == (["column"] if container_type == "column" else [])
+        component_calls.append(kwargs)
+
+    monkeypatch.setattr(viewer, "_plotly_camera_capture", capture_component)
+
+    def unavailable_png_export(*args, **kwargs):
+        pytest.fail("Browser downloads must not require server PNG export")
+
+    monkeypatch.setattr(viewer, "_plotly_png_bytes", unavailable_png_export)
+    traces = {
+        "scatter": go.Scatter(x=[1, 2], y=[3, 4]),
+        "heatmap": go.Heatmap(z=[[1, 2], [3, 4]]),
+        "parcoords": go.Parcoords(dimensions=[
+            dict(label="Frequency", values=[10, 20]),
+            dict(label="Amplitude", values=[0.1, 0.2]),
+        ]),
+    }
+    viewer._render_downloadable_plotly(
+        container, go.Figure(traces[plot_type]),
+        key=plot_type, file_stem=f"real_{plot_type}",
+        width_percent=1200, export_width=1200, export_height=560,
+    )
+    assert len(component_calls) == 1
+    args = component_calls[0]
+    assert args["show_download"] is True
+    assert args["show_cache_view"] is False
+    assert args["camera_enabled"] is False
+    assert args["figure"]["data"][0]["type"] == plot_type
+    assert args["download_file_stem"] == f"real_{plot_type}"
+    assert args["download_width"] == 1200
+    assert args["download_height"] == 560

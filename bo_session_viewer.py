@@ -26927,7 +26927,7 @@ def _render_downloadable_plotly(
         _apply_global_plot_style(fig)
     chart_key = f"{key}_w{effective_export_width}_h{int(fig.layout.height or effective_export_height)}"
     if camera_storage_key:
-        rendered_camera = _render_camera_persistent_plotly(
+        _render_camera_persistent_plotly(
             plot_column,
             fig,
             key=chart_key,
@@ -26938,31 +26938,34 @@ def _render_downloadable_plotly(
             export_height=effective_export_height,
             shared_camera_storage_key=shared_camera_storage_key,
             apply_sync_nonce=apply_sync_nonce,
-            show_download=False,
+            show_download=True,
         )
         event = None
-        download_camera = _stored_plotly_camera(camera_storage_key) or rendered_camera
-        download_fig = go.Figure(fig)
-        _apply_plotly_camera(download_fig, download_camera)
-        try:
-            png_bytes = _plotly_png_bytes(
-                download_fig,
-                width=effective_export_width,
-                height=effective_export_height,
+        eager_png = False
+    elif on_select == "ignore" and eager_png:
+        # Export in the browser so a missing Kaleido installation cannot hide
+        # the download control for ordinary interactive plots.
+        def render_download_component():
+            return _plotly_camera_capture(
+                figure=json.loads(json.dumps(
+                    fig.to_plotly_json(), cls=PlotlyJSONEncoder,
+                )),
+                camera_enabled=False,
+                show_cache_view=False,
+                show_download=True,
+                height=int(fig.layout.height or effective_export_height),
+                download_file_stem=_safe_download_stem(file_stem),
+                download_width=effective_export_width,
+                download_height=effective_export_height,
+                default=None,
+                key=f"{chart_key}_download_component",
             )
-            _render_browser_download_link(
-                plot_column,
-                "Download plot",
-                png_bytes,
-                file_name=f"{_safe_download_stem(file_stem)}.png",
-                mime="image/png",
-            )
-            if download_camera is None:
-                plot_column.caption(
-                    "Click Cache view after rotating to export the current perspective."
-                )
-        except RuntimeError as exc:
-            plot_column.caption(str(exc))
+        if hasattr(plot_column, "__enter__") and hasattr(plot_column, "__exit__"):
+            with plot_column:
+                render_download_component()
+        else:
+            render_download_component()
+        event = None
         eager_png = False
     else:
         event = plot_column.plotly_chart(
@@ -36723,7 +36726,7 @@ def render_bo_session_app() -> None:
                                         apply_sync_nonce=comparison_sync_nonce,
                                     )
                                 else:
-                                    rendered_camera = _render_camera_persistent_plotly(
+                                    _render_camera_persistent_plotly(
                                         overview_column,
                                         comparison_fig,
                                         key=(
@@ -36740,42 +36743,8 @@ def render_bo_session_app() -> None:
                                             f"{real_metric}_{series_token}_{comparison_x}_"
                                             f"{comparison_y}_{comparison_z}"
                                         ),
-                                        show_download=False,
+                                        show_download=True,
                                     )
-                                    download_camera = (
-                                        comparison_cached_camera
-                                        if comparison_cached_camera is not None
-                                        else rendered_camera
-                                    )
-                                    download_fig = go.Figure(comparison_fig)
-                                    _apply_plotly_camera(download_fig, download_camera)
-                                    try:
-                                        png_bytes = _plotly_png_bytes(
-                                            download_fig,
-                                            width=max(
-                                                500,
-                                                int(plot_width_percent),
-                                            ),
-                                            height=plot_3d_height,
-                                            scale=2,
-                                        )
-                                        _render_browser_download_link(
-                                            overview_column,
-                                            "Download plot",
-                                            png_bytes,
-                                            file_name=(
-                                                f"{_safe_download_stem('real_comparison_3d')}_"
-                                                f"{_safe_download_stem(value_column)}_"
-                                                f"{_safe_download_stem(real_metric)}_"
-                                                f"{_safe_download_stem(series_token)}_"
-                                                f"{_safe_download_stem(comparison_x)}_"
-                                                f"{_safe_download_stem(comparison_y)}_"
-                                                f"{_safe_download_stem(comparison_z)}.png"
-                                            ),
-                                            mime="image/png",
-                                        )
-                                    except RuntimeError as exc:
-                                        overview_column.caption(str(exc))
                             if comparison_sync_nonce > 0:
                                 st.session_state[sync_nonce_key] = 0
                             comparison_slice_form = st.form(
@@ -39263,15 +39232,20 @@ def render_bo_session_app() -> None:
                                     axis_ranges=real_axis_ranges,
                                     value_range=real_value_range,
                                 )
-                                _plotly_chart_with_colorbars(
-                                    _sized_plot_container(st, plot_width_percent),
+                                _render_downloadable_plotly(
+                                    st,
                                     real_figure,
-                                    use_container_width=True,
                                     key=(
                                         f"bo_real_plot_both_{real_plot_state_key}_"
                                         f"{_safe_download_stem(series_name)}_"
                                         f"{real_metric}_{real_x}_{real_scope_key}"
                                     ),
+                                    file_stem=(
+                                        f"real_data_plot_both_{real_plot_state_key}_"
+                                        f"{_safe_download_stem(series_name)}_"
+                                        f"{real_metric}_{real_x}_{real_scope_key}"
+                                    ),
+                                    width_percent=plot_width_percent,
                                 )
                         elif real_channel_mode == real_simulation_run_mode:
                             run_series = _real_simulation_run_plot_series(pd.concat(
@@ -39317,15 +39291,20 @@ def render_bo_session_app() -> None:
                                     axis_ranges=real_axis_ranges,
                                     value_range=real_value_range,
                                 )
-                                _plotly_chart_with_colorbars(
-                                    _sized_plot_container(st, plot_width_percent),
+                                _render_downloadable_plotly(
+                                    st,
                                     real_figure,
-                                    use_container_width=True,
                                     key=(
                                         f"bo_real_plot_both_{real_plot_state_key}_"
                                         f"{group_id}_{real_metric}_{real_x}_"
                                         f"{real_scope_key}"
                                     ),
+                                    file_stem=(
+                                        f"real_data_plot_both_{real_plot_state_key}_"
+                                        f"{group_id}_{real_metric}_{real_x}_"
+                                        f"{real_scope_key}"
+                                    ),
+                                    width_percent=plot_width_percent,
                                 )
                         elif real_channel_mode == "Plot channels individually":
                             individual_channels = sorted(
@@ -39360,14 +39339,18 @@ def render_bo_session_app() -> None:
                                     and not real_effective_show_iteration_path
                                 ):
                                     real_figure = _strip_plotly_color_references(real_figure)
-                                _plotly_chart_with_colorbars(
-                                    _sized_plot_container(st, plot_width_percent),
+                                _render_downloadable_plotly(
+                                    st,
                                     real_figure,
-                                    use_container_width=True,
                                     key=(
                                         f"bo_real_plot_both_{real_plot_state_key}_"
                                         f"{channel}_{real_metric}_{real_x}_{real_scope_key}"
                                     ),
+                                    file_stem=(
+                                        f"real_data_plot_both_{real_plot_state_key}_"
+                                        f"{channel}_{real_metric}_{real_x}_{real_scope_key}"
+                                    ),
+                                    width_percent=plot_width_percent,
                                 )
                         else:
                             real_figure = _plot_real_data_both_1d(
@@ -39391,15 +39374,20 @@ def render_bo_session_app() -> None:
                                 and not real_effective_show_iteration_path
                             ):
                                 real_figure = _strip_plotly_color_references(real_figure)
-                            _plotly_chart_with_colorbars(
-                                _sized_plot_container(st, plot_width_percent),
+                            _render_downloadable_plotly(
+                                st,
                                 real_figure,
-                                use_container_width=True,
                                 key=(
                                     f"bo_real_plot_both_{real_plot_state_key}_"
                                     f"{real_metric}_{real_x}_{real_channel_mode}_"
                                     f"{real_scope_key}"
                                 ),
+                                file_stem=(
+                                    f"real_data_plot_both_{real_plot_state_key}_"
+                                    f"{real_metric}_{real_x}_{real_channel_mode}_"
+                                    f"{real_scope_key}"
+                                ),
+                                width_percent=plot_width_percent,
                             )
                     elif real_phase == "both":
                         buffer_column, target_column = st.columns(2)
@@ -39563,11 +39551,12 @@ def render_bo_session_app() -> None:
                                                     display_width_percent=100,
                                                 )
                                     else:
-                                        _plotly_chart_with_colorbars(
-                                            _sized_plot_container(column, plot_width_percent),
+                                        _render_downloadable_plotly(
+                                            column,
                                             real_figure,
-                                            use_container_width=True,
                                             key=plot_key,
+                                            file_stem=plot_key,
+                                            width_percent=plot_width_percent,
                                         )
                                         render_real_swv_traces(
                                             column,
@@ -39682,11 +39671,12 @@ def render_bo_session_app() -> None:
                                     series_points,
                                 )
                             else:
-                                _plotly_chart_with_colorbars(
-                                    _sized_plot_container(st, plot_width_percent),
+                                _render_downloadable_plotly(
+                                    st,
                                     real_figure,
-                                    use_container_width=True,
                                     key=plot_key,
+                                    file_stem=plot_key,
+                                    width_percent=plot_width_percent,
                                 )
                                 render_real_swv_traces(
                                     st,
@@ -40040,13 +40030,9 @@ def render_bo_session_app() -> None:
                                             slice_axis=real_2d_slice_column,
                                             slice_value=sweep_value,
                                         )
-                                        _plotly_chart_with_colorbars(
-                                            _sized_plot_container(
-                                                sweep_container,
-                                                plot_width_percent,
-                                            ),
+                                        _render_downloadable_plotly(
+                                            sweep_container,
                                             sweep_figure,
-                                            use_container_width=True,
                                             key=(
                                                 f"bo_real_slice_sweep_{real_plot_state_key}_"
                                                 f"{sweep_phase}_{sweep_series_name}_"
@@ -40054,6 +40040,14 @@ def render_bo_session_app() -> None:
                                                 f"{real_channel_mode}_{real_scope_key}_"
                                                 f"{sweep_token}_{real_2d_sweep_token}"
                                             ),
+                                            file_stem=(
+                                                f"real_data_slice_sweep_{real_plot_state_key}_"
+                                                f"{sweep_phase}_{sweep_series_name}_"
+                                                f"{real_metric}_{real_x}_{real_y}_"
+                                                f"{real_channel_mode}_{real_scope_key}_"
+                                                f"{sweep_token}_{real_2d_sweep_token}"
+                                            ),
+                                            width_percent=plot_width_percent,
                                         )
 
                     if real_view == "3D tensor" and not count_mode:
