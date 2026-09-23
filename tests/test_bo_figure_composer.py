@@ -429,6 +429,24 @@ def test_add_to_composer_queues_exact_plot_and_current_settings():
     assert state["bo_composer_capture_id_0"] == capture_id
 
 
+def test_add_to_composer_accepts_plotly_source_without_server_png():
+    state = {}
+    figure = viewer.go.Figure(viewer.go.Scatter(x=[1, 2], y=[3, 4]))
+
+    with patch.object(viewer.st, "session_state", state):
+        capture_id = viewer._queue_plot_for_composer(
+            None,
+            label="Browser-rendered plot",
+            file_stem="browser_plot",
+            figure=figure,
+        )
+
+    capture = state["bo_composer_captured_plots"][capture_id]
+    assert capture["png_bytes"] is None
+    assert capture["source_figure"] is figure
+    assert state["bo_composer_pending_captures"] == [capture_id]
+
+
 def test_captured_plot_is_inserted_as_figure_a_and_shifts_existing_panels():
     state = {
         "bo_composer_count": 2,

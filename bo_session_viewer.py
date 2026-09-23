@@ -1978,6 +1978,10 @@ def _observation_table(session: dict) -> pd.DataFrame:
             # paired sessions stored a Classic Q value in quality.Q_run.
             "Q_run": obs.get("Q_run", quality.get("Q_run")),
             "objective": obs.get("objective"),
+            "method_id": obs.get("method_id"),
+            "optimization_direction": _saved_observation_optimization_direction(
+                session, obs,
+            ),
             "completed_at": obs.get("completed_at"),
         }
         row.update(obs.get("params") or {})
@@ -2059,18 +2063,32 @@ def _observation_table(session: dict) -> pd.DataFrame:
         errors="coerce",
     ).fillna(1).astype(int)
     history_iteration = pd.to_numeric(history["iteration"], errors="coerce")
+    matched_indices = set()
+    unmatched_rows = []
     for _, row in observation_frame.iterrows():
         mask = (
             (history_group == int(row.get("group_id", 1)))
             & (history_iteration == int(row["iteration"]))
         )
-        matching = history.index[mask]
-        if matching.empty:
+        # A group can evaluate both directions at the same iteration. Match
+        # the saved identity before overlaying scores, and never reuse a row.
+        for identity in ("method_id", "optimization_direction", "objective"):
+            value = row.get(identity)
+            if pd.notna(value) and identity in history.columns:
+                candidates = history.loc[mask, identity]
+                if candidates.notna().any():
+                    mask &= history[identity].astype(str).eq(str(value))
+        matching = [index for index in history.index[mask] if index not in matched_indices]
+        if not matching:
+            unmatched_rows.append(row.to_dict())
             continue
         index = matching[0]
+        matched_indices.add(index)
         for column, value in row.items():
             if pd.notna(value):
                 history.at[index, column] = value
+    if unmatched_rows:
+        history = pd.concat([history, pd.DataFrame(unmatched_rows)], ignore_index=True)
     return add_best_q_column(history)
 
 
@@ -2089,20 +2107,97 @@ def _numeric_columns(frame: pd.DataFrame) -> list[str]:
 
 
 def _channel_metric_columns(frame: pd.DataFrame) -> dict[str, dict[str, str]]:
-    """Return metric -> channel -> history-column mappings."""
+    """Return numeric channel series, including constant and single-point series."""
     metrics: dict[str, dict[str, str]] = {}
     for column in frame.columns:
-        q_match = re.fullmatch(r"Q_ch(\d+)", str(column), re.IGNORECASE)
-        component_match = re.fullmatch(r"ch(\d+)_(.+)", str(column), re.IGNORECASE)
+        q_match = re.fullmatch(r"Q_ch(\d+(?:_(?:max|min))?)", str(column), re.IGNORECASE)
+        component_match = re.fullmatch(r"ch(\d+(?:_(?:max|min))?)_(.+)", str(column), re.IGNORECASE)
         if q_match:
             channel, metric = q_match.group(1), "Q_channel"
         elif component_match:
             channel, metric = component_match.group(1), component_match.group(2)
         else:
             continue
-        if pd.to_numeric(frame[column], errors="coerce").nunique(dropna=True) > 1:
+        if pd.to_numeric(frame[column], errors="coerce").notna().any():
             metrics.setdefault(metric, {})[channel] = column
     return metrics
+
+
+def _history_channel_series(
+    frame: pd.DataFrame,
+    metric: str,
+    channel_metrics: dict[str, dict[str, str]],
+    selected_channels: Sequence[str],
+) -> tuple[pd.DataFrame, str, dict[str, str], bool]:
+    """Resolve channel scores or scope shared run values to each channel's rows."""
+    channel_metric = "Q_channel" if metric == "Q_run" else metric
+    if channel_metric in channel_metrics:
+        return frame, channel_metric, channel_metrics[channel_metric], False
+    if metric not in frame.columns:
+        return frame, metric, {}, False
+
+    result = frame.copy()
+    columns = {}
+    for channel in selected_channels:
+        mask = pd.Series(False, index=frame.index)
+        if "ground_truth_channel" in frame.columns:
+            mask |= frame["ground_truth_channel"].map(
+                _simulation_channel_identity_text
+            ).eq(str(channel))
+        if "channels" in frame.columns:
+            mask |= frame["channels"].fillna("").astype(str).map(
+                lambda value: str(channel) in {
+                    part.strip() for part in value.split(",")
+                }
+            )
+        # Expanded analysis channels may not appear in the physical-channel list.
+        for metric_columns in channel_metrics.values():
+            if channel in metric_columns:
+                mask |= pd.to_numeric(
+                    frame[metric_columns[channel]], errors="coerce"
+                ).notna()
+        values = pd.to_numeric(frame[metric], errors="coerce").where(mask)
+        if values.notna().any():
+            column = f"__history_channel_{channel}"
+            result[column] = values
+            columns[channel] = column
+    return result, metric, columns, True
+
+
+def _history_channels_by_direction(
+    frame: pd.DataFrame,
+    channel_columns: dict[str, str],
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Expose each saved channel/direction pair as an independently selectable series."""
+    if "optimization_direction" not in frame.columns:
+        return frame, channel_columns
+    directions = frame["optimization_direction"].fillna("").astype(str).str.strip().str.lower()
+    result = frame.copy()
+    columns = {}
+    for channel, source in channel_columns.items():
+        values = pd.to_numeric(frame[source], errors="coerce")
+        for direction in sorted(directions.loc[values.notna()].unique()):
+            label = f"{channel} · {direction.capitalize() or 'Unspecified direction'}"
+            column = f"__history_direction_{len(columns)}"
+            result[column] = values.where(directions.eq(direction))
+            columns[label] = column
+    return result, columns
+
+
+def _history_channel_display_control(
+    key: str, *, global_metric: bool, has_channels: bool,
+) -> str:
+    options = ["Overlay selected channels", "Separate plots", "Average selected channels"]
+    if global_metric:
+        options.insert(0, "Run-level series")
+    _preserve_valid_widget_value(key, options, options[0])
+    return st.radio(
+        "Channel display",
+        options,
+        horizontal=True,
+        key=key,
+        disabled=not has_channels,
+    )
 
 
 def _best_q_parameters_by_channel_frame(
@@ -2152,9 +2247,9 @@ def _best_q_parameters_by_channel_frame(
     )
     for preferred_metric in preferred_metrics:
         for column in history.columns:
-            q_match = re.fullmatch(r"Q_ch(\d+)", str(column), re.IGNORECASE)
+            q_match = re.fullmatch(r"Q_ch(\d+(?:_(?:max|min))?)", str(column), re.IGNORECASE)
             component_match = re.fullmatch(
-                r"ch(\d+)_(.+)",
+                r"ch(\d+(?:_(?:max|min))?)_(.+)",
                 str(column),
                 re.IGNORECASE,
             )
@@ -3088,6 +3183,125 @@ def _add_moving_average_traces(
     return fig
 
 
+def _history_point_data(rows: pd.DataFrame, *, channel_series: bool = False) -> list[list]:
+    """Attach source identity only to points representing actual observations."""
+    result = []
+    for row in rows.to_dict("records"):
+        group = _finite_float(row.get("group_id", 1))
+        channel = str(row.get("channel", "")) if channel_series else ""
+        raw_direction = row.get("direction", row.get("optimization_direction"))
+        direction = "" if pd.isna(raw_direction) else str(raw_direction)
+        method = row.get("method_id")
+        method = "" if pd.isna(method) else str(method)
+        if channel == "average" or group is None:
+            result.append([])
+            continue
+        result.append([
+            "bo_history", int(row["iteration"]), int(group),
+            channel.split(" · ")[0], direction.lower(),
+            method if not channel_series else "",
+        ])
+    return result
+
+
+def _history_swv_selection(event: Any, observations: list[dict]) -> dict | None:
+    """Resolve a clicked raw point without guessing between duplicate runs."""
+    points = (event or {}).get("selection", {}).get("points", [])
+    if len(points) != 1:
+        return None
+    data = points[0].get("customdata")
+    if not isinstance(data, (list, tuple)) or len(data) != 6 or data[0] != "bo_history":
+        return None
+    _, iteration, group, channel, direction, method = data
+    matches = [obs for obs in observations if (
+        obs.get("group_id", 1) == group and obs.get("iteration") == iteration
+        and (not direction or str(obs.get("optimization_direction") or "").lower() == direction)
+        and (not method or str(obs.get("method_id") or "") == method)
+    )]
+    if len(matches) != 1:
+        return None
+    return {"group_id": group, "iteration": iteration, "channel": channel,
+            "direction": direction, "method_id": str(matches[0].get("method_id") or "")}
+
+
+def _handle_history_swv_selection(chart_key: str, observations: list[dict]) -> None:
+    """Handle the chart that fired the event, rather than replaying saved selections."""
+    event = st.session_state.get(chart_key) or {}
+    points = event.get("selection", {}).get("points", [])
+    previous_key = f"bo_history_selection_{chart_key}"
+    previous_points = st.session_state.get(previous_key, [])
+    st.session_state[previous_key] = points
+    st.session_state.pop("bo_history_swv_selection_message", None)
+    if not points:
+        return
+    # Plotly can retain selections from other traces. A single newly added
+    # point identifies this click even when the event includes earlier points.
+    added_points = [point for point in points if point not in previous_points]
+    if not added_points:
+        return
+    clicked_points = added_points if len(points) > 1 else points
+    selection = _history_swv_selection(
+        {"selection": {"points": clicked_points}}, observations,
+    )
+    if selection is not None:
+        st.session_state["bo_history_swv_request"] = selection
+    elif added_points:
+        st.session_state["bo_history_swv_selection_message"] = (
+            "This selection does not identify a single observation. "
+            "Choose an individual channel and group point to load SWV traces."
+        )
+
+
+def _consume_history_swv_request() -> dict | None:
+    """Keep click navigation separate from the shared observation/history controls."""
+    selection = st.session_state.pop("bo_history_swv_request", None)
+    if selection is not None:
+        st.session_state["bo_history_swv_focus"] = selection
+        st.session_state["bo_history_swv_render_request"] = selection
+    return selection
+
+
+def _activate_swv_traces_tab() -> None:
+    # Streamlit 1.40 has no programmatic tab-selection API. This one-shot
+    # component selects the existing BO tab without rebuilding the tab group.
+    # A nonce allows repeated clicks to issue distinct navigation requests.
+    components.html(
+        """
+        <script>
+        // Navigation request: NAVIGATION_NONCE
+        const doc = window.parent.document;
+        let attempts = 0;
+        function activate() {
+            const tabLists = [...doc.querySelectorAll('[role="tablist"]')];
+            for (const list of tabLists) {
+                const tabs = [...list.querySelectorAll('[role="tab"]')];
+                if (!tabs.some(tab => tab.textContent.trim() === 'History & scores')) continue;
+                const target = tabs.find(tab => tab.textContent.trim() === 'SWV traces');
+                if (!target) continue;
+                target.click();
+                target.scrollIntoView({block: 'start', behavior: 'smooth'});
+                return;
+            }
+            if (++attempts < 100) window.setTimeout(activate, 50);
+        }
+        activate();
+        </script>
+        """.replace("NAVIGATION_NONCE", str(time.time_ns())),
+        height=0,
+    )
+
+
+def _history_swv_observation_matches(observation: dict, selection: dict) -> bool:
+    return (
+        observation.get("group_id", 1) == selection["group_id"]
+        and observation.get("iteration") == selection["iteration"]
+        and (not selection["direction"] or
+             str(observation.get("optimization_direction") or "").lower() == selection["direction"])
+        and (not selection["method_id"] or
+             str(observation.get("method_id") or "") == selection["method_id"])
+    )
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _plot_trend(
     frame: pd.DataFrame,
@@ -3332,7 +3546,7 @@ def _plot_trend(
                     marker=marker or None,
                     line={"color": group_color} if group_color else None,
                     opacity=trace_opacity,
-                    customdata=iterations,
+                    customdata=_history_point_data(rows),
                     hovertemplate=(
                         f"{group_name}<br>Iteration %{{x}}<br>"
                         f"{metric}: %{{y:.4g}}<extra></extra>"
@@ -3430,7 +3644,7 @@ def _plot_trend(
             marker=marker,
             line={"color": group_color} if group_color else None,
             opacity=trace_opacity,
-            customdata=iterations,
+            customdata=_history_point_data(rows),
             hovertemplate=(
                 f"{group_name}<br>Iteration %{{x}}<br>"
                 f"{metric}: %{{y:.4g}}<extra></extra>"
@@ -5412,6 +5626,9 @@ def _plot_channel_trend(
         if "group_name" in frame.columns
         else pd.Series("", index=frame.index)
     )
+    directions = frame.get(
+        "optimization_direction", pd.Series("", index=frame.index),
+    ).fillna("").astype(str).str.strip().str.lower()
     records = []
     frame_channels = (
         frame["ground_truth_channel"].map(_simulation_channel_identity_text)
@@ -5429,8 +5646,10 @@ def _plot_channel_trend(
         if channel in channel_columns
     ]
     shared_global_column = (
-        len(selected_column_names) > 1
-        and len(set(selected_column_names)) < len(selected_column_names)
+        any(
+            column in frame.columns and column == metric
+            for column in selected_column_names
+        )
     )
     for channel in selected_channels:
         values = pd.to_numeric(frame[channel_columns[channel]], errors="coerce")
@@ -5449,6 +5668,7 @@ def _plot_channel_trend(
                 "group_id": group_id,
                 "group_name": group_name,
                 "channel": str(channel),
+                "direction": directions.loc[index],
             })
     data = pd.DataFrame(records)
     if data.empty:
@@ -5462,7 +5682,7 @@ def _plot_channel_trend(
 
     # Normalize duplicate rows before applying either display-level average.
     data = data.groupby(
-        ["group_id", "group_name", "channel", "iteration"],
+        ["group_id", "group_name", "channel", "direction", "iteration"],
         as_index=False,
         dropna=False,
     )["value"].mean()
@@ -5499,7 +5719,7 @@ def _plot_channel_trend(
             fig.update_layout(height=340)
             return fig
         data = data.groupby(
-            ["average_value", "channel", "iteration"],
+            ["average_value", "channel", "direction", "iteration"],
             as_index=False,
         ).agg(aggregation)
         data["group_id"] = [
@@ -5520,7 +5740,7 @@ def _plot_channel_trend(
         if "reference_value" in data.columns:
             aggregation["reference_value"] = "mean"
         data = data.groupby(
-            ["channel", "iteration"],
+            ["channel", "direction", "iteration"],
             as_index=False,
         ).agg(aggregation)
         data["group_id"] = "__average__"
@@ -5533,7 +5753,7 @@ def _plot_channel_trend(
         if "reference_value" in data.columns:
             value_columns["reference_value"] = "mean"
         data = data.groupby(
-            ["group_id", "group_name", "iteration"],
+            ["group_id", "group_name", "direction", "iteration"],
             as_index=False,
             dropna=False,
         ).agg(value_columns)
@@ -5589,7 +5809,7 @@ def _plot_channel_trend(
         elif separate_channels:
             facet_data = data[data["channel"] == facet_key]
 
-        series_columns = []
+        series_columns = ["direction"]
         if not separate_groups and facet_data["group_id"].nunique(dropna=False) > 1:
             series_columns.extend(["group_id", "group_name"])
         if not separate_channels and facet_data["channel"].nunique() > 1:
@@ -5615,6 +5835,11 @@ def _plot_channel_trend(
                 name_parts.append("channel average")
             elif not separate_channels:
                 name_parts.append(f"Ch {channel}")
+            direction = str(rows["direction"].iloc[0])
+            if direction and not (
+                not separate_channels and channel.endswith(f" · {direction.capitalize()}")
+            ):
+                name_parts.append(direction.capitalize())
             trace_name = " · ".join(name_parts) or (
                 f"Ch {channel}" if channel != "average" else "Channel average"
             )
@@ -5650,9 +5875,12 @@ def _plot_channel_trend(
                 mode="lines+markers",
                 name=trace_name,
                 marker=marker or None,
-                line={"color": group_color} if group_color else None,
+                line={
+                    **({"color": group_color} if group_color else {}),
+                    "dash": "dash" if direction == "minimize" else "solid",
+                },
                 opacity=trace_opacity,
-                customdata=rows["iteration"],
+                customdata=_history_point_data(rows, channel_series=True),
                 hovertemplate=(
                     f"{trace_name}<br>Iteration %{{x}}<br>"
                     f"{label}: %{{y:.4g}}<extra></extra>"
@@ -5765,13 +5993,29 @@ def _plot_channel_trend(
     return _apply_plotly_colorbar_height(fig)
 
 
+def _plotly_array_values(values: Any) -> np.ndarray:
+    """Read ordinary arrays and Plotly's JSON-encoded numeric arrays."""
+    if values is None:
+        return np.asarray([])
+    if isinstance(values, Mapping) and "bdata" in values and "dtype" in values:
+        decoded = np.frombuffer(
+            base64.b64decode(values["bdata"]), dtype=np.dtype(values["dtype"]),
+        )
+        shape = values.get("shape")
+        if shape is not None:
+            dimensions = shape.split(",") if isinstance(shape, str) else shape
+            decoded = decoded.reshape(tuple(int(size) for size in dimensions))
+        return decoded
+    return np.asarray(values)
+
+
 def _figure_y_bounds(fig: go.Figure) -> tuple[float, float] | None:
     values = []
     for trace in fig.data:
         y_values = getattr(trace, "y", None)
         if y_values is None:
             continue
-        numeric = pd.to_numeric(pd.Series(y_values), errors="coerce")
+        numeric = pd.to_numeric(pd.Series(_plotly_array_values(y_values)), errors="coerce")
         values.extend(numeric[np.isfinite(numeric)].tolist())
     if not values:
         return None
@@ -9912,7 +10156,7 @@ def _clicked_iteration(event: Any) -> int | None:
     point = points[-1]
     raw = point.get("customdata", point.get("x"))
     if isinstance(raw, (list, tuple)):
-        raw = raw[0] if raw else None
+        raw = raw[1] if len(raw) == 6 and raw[0] == "bo_history" else (raw[0] if raw else None)
     try:
         return int(raw)
     except (TypeError, ValueError):
@@ -17504,16 +17748,21 @@ def _group_qualified_trace(
     trace: dict,
     include_group: bool,
 ) -> dict:
-    if not include_group:
+    """Keep saved optimization directions distinct in SWV channel selectors."""
+    direction = str(trace.get("optimization_direction") or "").strip().lower()
+    if not include_group and not direction:
         return trace
-    group_name = str(
-        observation.get("group_name")
-        or f"Group {observation.get('group_id', 1)}"
-    )
+    label_parts = []
+    if include_group:
+        label_parts.append(str(
+            observation.get("group_name")
+            or f"Group {observation.get('group_id', 1)}"
+        ))
+    label_parts.append(_trace_channel_label(trace["channel"]))
+    if direction:
+        label_parts.append(direction)
     qualified = dict(trace)
-    qualified["display_channel"] = (
-        f"{group_name} · {_trace_channel_label(trace['channel'])}"
-    )
+    qualified["display_channel"] = " · ".join(label_parts)
     return qualified
 
 
@@ -18172,6 +18421,31 @@ def _classic_active_input_lines(
     return lines
 
 
+def _trace_score_phase_metrics(metrics_by_channel: Mapping[str, Any]) -> dict:
+    """Complete missing scoring summaries from the replicate peaks in the panel."""
+    completed = {}
+    for channel, raw_metrics in metrics_by_channel.items():
+        metrics = dict(raw_metrics or {})
+        raw_peaks = metrics.get("peak_currents_uA")
+        peaks = [
+            numeric for value in raw_peaks
+            if (numeric := _finite_float(value)) is not None
+        ] if isinstance(raw_peaks, (list, tuple, np.ndarray, pd.Series)) else []
+        if peaks:
+            # Trace backfilling supplies replicate lists, but the scorer also
+            # needs phase means and counts. Missing means otherwise become
+            # zero, even while the panel displays nonzero peak differences.
+            for key, value in {
+                "mean_peak_current_uA": float(np.mean(peaks)),
+                "std_peak_current_uA": _rescore_sample_std(peaks),
+                "ok_scan_count": len(peaks),
+            }.items():
+                if _finite_float(metrics.get(key)) is None:
+                    metrics[key] = value
+        completed[channel] = metrics
+    return completed
+
+
 def _paired_iteration_q_score_lines(
     observation: Mapping[str, Any],
     channels: Sequence[str],
@@ -18201,19 +18475,19 @@ def _paired_iteration_q_score_lines(
     snr_definition = str(
         paired_weights.get("repeat_scan_snr_definition", "original") or "original"
     ).strip().lower()
-    direction = _rescore_group_direction(
+    direction = _saved_observation_optimization_direction({}, observation) or _rescore_group_direction(
         config,
         int(observation.get("group_id", 1) or 1),
     )
     allowed_channels = _rescore_observation_channels(observation, config)
-    buffer_all = _scoped_rescore_metrics(
+    buffer_all = _trace_score_phase_metrics(_scoped_rescore_metrics(
         observation.get("buffer_channel_metrics") or {},
         allowed_channels,
-    )
-    target_all = _scoped_rescore_metrics(
+    ))
+    target_all = _trace_score_phase_metrics(_scoped_rescore_metrics(
         observation.get("target_channel_metrics") or {},
         allowed_channels,
-    )
+    ))
     derived_quality = _rescore_paired_quality(
         buffer_all,
         target_all,
@@ -18225,6 +18499,9 @@ def _paired_iteration_q_score_lines(
         (observation.get("quality") or {}).get("channel_components") or {}
     )
     for saved_channel, saved_component in saved_components.items():
+        if str(saved_channel) not in derived_components:
+            # Saved display aliases (e.g. 2_min) are not extra run channels.
+            continue
         saved_differences = (saved_component or {}).get(
             "pairwise_peak_differences_uA"
         )
@@ -18580,7 +18857,7 @@ def _observation_with_trace_peak_replicates(
         phase = str(item.get("phase") or "").strip().lower()
         if phase not in {"buffer", "target"}:
             continue
-        channel = str(_trace_channel_key(dict(item)))
+        channel = str(item["channel"])
         path_value = item.get("path")
         if path_value is None:
             continue
@@ -18715,7 +18992,7 @@ def _observation_with_plotted_peak_replicates(
             np.nanpercentile(values, 99) - np.nanpercentile(values, 5)
         )
         phase = str(item.get("phase") or "").strip().lower()
-        channel = str(_trace_channel_key(dict(item)))
+        channel = str(item["channel"])
         source_name = f"{phase}_channel_metrics"
         source = enriched.get(source_name)
         if not isinstance(source, dict):
@@ -23227,13 +23504,13 @@ def _plot_colormap_override_is_valid() -> bool:
 
 
 def _plot_height_px(kind: str) -> int:
-    defaults = {"1d": 420, "2d": 560, "3d": 620}
+    defaults = {"1d": 600, "2d": 560, "3d": 620}
     key = f"bo_plot_{kind}_height"
     return int(max(220, min(1800, float(st.session_state.get(key, defaults.get(kind, 420)) or defaults.get(kind, 420)))))
 
 
 def _plot_width_px() -> int:
-    return int(max(500, min(2600, float(st.session_state.get("bo_plot_width_px", 960) or 960))))
+    return int(max(500, min(2600, float(st.session_state.get("bo_plot_width_px", 1200) or 1200))))
 
 
 def _plot_perimeter_width() -> float:
@@ -26421,9 +26698,9 @@ def _history_plotly_to_matplotlib(
         ))
         if axis is None:
             continue
-        x_values = list(trace.x) if trace.x is not None else []
+        x_values = _plotly_array_values(trace.x)
         y_values = pd.to_numeric(
-            pd.Series(list(trace.y) if trace.y is not None else []),
+            pd.Series(_plotly_array_values(trace.y)),
             errors="coerce",
         ).to_numpy()
         if len(x_values) != len(y_values):
@@ -26545,7 +26822,7 @@ def _history_plotly_to_matplotlib(
 
 
 def _queue_plot_for_composer(
-    png_bytes: bytes,
+    png_bytes: bytes | None,
     *,
     label: str,
     file_stem: str,
@@ -26568,10 +26845,16 @@ def _queue_plot_for_composer(
         raise ValueError("Figure Composer already has 12 panels queued or in use.")
     reserved_index = len(pending)
     reserved_label = chr(ord("A") + reserved_index)
+    captured_png = (
+        bytes(png_bytes)
+        if isinstance(png_bytes, (bytes, bytearray))
+        else None
+    )
     capture_id = hashlib.sha256(
-        png_bytes
+        (captured_png or b"")
         + str(file_stem).encode("utf-8", errors="replace")
         + reserved_label.encode("ascii")
+        + str(time.time_ns()).encode("ascii")
     ).hexdigest()[:16]
     registry_key = "bo_composer_captured_plots"
     registry = st.session_state.get(registry_key)
@@ -26580,7 +26863,7 @@ def _queue_plot_for_composer(
     registry[capture_id] = {
         "label": str(label or file_stem or "Captured plot"),
         "file_stem": str(file_stem or "captured_plot"),
-        "png_bytes": bytes(png_bytes),
+        "png_bytes": captured_png,
         # Keep the in-memory source object so the Composer can render it at
         # the final panel size/DPI and apply presentation overrides. This is
         # intentionally excluded from portable metadata and is not converted
@@ -26651,7 +26934,7 @@ def _queue_plot_for_composer(
 
 def _render_add_to_composer_button(
     container,
-    png_bytes: bytes,
+    png_bytes: bytes | None,
     *,
     key: str,
     file_stem: str,
@@ -26661,6 +26944,8 @@ def _render_add_to_composer_button(
     label: str = "",
 ) -> None:
     """Render a reusable action that snapshots the current configured plot."""
+    if not callable(getattr(container, "button", None)):
+        return
     title = (
         _plain_plotly_text(getattr(figure.layout.title, "text", ""))
         if isinstance(figure, go.Figure)
@@ -26700,7 +26985,7 @@ def _render_add_to_composer_button(
 
 def _add_plot_to_composer_callback(
     *,
-    png_bytes: bytes,
+    png_bytes: bytes | None,
     label: str,
     file_stem: str,
     figure: go.Figure | plt.Figure | None,
@@ -26747,6 +27032,8 @@ def _render_downloadable_plotly(
     eager_png: bool = True,
     individual_plot_settings: bool = False,
     individual_plot_settings_heading: str = "Plot settings",
+    interactive_history: bool = False,
+    history_observations: list[dict] | None = None,
 ) -> Any:
     settings_prefix = f"{key}_individual_plot"
     default_height = min(
@@ -26837,7 +27124,23 @@ def _render_downloadable_plotly(
             dpi=100,
             apply_global_style=False,
         )
-        plot_column.image(png_bytes, width=effective_export_width)
+        event = None
+        if interactive_history:
+            fig.update_layout(
+                width=effective_export_width, clickmode="event+select", uirevision=key,
+            )
+            chart_key = f"{key}_interactive"
+
+            def history_selection_callback() -> None:
+                _handle_history_swv_selection(chart_key, history_observations)
+
+            event = plot_column.plotly_chart(
+                fig, use_container_width=False,
+                on_select=(history_selection_callback if history_observations is not None else on_select),
+                selection_mode=selection_mode, key=chart_key,
+            )
+        else:
+            plot_column.image(png_bytes, width=effective_export_width)
         _render_browser_download_link(
             plot_column,
             "Download plot",
@@ -26862,7 +27165,7 @@ def _render_downloadable_plotly(
         )
         if settings_submitted:
             st.rerun()
-        return None
+        return event
     _apply_plotly_colorbar_height(fig)
     fig.update_layout(width=effective_export_width, autosize=False)
     if not individual_plot_settings:
@@ -26880,39 +27183,52 @@ def _render_downloadable_plotly(
             export_height=effective_export_height,
             shared_camera_storage_key=shared_camera_storage_key,
             apply_sync_nonce=apply_sync_nonce,
-            show_download=False,
+            show_download=True,
         )
         event = None
         download_camera = _stored_plotly_camera(camera_storage_key) or rendered_camera
         download_fig = go.Figure(fig)
         _apply_plotly_camera(download_fig, download_camera)
-        try:
-            png_bytes = _plotly_png_bytes(
-                download_fig,
-                width=effective_export_width,
-                height=effective_export_height,
+        _render_add_to_composer_button(
+            plot_column,
+            None,
+            key=key,
+            file_stem=file_stem,
+            figure=download_fig,
+            camera=download_camera,
+        )
+        eager_png = False
+    elif on_select == "ignore" and eager_png:
+        # Export in the browser so a missing Kaleido installation cannot hide
+        # the download control for ordinary interactive plots.
+        def render_download_component():
+            return _plotly_camera_capture(
+                figure=json.loads(json.dumps(
+                    fig.to_plotly_json(), cls=PlotlyJSONEncoder,
+                )),
+                camera_enabled=False,
+                show_cache_view=False,
+                show_download=True,
+                height=int(fig.layout.height or effective_export_height),
+                download_file_stem=_safe_download_stem(file_stem),
+                download_width=effective_export_width,
+                download_height=effective_export_height,
+                default=None,
+                key=f"{chart_key}_download_component",
             )
-            _render_browser_download_link(
-                plot_column,
-                "Download plot",
-                png_bytes,
-                file_name=f"{_safe_download_stem(file_stem)}.png",
-                mime="image/png",
-            )
-            _render_add_to_composer_button(
-                plot_column,
-                png_bytes,
-                key=key,
-                file_stem=file_stem,
-                figure=download_fig,
-                camera=download_camera,
-            )
-            if download_camera is None:
-                plot_column.caption(
-                    "Click Cache view after rotating to export the current perspective."
-                )
-        except RuntimeError as exc:
-            plot_column.caption(str(exc))
+        if hasattr(plot_column, "__enter__") and hasattr(plot_column, "__exit__"):
+            with plot_column:
+                render_download_component()
+        else:
+            render_download_component()
+        event = None
+        _render_add_to_composer_button(
+            plot_column,
+            None,
+            key=key,
+            file_stem=file_stem,
+            figure=fig,
+        )
         eager_png = False
     else:
         event = plot_column.plotly_chart(
@@ -27084,6 +27400,10 @@ def _reset_bo_group_channel_selector_defaults(session_token: str) -> None:
     exact_keys = {
         "bo_channel_group_scope",
         "bo_channel_group_scope__preferred",
+        "bo_history_swv_focus",
+        "bo_history_swv_request",
+        "bo_history_swv_render_request",
+        "bo_history_swv_selection_message",
         "bo_observation_group_scope",
         "bo_observation_group_scope__preferred",
         "bo_observation_group_scope_compact_session",
@@ -27091,6 +27411,7 @@ def _reset_bo_group_channel_selector_defaults(session_token: str) -> None:
         "bo_surrogate_pref_groups",
     }
     prefixes = (
+        "bo_history_selection_",
         "bo_trend_channels_",
         "bo_hp_response_channels_",
         "bo_paired_channels_",
@@ -30421,10 +30742,10 @@ def _composer_draw_captured_plot(
     registry = st.session_state.get("bo_composer_captured_plots")
     capture_id = str(spec.get("capture_id") or "")
     capture = registry.get(capture_id) if isinstance(registry, Mapping) else None
-    png_bytes = capture.get("png_bytes") if isinstance(capture, Mapping) else None
-    if not isinstance(png_bytes, (bytes, bytearray)):
+    if not isinstance(capture, Mapping):
         _composer_error_panel(ax, "This captured plot is no longer in this session.")
         return
+    png_bytes = capture.get("png_bytes")
     source_figure = (
         _composer_formatted_capture_figure(capture, spec)
         if bool(spec.get("capture_rerender_source", True))
@@ -30438,6 +30759,12 @@ def _composer_draw_captured_plot(
             spec["rect"],
             render_dpi,
             text_size,
+        )
+        return
+    if not isinstance(png_bytes, (bytes, bytearray)):
+        _composer_error_panel(
+            ax,
+            "This captured plot has no reusable source or raster fallback.",
         )
         return
     try:
@@ -32369,16 +32696,16 @@ def render_bo_session_app() -> None:
             legacy_width_percent = _finite_float(
                 st.session_state.get(
                     "bo_plot_width_percent__preferred",
-                    st.session_state.get("bo_plot_width_percent", 80),
+                    st.session_state.get("bo_plot_width_percent", 100),
                 )
             )
             st.session_state["bo_plot_width_px"] = int(
-                round(1200 * float(legacy_width_percent or 80) / 100)
+                round(1200 * float(legacy_width_percent or 100) / 100)
             )
         _prepare_numeric_widget_preference(
             "bo_plot_width_px",
             "bo_plot_width_px__preferred",
-            default=960,
+            default=1200,
             minimum=500,
             maximum=2200,
             cast=int,
@@ -32387,7 +32714,7 @@ def render_bo_session_app() -> None:
             "Plot width",
             min_value=500,
             max_value=2200,
-            value=960,
+            value=1200,
             step=20,
             format="%d px",
             help="Exact plot width in pixels for both browser display and downloaded PNGs.",
@@ -32397,7 +32724,7 @@ def render_bo_session_app() -> None:
         _prepare_numeric_widget_preference(
             "bo_plot_1d_height",
             "bo_plot_1d_height__preferred",
-            default=420,
+            default=600,
             minimum=240,
             maximum=1200,
             cast=int,
@@ -32406,7 +32733,7 @@ def render_bo_session_app() -> None:
             "1D plot height",
             min_value=240,
             max_value=1200,
-            value=420,
+            value=600,
             step=20,
             format="%d px",
             help="Canvas height used for line, trend, trace, and other 1D-style plots.",
@@ -32959,6 +33286,7 @@ def render_bo_session_app() -> None:
         observation_group_metadata,
         set(observation_group_ids),
     )
+    history_swv_request = _consume_history_swv_request()
     observation_selector_columns = st.columns(2)
     with observation_selector_columns[0]:
         observation_group_options = [
@@ -33064,6 +33392,8 @@ def render_bo_session_app() -> None:
             "PDF Export",
         ]
     )
+    if history_swv_request is not None:
+        _activate_swv_traces_tab()
     with rescore_tab:
         _render_rescore_q_tab(source_session)
     with metadata_tab:
@@ -33133,13 +33463,46 @@ def render_bo_session_app() -> None:
                 if column.startswith("Optimized ")
                 and column not in optimized_column_config
             })
-            st.dataframe(
-                optimized_parameters,
-                use_container_width=True,
-                height=420,
-                hide_index=True,
-                column_config=optimized_column_config,
+            optimized_table_view = st.radio(
+                "Optimized parameters view",
+                ["Full table", "Interactive table"],
+                horizontal=True,
+                key="bo_optimized_parameters_view",
             )
+            if optimized_table_view == "Full table":
+                table_html = optimized_parameters.to_html(
+                    index=False,
+                    border=0,
+                    classes="bo-optimized-parameters",
+                    escape=True,
+                    na_rep="—",
+                    float_format=lambda value: f"{value:.6g}",
+                    formatters={
+                        "Optimized iteration": lambda value: f"{value:.0f}",
+                        "Optimized objective (Q_run)": lambda value: f"{value:.6g}",
+                    },
+                )
+                st.markdown(
+                    """<style>
+                    table.bo-optimized-parameters {
+                        width: 100%; table-layout: fixed;
+                    }
+                    table.bo-optimized-parameters th,
+                    table.bo-optimized-parameters td {
+                        white-space: normal; overflow-wrap: anywhere;
+                        text-align: left; vertical-align: top;
+                    }
+                    </style>""" + table_html,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.dataframe(
+                    optimized_parameters,
+                    use_container_width=True,
+                    height=35 * (len(optimized_parameters) + 1) + 3,
+                    hide_index=True,
+                    column_config=optimized_column_config,
+                )
             if (optimized_parameters["Optimization direction"] == "Not saved").any():
                 st.warning(
                     "An optimized result is not shown for groups whose optimization "
@@ -33353,6 +33716,13 @@ def render_bo_session_app() -> None:
     with overview:
         @st.fragment
         def _render_history_scores_tab() -> None:
+            # A selection callback runs before this fragment. Refresh the app
+            # so the SWV fragment receives a fresh scope and render request.
+            if st.session_state.get("bo_history_swv_request") is not None:
+                st.rerun(scope="app")
+            selection_message = st.session_state.pop("bo_history_swv_selection_message", None)
+            if selection_message:
+                st.info(selection_message)
             show_trend_observation_group_filter = (
                 bool(
                     ((full_session.get("config") or {}).get("records") or {}).get(
@@ -33451,6 +33821,11 @@ def render_bo_session_app() -> None:
             starting_point_response_history = trend_history.copy()
             trend_channel_options = sorted(
                 {
+                    *{
+                        channel
+                        for columns in _channel_metric_columns(trend_history).values()
+                        for channel in columns
+                    },
                     *(
                         set(trend_history["ground_truth_channel"].dropna().astype(str))
                         if "ground_truth_channel" in trend_history.columns
@@ -33637,38 +34012,26 @@ def render_bo_session_app() -> None:
                     hide_index=True,
                 )
             channel_metrics = _channel_metric_columns(trend_history)
-            if trend_scope_key != "all":
-                selected_trend_groups = [
-                    group for group in groups
-                    if int(group["id"]) in trend_selected_observation_group_ids
-                ]
-                configured_channels = {
-                    str(channel)
-                    for group in selected_trend_groups
-                    for channel in group.get("channels", [])
+            # The scoped history is authoritative: saved analysis channels can
+            # exceed the physical channels listed in the group configuration.
+            if trend_channel_options:
+                channel_metrics = {
+                    metric_name: {
+                        channel: column
+                        for channel, column in columns.items()
+                        if channel in selected_history_channels
+                    }
+                    for metric_name, columns in channel_metrics.items()
                 }
-                if configured_channels:
-                    if trend_channel_options:
-                        configured_channels = configured_channels.intersection(
-                            set(selected_history_channels)
-                        )
-                    channel_metrics = {
-                        metric_name: {
-                            channel: column
-                            for channel, column in columns.items()
-                            if channel in configured_channels
-                        }
-                        for metric_name, columns in channel_metrics.items()
-                    }
-                    channel_metrics = {
-                        metric_name: columns
-                        for metric_name, columns in channel_metrics.items()
-                        if columns
-                    }
+                channel_metrics = {
+                    metric_name: columns
+                    for metric_name, columns in channel_metrics.items()
+                    if columns
+                }
             channel_column_names = {
                 column for column in trend_history.columns
                 if (
-                    re.fullmatch(r"Q_ch\d+", str(column), re.IGNORECASE)
+                    re.fullmatch(r"Q_ch\d+(?:_(?:max|min))?", str(column), re.IGNORECASE)
                     or re.fullmatch(r"ch\d+_.+", str(column), re.IGNORECASE)
                 )
             }
@@ -33695,7 +34058,10 @@ def render_bo_session_app() -> None:
                 metric_choice = st.selectbox(
                     "Trend metric",
                     metric_options,
-                    format_func=lambda choice: _metric_label(choice.split("::", 1)[1]),
+                    format_func=lambda choice: (
+                        f"{_metric_label(choice.split('::', 1)[1])}"
+                        + (" (per channel)" if choice.startswith("channel::") else "")
+                    ),
                     key=trend_metric_key,
                 )
             else:
@@ -33704,83 +34070,44 @@ def render_bo_session_app() -> None:
             metric_kind, metric = metric_choice.split("::", 1)
             plot_metric_kind = metric_kind
             plot_metric = metric
-            ground_truth_trend_channels = (
-                sorted(
-                    trend_history["ground_truth_channel"].dropna().astype(str).unique(),
-                    key=_channel_sort_key,
+            channel_frame, channel_metric, channel_columns, shared_run_values = (
+                _history_channel_series(
+                    trend_history, metric, channel_metrics, selected_history_channels,
                 )
-                if "ground_truth_channel" in trend_history.columns
-                else []
             )
-            q_run_channel_view = None
-            global_channel_view = None
-            if (
-                metric_kind == "global"
-                and metric == "Q_run"
-                and "Q_channel" in channel_metrics
-            ):
-                q_display_options = [
-                    "Run-level Q",
-                    "Average channel Q",
-                    "Overlay channel Q",
-                    "Separate channel Q plots",
-                ]
-                q_display_key = f"bo_q_run_display_{trend_scope_key}"
-                _preserve_valid_widget_value(
-                    q_display_key,
-                    q_display_options,
-                    q_display_options[0],
+            channel_layout = _history_channel_display_control(
+                f"bo_history_channel_display_{trend_scope_key}_{metric_choice}",
+                global_metric=metric_kind == "global",
+                has_channels=bool(channel_columns),
+            )
+            split_history_directions = st.checkbox(
+                "Treat minimize and maximize as separate channels",
+                value=False,
+                key=f"bo_history_split_directions_{trend_scope_key}",
+                disabled=not bool(channel_columns),
+                help=(
+                    "Adds a separate Trend channels entry for each channel and "
+                    "optimization direction. Choose Separate plots to give each "
+                    "entry its own plot."
+                ),
+            )
+            if split_history_directions:
+                channel_frame, channel_columns = _history_channels_by_direction(
+                    channel_frame, channel_columns,
                 )
-                q_run_channel_view = st.radio(
-                    "Q series",
-                    q_display_options,
-                    horizontal=True,
-                    key=q_display_key,
-                    help=(
-                        "Chooses whether Q run is shown as the saved run-level "
-                        "objective or expanded into channel Q traces."
-                    ),
-                )
-                if q_run_channel_view != "Run-level Q":
-                    plot_metric_kind = "channel"
-                    plot_metric = "Q_channel"
-            elif (
-                metric_kind == "global"
-                and metric in trend_history.columns
-                and len(ground_truth_trend_channels) > 1
-            ):
-                metric_display_label = _metric_label(metric)
-                global_display_options = [
-                    f"Run-level {metric_display_label}",
-                    f"Average channel {metric_display_label}",
-                    f"Overlay channel {metric_display_label}",
-                    f"Separate channel {metric_display_label} plots",
-                ]
-                global_display_key = (
-                    f"bo_global_channel_display_{trend_scope_key}_{metric}"
-                )
-                _preserve_valid_widget_value(
-                    global_display_key,
-                    global_display_options,
-                    global_display_options[0],
-                )
-                global_channel_view = st.radio(
-                    f"{metric_display_label} series",
-                    global_display_options,
-                    horizontal=True,
-                    key=global_display_key,
-                    help=(
-                        "Chooses whether this parameter trend is shown as saved "
-                        "simulation-run rows or expanded into real-channel traces."
-                    ),
-                )
-                if global_channel_view != global_display_options[0]:
-                    plot_metric_kind = "channel"
-                    plot_metric = metric
-                    channel_metrics[plot_metric] = {
-                        channel: metric
-                        for channel in ground_truth_trend_channels
-                    }
+            if channel_layout != "Run-level series" and channel_columns:
+                plot_metric_kind = "channel"
+                plot_metric = channel_metric
+                trend_history = channel_frame
+                channel_metrics[plot_metric] = channel_columns
+                if shared_run_values:
+                    st.caption(
+                        "This metric is saved per run. Each channel plot shows "
+                        "the run values for observations containing that channel; "
+                        "channels measured together share these values."
+                    )
+            elif not channel_columns:
+                st.caption("No saved channel values are available for this metric.")
             group_layout = "Plot groups overlaid"
             group_color_values = None
             group_color_label = None
@@ -33788,8 +34115,6 @@ def render_bo_session_app() -> None:
             group_average_label = None
             is_simulated_trend_session = False
             has_multiple_trend_groups = (
-                metric in trend_history.columns
-                and
                 "group_id" in trend_history.columns
                 and trend_history["group_id"].nunique(dropna=True) > 1
             )
@@ -34112,7 +34437,6 @@ def render_bo_session_app() -> None:
             trend_render_gate_key = "bo_history_scores_large_plot_render_signature"
             trend_figure = None
             trend_figures: list[tuple[str, go.Figure]] = []
-            trend_events = []
             skip_large_trend_render = False
 
             def _history_trend_render_allowed(
@@ -34150,7 +34474,10 @@ def render_bo_session_app() -> None:
                     channel_metrics[plot_metric],
                     key=_channel_sort_key,
                 )
-                trend_channels_key = f"bo_trend_channels_{trend_scope_key}_{plot_metric}"
+                trend_channels_key = (
+                    f"bo_trend_channels_{trend_scope_key}_{plot_metric}_"
+                    f"{'directions' if split_history_directions else 'physical'}"
+                )
                 trend_channels_valid, trend_channels_display = (
                     _prepare_preferred_multiselect_value(
                         trend_channels_key,
@@ -34172,43 +34499,6 @@ def render_bo_session_app() -> None:
                     trend_channels_valid,
                     trend_channels,
                 )
-                if global_channel_view is not None:
-                    metric_display_label = _metric_label(plot_metric)
-                    channel_layout = {
-                        f"Average channel {metric_display_label}": (
-                            "Average selected channels"
-                        ),
-                        f"Overlay channel {metric_display_label}": (
-                            "Overlay selected channels"
-                        ),
-                        f"Separate channel {metric_display_label} plots": (
-                            "Separate plots"
-                        ),
-                    }[global_channel_view]
-                elif q_run_channel_view is None:
-                    channel_layout_options = [
-                        "Overlay selected channels",
-                        "Separate plots",
-                        "Average selected channels",
-                    ]
-                    channel_layout_key = f"bo_trend_layout_{trend_scope_key}_{plot_metric}"
-                    _preserve_valid_widget_value(
-                        channel_layout_key,
-                        channel_layout_options,
-                        channel_layout_options[0],
-                    )
-                    channel_layout = st.radio(
-                        "Channel display",
-                        channel_layout_options,
-                        horizontal=True,
-                        key=channel_layout_key,
-                    )
-                else:
-                    channel_layout = {
-                        "Average channel Q": "Average selected channels",
-                        "Overlay channel Q": "Overlay selected channels",
-                        "Separate channel Q plots": "Separate plots",
-                    }[q_run_channel_view]
                 if trend_channels:
                     chart_key_suffix = (
                         f"{metric}_{plot_metric}_{channel_layout}_"
@@ -34421,7 +34711,8 @@ def render_bo_session_app() -> None:
                     for label, figure in trend_figures
                 ]
             if trend_figures:
-                trend_events = []
+                st.caption("Click an iteration point to open its SWV traces in the SWV traces tab. "
+                           "Channel or group averages do not identify a single trace.")
                 for figure_index, (figure_label, figure) in enumerate(
                     trend_figures,
                     start=1,
@@ -34445,7 +34736,7 @@ def render_bo_session_app() -> None:
                         _apply_y_axis_range(figure, *trend_y_limits)
                     else:
                         _fit_y_axis_to_figure(figure)
-                    trend_events.append(_render_downloadable_plotly(
+                    _render_downloadable_plotly(
                         st,
                         figure,
                         key=(
@@ -34462,7 +34753,9 @@ def render_bo_session_app() -> None:
                         selection_mode="points",
                         individual_plot_settings=True,
                         individual_plot_settings_heading="Trend plot settings",
-                    ))
+                        interactive_history=True,
+                        history_observations=observations,
+                    )
                 trend_q_kind = _metric_q_kind(metric, paired_objective)
                 if trend_q_kind:
                     _render_q_equation(session["config"], trend_q_kind)
@@ -36214,37 +36507,6 @@ def render_bo_session_app() -> None:
                     config=full_session.get("config", {}),
                     scope_key=trend_scope_key,
                 )
-            clicked_iteration = next(
-                (
-                    iteration
-                    for iteration in (_clicked_iteration(event) for event in trend_events)
-                    if iteration is not None
-                ),
-                None,
-            )
-            click_state_key = (
-                f"bo_last_trend_click_{session['state'].get('session_id', 'session')}_"
-                f"{selected_group_id}_{chart_key_suffix}"
-            )
-            last_clicked_iteration = st.session_state.get(click_state_key)
-            if clicked_iteration is not None and clicked_iteration != last_clicked_iteration:
-                st.session_state[click_state_key] = clicked_iteration
-            is_new_plot_click = (
-                clicked_iteration is not None
-                and clicked_iteration != last_clicked_iteration
-            )
-            if (
-                not all_groups_scope
-                and
-                is_new_plot_click
-                and clicked_iteration in iteration_options
-                and clicked_iteration != selected_iteration
-            ):
-                st.session_state[iteration_state_key] = (
-                    f"g{selected_observation_group}:i{clicked_iteration}"
-                )
-                st.rerun()
-
             if any(
                 str(obs.get("objective", "")).lower() == "paired_response"
                 for obs in plot_observations
@@ -37002,11 +37264,34 @@ def render_bo_session_app() -> None:
     with traces:
         @st.fragment
         def _render_swv_traces_tab() -> None:
+            history_swv_request = st.session_state.pop("bo_history_swv_render_request", None)
+            history_focus = st.session_state.get("bo_history_swv_focus")
+            swv_group_scope = selected_observation_group_scope
+            swv_iteration_scope = selected_iteration_scope
+            swv_observations = group_scoped_observations
+            swv_iterations = scoped_iterations
             selected_group_label = selected_observation_group_scope_label
+            if history_focus:
+                swv_group_scope = history_focus["group_id"]
+                swv_iteration_scope = history_focus["iteration"]
+                swv_observations = [obs for obs in observations
+                                    if obs.get("group_id", 1) == swv_group_scope]
+                swv_iterations = sorted({int(obs["iteration"]) for obs in swv_observations})
+                selected_group_label = observation_group_scope_label(swv_group_scope)
+                st.caption(
+                    f"History selection: {selected_group_label} · iteration {history_focus['iteration']}"
+                    + (f" · Channel {history_focus['channel']}" if history_focus['channel'] else "")
+                    + (f" · {history_focus['direction'].capitalize()}" if history_focus['direction'] else "")
+                )
+                if st.button("Use observation selectors", key="bo_swv_clear_history_focus"):
+                    st.session_state.pop("bo_history_swv_focus", None)
+                    st.rerun(scope="fragment")
+            if history_swv_request is not None:
+                st.session_state[f"bo_trace_iteration_mode_{swv_group_scope}"] = "Selected observation iteration"
             trace_settings_form = st.form(
                 key=(
                     "bo_swv_trace_settings_form_"
-                    f"{selected_observation_group_scope}"
+                    f"{swv_group_scope}"
                 ),
                 clear_on_submit=False,
                 enter_to_submit=False,
@@ -37020,17 +37305,17 @@ def render_bo_session_app() -> None:
                 "Iteration range",
                 "All iterations",
             ]
-            if len(scoped_iterations) < 2:
+            if len(swv_iterations) < 2:
                 trace_iteration_mode_options.remove("Iteration range")
             default_trace_iteration_mode = (
                 "All iterations"
-                if selected_iteration_scope == "all"
+                if swv_iteration_scope == "all"
                 else "Selected observation iteration"
             )
             if default_trace_iteration_mode not in trace_iteration_mode_options:
                 default_trace_iteration_mode = trace_iteration_mode_options[-1]
             trace_iteration_mode_key = (
-                f"bo_trace_iteration_mode_{selected_observation_group_scope}"
+                f"bo_trace_iteration_mode_{swv_group_scope}"
             )
             _preserve_valid_widget_value(
                 trace_iteration_mode_key,
@@ -37043,45 +37328,45 @@ def render_bo_session_app() -> None:
                 horizontal=True,
                 key=trace_iteration_mode_key,
             )
-            trace_iteration_start = int(scoped_iterations[0])
-            trace_iteration_end = int(scoped_iterations[-1])
-            if len(scoped_iterations) >= 2:
+            trace_iteration_start = int(swv_iterations[0])
+            trace_iteration_end = int(swv_iterations[-1])
+            if len(swv_iterations) >= 2:
                 selected_iteration_for_default = (
-                    int(selected_iteration_scope)
-                    if selected_iteration_scope != "all"
-                    else scoped_iterations[-1]
+                    int(swv_iteration_scope)
+                    if swv_iteration_scope != "all"
+                    else swv_iterations[-1]
                 )
                 default_iteration_start = (
-                    scoped_iterations[0]
-                    if selected_iteration_scope == "all"
+                    swv_iterations[0]
+                    if swv_iteration_scope == "all"
                     else selected_iteration_for_default
                 )
                 default_iteration_end = (
-                    scoped_iterations[-1]
-                    if selected_iteration_scope == "all"
+                    swv_iterations[-1]
+                    if swv_iteration_scope == "all"
                     else selected_iteration_for_default
                 )
                 range_columns = trace_settings_form.columns(2)
                 trace_iteration_start_input = range_columns[0].number_input(
                     "Iteration start",
-                    min_value=int(scoped_iterations[0]),
-                    max_value=int(scoped_iterations[-1]),
+                    min_value=int(swv_iterations[0]),
+                    max_value=int(swv_iterations[-1]),
                     value=int(default_iteration_start),
                     step=1,
                     key=(
                         f"bo_trace_iteration_start_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                 )
                 trace_iteration_end_input = range_columns[1].number_input(
                     "Iteration end",
-                    min_value=int(scoped_iterations[0]),
-                    max_value=int(scoped_iterations[-1]),
+                    min_value=int(swv_iterations[0]),
+                    max_value=int(swv_iterations[-1]),
                     value=int(default_iteration_end),
                     step=1,
                     key=(
                         f"bo_trace_iteration_end_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                 )
                 trace_iteration_start, trace_iteration_end = sorted(
@@ -37095,7 +37380,7 @@ def render_bo_session_app() -> None:
                 )
             if trace_iteration_mode == "Iteration range":
                 trace_observations = [
-                    obs for obs in group_scoped_observations
+                    obs for obs in swv_observations
                     if trace_iteration_start
                     <= int(obs.get("iteration", 0))
                     <= trace_iteration_end
@@ -37107,21 +37392,24 @@ def render_bo_session_app() -> None:
                     f"range_{trace_iteration_start}_{trace_iteration_end}"
                 )
             elif trace_iteration_mode == "All iterations":
-                trace_observations = list(group_scoped_observations)
+                trace_observations = list(swv_observations)
                 selected_iteration_label = "all iterations"
                 trace_iteration_token = "all"
             else:
                 trace_iteration_value = (
-                    int(selected_iteration_scope)
-                    if selected_iteration_scope != "all"
-                    else int(scoped_iterations[-1])
+                    int(swv_iteration_scope)
+                    if swv_iteration_scope != "all"
+                    else int(swv_iterations[-1])
                 )
                 trace_observations = [
-                    obs for obs in group_scoped_observations
+                    obs for obs in swv_observations
                     if int(obs.get("iteration", 0)) == trace_iteration_value
                 ]
                 selected_iteration_label = f"iteration {trace_iteration_value}"
                 trace_iteration_token = f"iter_{trace_iteration_value}"
+            if history_focus and trace_iteration_mode == "Selected observation iteration":
+                trace_observations = [obs for obs in trace_observations
+                                      if _history_swv_observation_matches(obs, history_focus)]
             trace_observations = sorted(
                 trace_observations,
                 key=lambda item: (
@@ -37192,7 +37480,7 @@ def render_bo_session_app() -> None:
                 selected_trace_phases = None
                 if trace_has_paired_phases:
                     trace_phase_key = (
-                        f"bo_trace_phase_filter_{selected_observation_group_scope}"
+                        f"bo_trace_phase_filter_{swv_group_scope}"
                     )
                     _preserve_valid_widget_value(
                         trace_phase_key,
@@ -37226,13 +37514,24 @@ def render_bo_session_app() -> None:
                     trace for _observation, trace in display_trace_entries
                 ]
                 trace_channels_key = (
-                    f"bo_trace_channels_{selected_observation_group_scope}_"
+                    f"bo_trace_channels_{swv_group_scope}_"
                     f"{selected_trace_phase_label}"
                 )
                 available_channels = sorted(
                     {_trace_channel_key(item) for item in display_available_traces},
                     key=_channel_sort_key,
                 )
+                if history_swv_request is not None:
+                    focused_channels = sorted({
+                        _trace_channel_key(trace) for trace in display_available_traces
+                        if (not history_swv_request["channel"] or
+                            str(trace["channel"]) == history_swv_request["channel"])
+                        and (not history_swv_request["direction"] or
+                             not trace.get("optimization_direction") or
+                             str(trace["optimization_direction"]).lower() == history_swv_request["direction"])
+                    }, key=_channel_sort_key)
+                    st.session_state[trace_channels_key] = focused_channels
+                    st.session_state[f"{trace_channels_key}__preferred"] = focused_channels
                 trace_channels_valid, trace_channels_display = (
                     _prepare_preferred_multiselect_value(
                         trace_channels_key,
@@ -37259,7 +37558,7 @@ def render_bo_session_app() -> None:
                     "Plot channels separately",
                 ]
                 trace_channel_layout_key = (
-                    f"bo_trace_channel_layout_{selected_observation_group_scope}"
+                    f"bo_trace_channel_layout_{swv_group_scope}"
                 )
                 _preserve_valid_widget_value(
                     trace_channel_layout_key,
@@ -37277,10 +37576,10 @@ def render_bo_session_app() -> None:
                     "Plot each iteration separately",
                     "Overlay SWV traces",
                 ]
-                if len(group_scoped_observations) > 1:
+                if len(swv_observations) > 1:
                     trace_layout_options.append("Chronological diagonal stack")
                 trace_layout_key = (
-                    f"bo_trace_layout_{selected_observation_group_scope}"
+                    f"bo_trace_layout_{swv_group_scope}"
                 )
                 _preserve_valid_widget_value(
                     trace_layout_key,
@@ -37301,13 +37600,13 @@ def render_bo_session_app() -> None:
                     "Normalized raw",
                 ]
                 trace_types_key = (
-                    f"bo_trace_types_{selected_observation_group_scope}"
+                    f"bo_trace_types_{swv_group_scope}"
                 )
                 trace_types_preference_key = (
                     f"{trace_types_key}__preferred"
                 )
                 legacy_trace_type_key = (
-                    f"bo_trace_type_{selected_observation_group_scope}"
+                    f"bo_trace_type_{swv_group_scope}"
                 )
                 if (
                     trace_types_key not in st.session_state
@@ -37325,7 +37624,7 @@ def render_bo_session_app() -> None:
                         trace_types_key,
                         trace_types_preference_key,
                         trace_type_options,
-                        ["Corrected"],
+                        ["Corrected", "Raw"],
                     )
                 )
                 selected_trace_types = trace_settings_form.multiselect(
@@ -37395,7 +37694,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_voltage_min_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                 ))
                 trace_voltage_max = float(trace_voltage_columns[1].number_input(
@@ -37405,7 +37704,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_voltage_max_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                 ))
                 if trace_voltage_min > trace_voltage_max:
@@ -37423,12 +37722,12 @@ def render_bo_session_app() -> None:
                 default_trace_y_max = 1.2 if normalize_to_peak else 1.0
                 trace_y_min_key = (
                     f"bo_trace_y_min_"
-                    f"{selected_observation_group_scope}_"
+                    f"{swv_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 trace_y_max_key = (
                     f"bo_trace_y_max_"
-                    f"{selected_observation_group_scope}_"
+                    f"{swv_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 st.session_state.setdefault(trace_y_min_key, default_trace_y_min)
@@ -37438,7 +37737,7 @@ def render_bo_session_app() -> None:
                     "Set SWV y-axis limits manually",
                     key=(
                         f"bo_trace_manual_y_limits_"
-                        f"{selected_observation_group_scope}_"
+                        f"{swv_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                     help=(
@@ -37501,7 +37800,7 @@ def render_bo_session_app() -> None:
                         horizontal=True,
                         key=(
                             f"bo_trace_stack_phase_display_"
-                            f"{selected_observation_group_scope}"
+                            f"{swv_group_scope}"
                         ),
                     )
                 offset_columns = stack_settings.columns(3)
@@ -37512,7 +37811,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_stack_x_offset_"
-                        f"{selected_observation_group_scope}"
+                        f"{swv_group_scope}"
                     ),
                     help="Positive values shift newer traces to the right; negative values shift them left.",
                 )
@@ -37523,7 +37822,7 @@ def render_bo_session_app() -> None:
                     format="%.4f",
                     key=(
                         f"bo_trace_stack_y_offset_"
-                        f"{selected_observation_group_scope}_"
+                        f"{swv_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                     help="Positive values shift newer traces upward; negative values shift them downward.",
@@ -37536,7 +37835,7 @@ def render_bo_session_app() -> None:
                     step=0.1,
                     key=(
                         f"bo_trace_stack_height_"
-                        f"{selected_observation_group_scope}_"
+                        f"{swv_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                     help="Scales each SWV vertically before applying the chronological offset.",
@@ -37545,7 +37844,7 @@ def render_bo_session_app() -> None:
                     "Crop each SWV trace by current before stacking",
                     key=(
                         f"bo_trace_stack_manual_y_limits_"
-                        f"{selected_observation_group_scope}_"
+                        f"{swv_group_scope}_"
                         f"{trace_transform_key}"
                     ),
                 )
@@ -37554,12 +37853,12 @@ def render_bo_session_app() -> None:
                 y_limit_columns = stack_settings.columns(2)
                 stack_y_min_key = (
                     f"bo_trace_stack_trace_y_min_"
-                    f"{selected_observation_group_scope}_"
+                    f"{swv_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 stack_y_max_key = (
                     f"bo_trace_stack_trace_y_max_"
-                    f"{selected_observation_group_scope}_"
+                    f"{swv_group_scope}_"
                     f"{trace_transform_key}"
                 )
                 st.session_state.setdefault(
@@ -37601,15 +37900,16 @@ def render_bo_session_app() -> None:
                     value=350,
                     step=50,
                     key=(
-                        f"bo_trace_gif_duration_{selected_observation_group_scope}"
+                        f"bo_trace_gif_duration_{swv_group_scope}"
                     ),
                     help="Used when the rendered selection contains multiple iterations.",
                 )
 
                 trace_render_signature = (
                     session["state"].get("session_id", session["root"].name),
-                    selected_observation_group_scope,
+                    swv_group_scope,
                     trace_iteration_token,
+                    tuple(history_focus.items()) if history_focus else (),
                     selected_trace_phase_label,
                     tuple(selected_trace_phases or ()),
                     tuple(selected_channels),
@@ -37633,6 +37933,8 @@ def render_bo_session_app() -> None:
                     "Render SWV settings",
                     use_container_width=True,
                 ):
+                    st.session_state[trace_render_key] = trace_render_signature
+                if history_swv_request is not None:
                     st.session_state[trace_render_key] = trace_render_signature
                 render_swv_traces = (
                     st.session_state.get(trace_render_key)
@@ -37815,7 +38117,7 @@ def render_bo_session_app() -> None:
                                             figure,
                                             key=(
                                                 f"bo_trace_plot_single_"
-                                                f"{selected_observation_group_scope}_"
+                                                f"{swv_group_scope}_"
                                                 f"{trace_iteration_token}_"
                                                 f"{selected_trace_type}_"
                                                 f"{trace_index}_{trace_iteration}_"
@@ -37966,7 +38268,7 @@ def render_bo_session_app() -> None:
                                             figure,
                                             key=(
                                                 f"bo_trace_plot_iteration_"
-                                                f"{selected_observation_group_scope}_"
+                                                f"{swv_group_scope}_"
                                                 f"{trace_iteration_token}_"
                                                 f"{iteration_plot_index}_"
                                                 f"{iteration_group_id}_"
@@ -38073,7 +38375,7 @@ def render_bo_session_app() -> None:
                                     st,
                                     figure,
                                     key=(
-                                        f"bo_trace_plot_{selected_observation_group_scope}_"
+                                        f"bo_trace_plot_{swv_group_scope}_"
                                         f"{trace_iteration_token}_{trace_layout}_"
                                         f"{selected_trace_type}_{phase_label or 'all'}_"
                                         f"{selected_trace_phase_label}_"
@@ -38127,7 +38429,7 @@ def render_bo_session_app() -> None:
                             _trace_transform_key,
                         ) = _selected_trace_type_settings(selected_trace_type)
                         trace_gif_key = (
-                            f"bo_trace_gif_{selected_observation_group_scope}_"
+                            f"bo_trace_gif_{swv_group_scope}_"
                             f"{trace_iteration_token}_{trace_layout}_{selected_trace_type}_"
                             f"{selected_trace_phase_label}_"
                             f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
@@ -39749,7 +40051,7 @@ def render_bo_session_app() -> None:
                                         apply_sync_nonce=comparison_sync_nonce,
                                     )
                                 else:
-                                    rendered_camera = _render_camera_persistent_plotly(
+                                    _render_camera_persistent_plotly(
                                         overview_column,
                                         comparison_fig,
                                         key=(
@@ -39766,42 +40068,8 @@ def render_bo_session_app() -> None:
                                             f"{real_metric}_{series_token}_{comparison_x}_"
                                             f"{comparison_y}_{comparison_z}"
                                         ),
-                                        show_download=False,
+                                        show_download=True,
                                     )
-                                    download_camera = (
-                                        comparison_cached_camera
-                                        if comparison_cached_camera is not None
-                                        else rendered_camera
-                                    )
-                                    download_fig = go.Figure(comparison_fig)
-                                    _apply_plotly_camera(download_fig, download_camera)
-                                    try:
-                                        png_bytes = _plotly_png_bytes(
-                                            download_fig,
-                                            width=max(
-                                                500,
-                                                int(plot_width_percent),
-                                            ),
-                                            height=plot_3d_height,
-                                            scale=2,
-                                        )
-                                        _render_browser_download_link(
-                                            overview_column,
-                                            "Download plot",
-                                            png_bytes,
-                                            file_name=(
-                                                f"{_safe_download_stem('real_comparison_3d')}_"
-                                                f"{_safe_download_stem(value_column)}_"
-                                                f"{_safe_download_stem(real_metric)}_"
-                                                f"{_safe_download_stem(series_token)}_"
-                                                f"{_safe_download_stem(comparison_x)}_"
-                                                f"{_safe_download_stem(comparison_y)}_"
-                                                f"{_safe_download_stem(comparison_z)}.png"
-                                            ),
-                                            mime="image/png",
-                                        )
-                                    except RuntimeError as exc:
-                                        overview_column.caption(str(exc))
                             if comparison_sync_nonce > 0:
                                 st.session_state[sync_nonce_key] = 0
                             comparison_slice_form = st.form(
@@ -42289,15 +42557,20 @@ def render_bo_session_app() -> None:
                                     axis_ranges=real_axis_ranges,
                                     value_range=real_value_range,
                                 )
-                                _plotly_chart_with_colorbars(
-                                    _sized_plot_container(st, plot_width_percent),
+                                _render_downloadable_plotly(
+                                    st,
                                     real_figure,
-                                    use_container_width=True,
                                     key=(
                                         f"bo_real_plot_both_{real_plot_state_key}_"
                                         f"{_safe_download_stem(series_name)}_"
                                         f"{real_metric}_{real_x}_{real_scope_key}"
                                     ),
+                                    file_stem=(
+                                        f"real_data_plot_both_{real_plot_state_key}_"
+                                        f"{_safe_download_stem(series_name)}_"
+                                        f"{real_metric}_{real_x}_{real_scope_key}"
+                                    ),
+                                    width_percent=plot_width_percent,
                                 )
                         elif real_channel_mode == real_simulation_run_mode:
                             run_series = _real_simulation_run_plot_series(pd.concat(
@@ -42343,15 +42616,20 @@ def render_bo_session_app() -> None:
                                     axis_ranges=real_axis_ranges,
                                     value_range=real_value_range,
                                 )
-                                _plotly_chart_with_colorbars(
-                                    _sized_plot_container(st, plot_width_percent),
+                                _render_downloadable_plotly(
+                                    st,
                                     real_figure,
-                                    use_container_width=True,
                                     key=(
                                         f"bo_real_plot_both_{real_plot_state_key}_"
                                         f"{group_id}_{real_metric}_{real_x}_"
                                         f"{real_scope_key}"
                                     ),
+                                    file_stem=(
+                                        f"real_data_plot_both_{real_plot_state_key}_"
+                                        f"{group_id}_{real_metric}_{real_x}_"
+                                        f"{real_scope_key}"
+                                    ),
+                                    width_percent=plot_width_percent,
                                 )
                         elif real_channel_mode == "Plot channels individually":
                             individual_channels = sorted(
@@ -42386,14 +42664,18 @@ def render_bo_session_app() -> None:
                                     and not real_effective_show_iteration_path
                                 ):
                                     real_figure = _strip_plotly_color_references(real_figure)
-                                _plotly_chart_with_colorbars(
-                                    _sized_plot_container(st, plot_width_percent),
+                                _render_downloadable_plotly(
+                                    st,
                                     real_figure,
-                                    use_container_width=True,
                                     key=(
                                         f"bo_real_plot_both_{real_plot_state_key}_"
                                         f"{channel}_{real_metric}_{real_x}_{real_scope_key}"
                                     ),
+                                    file_stem=(
+                                        f"real_data_plot_both_{real_plot_state_key}_"
+                                        f"{channel}_{real_metric}_{real_x}_{real_scope_key}"
+                                    ),
+                                    width_percent=plot_width_percent,
                                 )
                         else:
                             real_figure = _plot_real_data_both_1d(
@@ -42417,15 +42699,20 @@ def render_bo_session_app() -> None:
                                 and not real_effective_show_iteration_path
                             ):
                                 real_figure = _strip_plotly_color_references(real_figure)
-                            _plotly_chart_with_colorbars(
-                                _sized_plot_container(st, plot_width_percent),
+                            _render_downloadable_plotly(
+                                st,
                                 real_figure,
-                                use_container_width=True,
                                 key=(
                                     f"bo_real_plot_both_{real_plot_state_key}_"
                                     f"{real_metric}_{real_x}_{real_channel_mode}_"
                                     f"{real_scope_key}"
                                 ),
+                                file_stem=(
+                                    f"real_data_plot_both_{real_plot_state_key}_"
+                                    f"{real_metric}_{real_x}_{real_channel_mode}_"
+                                    f"{real_scope_key}"
+                                ),
+                                width_percent=plot_width_percent,
                             )
                     elif real_phase == "both":
                         buffer_column, target_column = st.columns(2)
@@ -42589,11 +42876,12 @@ def render_bo_session_app() -> None:
                                                     display_width_percent=100,
                                                 )
                                     else:
-                                        _plotly_chart_with_colorbars(
-                                            _sized_plot_container(column, plot_width_percent),
+                                        _render_downloadable_plotly(
+                                            column,
                                             real_figure,
-                                            use_container_width=True,
                                             key=plot_key,
+                                            file_stem=plot_key,
+                                            width_percent=plot_width_percent,
                                         )
                                         render_real_swv_traces(
                                             column,
@@ -42708,11 +42996,12 @@ def render_bo_session_app() -> None:
                                     series_points,
                                 )
                             else:
-                                _plotly_chart_with_colorbars(
-                                    _sized_plot_container(st, plot_width_percent),
+                                _render_downloadable_plotly(
+                                    st,
                                     real_figure,
-                                    use_container_width=True,
                                     key=plot_key,
+                                    file_stem=plot_key,
+                                    width_percent=plot_width_percent,
                                 )
                                 render_real_swv_traces(
                                     st,
@@ -43066,13 +43355,9 @@ def render_bo_session_app() -> None:
                                             slice_axis=real_2d_slice_column,
                                             slice_value=sweep_value,
                                         )
-                                        _plotly_chart_with_colorbars(
-                                            _sized_plot_container(
-                                                sweep_container,
-                                                plot_width_percent,
-                                            ),
+                                        _render_downloadable_plotly(
+                                            sweep_container,
                                             sweep_figure,
-                                            use_container_width=True,
                                             key=(
                                                 f"bo_real_slice_sweep_{real_plot_state_key}_"
                                                 f"{sweep_phase}_{sweep_series_name}_"
@@ -43080,6 +43365,14 @@ def render_bo_session_app() -> None:
                                                 f"{real_channel_mode}_{real_scope_key}_"
                                                 f"{sweep_token}_{real_2d_sweep_token}"
                                             ),
+                                            file_stem=(
+                                                f"real_data_slice_sweep_{real_plot_state_key}_"
+                                                f"{sweep_phase}_{sweep_series_name}_"
+                                                f"{real_metric}_{real_x}_{real_y}_"
+                                                f"{real_channel_mode}_{real_scope_key}_"
+                                                f"{sweep_token}_{real_2d_sweep_token}"
+                                            ),
+                                            width_percent=plot_width_percent,
                                         )
 
                     if real_view == "3D tensor" and not count_mode:
