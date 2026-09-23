@@ -42,6 +42,7 @@ from matplotlib.text import Text
 from matplotlib.ticker import FixedFormatter, FixedLocator
 from matplotlib.transforms import Bbox
 from matplotlib.backends.backend_pdf import PdfPages
+from mpl_toolkits.mplot3d import proj3d
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -124,6 +125,7 @@ SWV_PHASE_COLORS = {
     "buffer": "#1f77b4",
     "target": "#ff7f0e",
 }
+PAIRED_MEASUREMENT_3D_LAYOUT = "Paired measurement 3D stack"
 OBSERVED_PATH_CMAP = LinearSegmentedColormap.from_list(
     "observed_iteration", OBSERVED_PATH_COLORS
 )
@@ -19548,6 +19550,249 @@ def _chronological_swv_stack_entries(
     return loaded, errors, entries
 
 
+def _plot_paired_measurement_3d_stack(
+    trace_entries: list[tuple[dict, dict]],
+    corrected: bool,
+    selected_channels: list[str],
+    analysis: dict,
+    config: dict,
+    normalize_to_peak: bool = False,
+    corrected_trace_key: str = "smoothed_corrected_current",
+    offset_to_baseline: bool = False,
+    voltage_min: float | None = None,
+    voltage_max: float | None = None,
+    current_min: float | None = None,
+    current_max: float | None = None,
+    show_axis_labels: bool = True,
+    voltage_label: str = "VOLTAGE (V)",
+    measurement_label: str = "MEASUREMENT",
+    current_label: str | None = None,
+):
+    """Render one BO iteration's buffer/target replicates as a 3D stack."""
+    fig = plt.figure(figsize=(8.2, 10.4))
+    ax = fig.add_subplot(111, projection="3d")
+    ax._bo_paired_measurement_3d_stack = True
+    ax.set_position((.03, .12, .94, .70))
+
+    loaded, errors, _entries = _chronological_swv_stack_entries(
+        trace_entries,
+        corrected,
+        selected_channels,
+        analysis,
+        config,
+        normalize_to_peak,
+        corrected_trace_key,
+        offset_to_baseline,
+        1.0,
+        voltage_min,
+        voltage_max,
+        None,
+        None,
+        ("buffer", "target"),
+    )
+    if not loaded:
+        ax.text2D(
+            .5,
+            .5,
+            "No paired buffer/target traces match this channel.",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+        )
+        ax.set_axis_off()
+        return fig, errors
+
+    phases = [str(row.get("phase", "")).strip().lower() for row in loaded]
+    if len(loaded) != 6 or phases.count("buffer") != 3 or phases.count("target") != 3:
+        errors.append(
+            "The paired 3D stack expects three buffer and three target traces; "
+            f"found {phases.count('buffer')} buffer and {phases.count('target')} target."
+        )
+
+    # Draw the most distant scan first, then place progressively nearer scans
+    # over it.  A geometric fade reads more naturally than a linear one here:
+    # rear traces recede without making the middle replicates disappear.
+    fade_values = np.geomspace(1.0, .25, len(loaded))
+    line_widths = np.linspace(3.2, 2.1, len(loaded))
+    all_current = [
+        np.asarray(row["current"], dtype=float) for row in loaded
+    ]
+    phase_measurements: dict[str, list[int]] = {"buffer": [], "target": []}
+    plotted_rows = list(enumerate(zip(loaded, fade_values), start=1))
+    for measurement, (row, _alpha) in plotted_rows:
+        phase = str(row.get("phase", "")).strip().lower()
+        phase_measurements.setdefault(phase, []).append(measurement)
+    for measurement, (row, alpha) in reversed(plotted_rows):
+        voltage = np.asarray(row["voltage"], dtype=float)
+        current = np.asarray(row["current"], dtype=float)
+        phase = str(row.get("phase", "")).strip().lower()
+        ax.plot(
+            voltage,
+            np.full_like(voltage, float(measurement)),
+            current,
+            color=SWV_PHASE_COLORS.get(phase, "#444444"),
+            linestyle=_swv_trace_linestyle(
+                row.get("trace") or {"phase": phase}
+            ),
+            linewidth=float(line_widths[measurement - 1]),
+            alpha=float(alpha),
+            solid_capstyle="round",
+            zorder=10 + len(loaded) - measurement,
+        )
+
+    voltage_values = np.concatenate([
+        np.asarray(row["voltage"], dtype=float) for row in loaded
+    ])
+    x_min = (
+        float(voltage_min)
+        if voltage_min is not None
+        else float(np.nanmin(voltage_values))
+    )
+    x_max = (
+        float(voltage_max)
+        if voltage_max is not None
+        else float(np.nanmax(voltage_values))
+    )
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(.65, len(loaded) + .35)
+    combined_current = np.concatenate(all_current)
+    z_min = (
+        float(current_min)
+        if current_min is not None
+        else float(np.nanmin(combined_current))
+    )
+    z_max = (
+        float(current_max)
+        if current_max is not None
+        else float(np.nanmax(combined_current))
+    )
+    if current_min is None or current_max is None:
+        z_span = max(z_max - z_min, 1e-9)
+        if current_min is None:
+            z_min -= .035 * z_span
+        if current_max is None:
+            z_max += .035 * z_span
+    ax.set_zlim(z_min, z_max)
+
+    ax.view_init(elev=20, azim=-55)
+    ax.set_box_aspect((1.65, 1.30, 1.0))
+    ax.set_yticks(range(1, len(loaded) + 1))
+    ax.tick_params(axis="x", labelsize=13, pad=3)
+    ax.tick_params(axis="y", labelsize=14, pad=7)
+    ax.tick_params(axis="z", labelsize=13, pad=3)
+    for tick, phase in zip(ax.get_yticklabels(), phases):
+        tick.set_color(SWV_PHASE_COLORS.get(phase, "#333333"))
+        tick.set_fontweight("bold")
+
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.fill = False
+        axis.pane.set_edgecolor((1, 1, 1, 0))
+        axis._axinfo["grid"]["linewidth"] = 0
+    # Put the current axis on the left, matching the publication stack view.
+    ax.zaxis._axinfo["juggled"] = (1, 2, 0)
+
+    if show_axis_labels:
+        ax.set_xlabel(voltage_label, fontsize=18, fontweight="bold", labelpad=14)
+        fig.canvas.draw()
+        depth_start = proj3d.proj_transform(
+            x_max,
+            1.0,
+            z_min,
+            ax.get_proj(),
+        )[:2]
+        depth_end = proj3d.proj_transform(
+            x_max,
+            float(len(loaded)),
+            z_min,
+            ax.get_proj(),
+        )[:2]
+        start_display = ax.transData.transform(depth_start)
+        end_display = ax.transData.transform(depth_end)
+        depth_vector = end_display - start_display
+        measurement_angle = math.degrees(math.atan2(
+            depth_vector[1],
+            depth_vector[0],
+        ))
+        if measurement_angle > 90:
+            measurement_angle -= 180
+        elif measurement_angle < -90:
+            measurement_angle += 180
+        outward_normal = np.array(
+            [depth_vector[1], -depth_vector[0]],
+            dtype=float,
+        )
+        normal_length = float(np.linalg.norm(outward_normal))
+        if normal_length > 0:
+            outward_normal /= normal_length
+        measurement_display = (
+            (start_display + end_display) / 2
+            + outward_normal * 94.0
+        )
+        measurement_figure_position = fig.transFigure.inverted().transform(
+            measurement_display
+        )
+        measurement_text = fig.text(
+            measurement_figure_position[0],
+            measurement_figure_position[1],
+            measurement_label,
+            ha="center",
+            va="center",
+            fontsize=18,
+            fontweight="bold",
+            rotation=measurement_angle,
+            rotation_mode="anchor",
+        )
+        measurement_text._bo_paired_measurement_label = True
+        current_text = fig.text(
+            .025,
+            .46,
+            current_label
+            or (
+                "NORMALIZED CURRENT"
+                if normalize_to_peak
+                else "CURRENT (" + chr(181) + "A)"
+            ),
+            ha="center",
+            va="center",
+            fontsize=18,
+            fontweight="bold",
+            rotation=90,
+        )
+        current_text._bo_paired_current_label = True
+
+    legend_handles = []
+    for phase in ("buffer", "target"):
+        measurements = phase_measurements.get(phase) or []
+        if not measurements:
+            continue
+        measurement_text = (
+            str(measurements[0])
+            if len(measurements) == 1
+            else f"{measurements[0]}-{measurements[-1]}"
+        )
+        legend_handles.append(Line2D(
+            [0],
+            [0],
+            color=SWV_PHASE_COLORS[phase],
+            linewidth=3.2,
+            label=f"{phase.upper()}   {measurement_text}",
+        ))
+    if legend_handles:
+        legend = fig.legend(
+            handles=legend_handles,
+            loc="upper left",
+            bbox_to_anchor=(.15, .97),
+            frameon=False,
+            fontsize=16,
+            handlelength=2.2,
+            handletextpad=.7,
+            borderaxespad=0,
+            labelspacing=.55,
+        )
+        legend.set_zorder(1000)
+    return fig, errors
+
+
 def _chronological_swv_stack_display_bounds(
     loaded: list[dict],
     x_step: float,
@@ -37576,6 +37821,11 @@ def render_bo_session_app() -> None:
                     "Plot each iteration separately",
                     "Overlay SWV traces",
                 ]
+                if (
+                    not trace_all_mode
+                    and selected_trace_phase_set == {"buffer", "target"}
+                ):
+                    trace_layout_options.append(PAIRED_MEASUREMENT_3D_LAYOUT)
                 if len(swv_observations) > 1:
                     trace_layout_options.append("Chronological diagonal stack")
                 trace_layout_key = (
@@ -37893,6 +38143,36 @@ def render_bo_session_app() -> None:
                         )
                         stack_y_min = None
                         stack_y_max = None
+                paired_3d_settings = trace_settings_form.expander(
+                    "Paired measurement 3D stack settings",
+                    expanded=trace_layout == PAIRED_MEASUREMENT_3D_LAYOUT,
+                )
+                paired_3d_settings.caption(
+                    "For one BO iteration, renders one stack per selected channel "
+                    "with buffer measurements first and target measurements second."
+                )
+                paired_3d_show_axis_labels = paired_3d_settings.checkbox(
+                    "Show axis labels",
+                    value=True,
+                    key=f"bo_trace_paired_3d_show_labels_{swv_group_scope}",
+                    help="Turn this off to retain only numeric tick labels and the legend.",
+                )
+                paired_3d_label_columns = paired_3d_settings.columns(3)
+                paired_3d_voltage_label = paired_3d_label_columns[0].text_input(
+                    "Voltage label",
+                    value="VOLTAGE (V)",
+                    key=f"bo_trace_paired_3d_voltage_label_{swv_group_scope}",
+                )
+                paired_3d_measurement_label = paired_3d_label_columns[1].text_input(
+                    "Measurement label",
+                    value="MEASUREMENT",
+                    key=f"bo_trace_paired_3d_measurement_label_{swv_group_scope}",
+                )
+                paired_3d_current_label = paired_3d_label_columns[2].text_input(
+                    "Current label",
+                    value="CURRENT (" + chr(181) + "A)",
+                    key=f"bo_trace_paired_3d_current_label_{swv_group_scope}",
+                )
                 trace_gif_duration = trace_settings_form.slider(
                     "SWV GIF frame duration (ms)",
                     min_value=100,
@@ -37926,6 +38206,10 @@ def render_bo_session_app() -> None:
                     stack_trace_height,
                     stack_y_min,
                     stack_y_max,
+                    paired_3d_show_axis_labels,
+                    paired_3d_voltage_label,
+                    paired_3d_measurement_label,
+                    paired_3d_current_label,
                     trace_gif_duration,
                 )
                 trace_render_key = "bo_swv_traces_render_signature"
@@ -37949,7 +38233,10 @@ def render_bo_session_app() -> None:
                 if render_swv_traces:
                     channel_groups = (
                         [[channel] for channel in selected_channels]
-                        if trace_channel_layout == "Plot channels separately"
+                        if (
+                            trace_channel_layout == "Plot channels separately"
+                            or trace_layout == PAIRED_MEASUREMENT_3D_LAYOUT
+                        )
                         else [selected_channels]
                     )
                     if not selected_channels:
@@ -37968,7 +38255,10 @@ def render_bo_session_app() -> None:
                                 ("buffer", ("buffer",)),
                                 ("target", ("target",)),
                             ]
-                        if trace_channel_layout == "Plot channels separately":
+                        if (
+                            trace_channel_layout == "Plot channels separately"
+                            or trace_layout == PAIRED_MEASUREMENT_3D_LAYOUT
+                        ):
                             channel = channel_group[0]
                             st.markdown(
                                 f"#### {_trace_channel_label(channel)}"
@@ -38305,7 +38595,33 @@ def render_bo_session_app() -> None:
                                     if current_corrected
                                     else "Loading raw traces..."
                                 ):
-                                    if trace_layout == "Chronological diagonal stack":
+                                    if trace_layout == PAIRED_MEASUREMENT_3D_LAYOUT:
+                                        current_axis_label = paired_3d_current_label
+                                        if (
+                                            current_normalize_to_peak
+                                            and current_axis_label
+                                            == "CURRENT (" + chr(181) + "A)"
+                                        ):
+                                            current_axis_label = "NORMALIZED CURRENT"
+                                        figure, errors = _plot_paired_measurement_3d_stack(
+                                            display_trace_entries,
+                                            current_corrected,
+                                            channel_group,
+                                            trace_analysis,
+                                            session["config"],
+                                            current_normalize_to_peak,
+                                            current_corrected_trace_key,
+                                            current_offset_to_baseline,
+                                            trace_voltage_min,
+                                            trace_voltage_max,
+                                            trace_y_min,
+                                            trace_y_max,
+                                            paired_3d_show_axis_labels,
+                                            paired_3d_voltage_label,
+                                            paired_3d_measurement_label,
+                                            current_axis_label,
+                                        )
+                                    elif trace_layout == "Chronological diagonal stack":
                                         figure, errors = _plot_chronological_swv_stack(
                                             display_trace_entries,
                                             current_corrected,
@@ -38361,7 +38677,16 @@ def render_bo_session_app() -> None:
                                     and trace_y_max is not None
                                     and figure.axes
                                 ):
-                                    figure.axes[0].set_ylim(trace_y_min, trace_y_max)
+                                    if trace_layout == PAIRED_MEASUREMENT_3D_LAYOUT:
+                                        figure.axes[0].set_zlim(
+                                            trace_y_min,
+                                            trace_y_max,
+                                        )
+                                    else:
+                                        figure.axes[0].set_ylim(
+                                            trace_y_min,
+                                            trace_y_max,
+                                        )
                                 trace_file_stem = (
                                     f"swv_traces_{selected_trace_type}_{trace_layout}_"
                                     f"{selected_group_label}_{selected_iteration_label}_"

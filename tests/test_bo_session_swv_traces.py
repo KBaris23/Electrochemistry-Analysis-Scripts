@@ -2053,6 +2053,104 @@ def test_chronological_order_label_is_marked_for_plot_customization(monkeypatch)
     plt.close(figure)
 
 
+def test_paired_measurement_3d_stack_orders_and_fades_six_replicates(monkeypatch):
+    phases = ["buffer"] * 3 + ["target"] * 3
+    loaded = [
+        {
+            "iteration": 47,
+            "stack_index": index,
+            "phase": phase,
+            "channel": "7_max",
+            "trace": {"phase": phase},
+            "voltage": pd.Series([-.55, -.30, 0.0]).to_numpy(),
+            "current": pd.Series([.01, .02 + index * .01, .01]).to_numpy(),
+        }
+        for index, phase in enumerate(phases)
+    ]
+    entries = [
+        ({"iteration": 47}, {"phase": phase, "channel": "7_max"})
+        for phase in phases
+    ]
+    monkeypatch.setattr(
+        viewer,
+        "_chronological_swv_stack_entries",
+        lambda *_args, **_kwargs: (loaded, [], entries),
+    )
+
+    figure, errors = viewer._plot_paired_measurement_3d_stack(
+        [],
+        True,
+        ["7_max"],
+        {},
+        {},
+        voltage_min=-.55,
+        voltage_max=0.0,
+    )
+
+    axis = figure.axes[0]
+    assert not errors
+    assert getattr(axis, "_bo_paired_measurement_3d_stack", False)
+    assert len(axis.lines) == 6
+    assert [tick.get_text() for tick in axis.get_yticklabels()] == [
+        "1", "2", "3", "4", "5", "6",
+    ]
+    # Rear traces are drawn first; the opaque foreground trace is drawn last.
+    assert axis.lines[0].get_alpha() < axis.lines[-1].get_alpha()
+    assert axis.get_xlabel() == "VOLTAGE (V)"
+    assert [
+        text.get_text() for text in figure.texts
+        if getattr(text, "_bo_paired_measurement_label", False)
+    ] == ["MEASUREMENT"]
+    assert [
+        text.get_text() for text in figure.texts
+        if getattr(text, "_bo_paired_current_label", False)
+    ] == ["CURRENT (" + chr(181) + "A)"]
+    assert [text.get_text() for text in figure.legends[0].get_texts()] == [
+        "BUFFER   1-3",
+        "TARGET   4-6",
+    ]
+    plt.close(figure)
+
+
+def test_paired_measurement_3d_stack_can_hide_axis_labels(monkeypatch):
+    phases = ["buffer"] * 3 + ["target"] * 3
+    loaded = [
+        {
+            "iteration": 1,
+            "stack_index": index,
+            "phase": phase,
+            "channel": "1",
+            "trace": {"phase": phase},
+            "voltage": pd.Series([-.5, -.25, 0.0]).to_numpy(),
+            "current": pd.Series([.0, .1, .0]).to_numpy(),
+        }
+        for index, phase in enumerate(phases)
+    ]
+    monkeypatch.setattr(
+        viewer,
+        "_chronological_swv_stack_entries",
+        lambda *_args, **_kwargs: (loaded, [], []),
+    )
+
+    figure, errors = viewer._plot_paired_measurement_3d_stack(
+        [],
+        False,
+        ["1"],
+        {},
+        {},
+        show_axis_labels=False,
+    )
+
+    axis = figure.axes[0]
+    assert not errors
+    assert axis.get_xlabel() == ""
+    assert axis.get_ylabel() == ""
+    assert axis.get_zlabel() == ""
+    assert not figure.texts
+    assert len(axis.get_yticklabels()) == 6
+    plt.close(figure)
+
+
 def test_paired_multi_iteration_overlay_uses_phase_colors(monkeypatch):
     monkeypatch.setattr(
         viewer,
