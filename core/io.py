@@ -9,7 +9,8 @@ import pandas as pd
 
 FILENAME_RE = re.compile(
     r"^(?P<mode>swv|cv)_ch(?P<ch>\d+)_([0-9a-f]+)_meas_"
-    r"(?P<date>\d{8})_(?P<time>\d{4})_(?P<scan>\d+)_ch(?P<ch2>\d+)\.csv$",
+    r"(?P<date>\d{8})_(?P<time>\d{4})_(?P<scan>\d+)_ch(?P<ch2>\d+)"
+    r"(?:_(?:max|min))?\.csv$",
     re.IGNORECASE,
 )
 CHANNEL_RE = re.compile(r"(?:^|[_\-\s])ch(?:annel)?\s*0*(\d+)(?:\D|$)", re.IGNORECASE)

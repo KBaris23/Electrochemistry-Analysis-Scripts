@@ -1774,6 +1774,175 @@ def test_replicate_swv_traces_use_distinct_phase_shades(monkeypatch):
     plt.close(figure)
 
 
+def test_replicate_swv_traces_can_show_dashed_phase_means(monkeypatch):
+    currents = {
+        "buffer_1.csv": [0.0, 1.0, 0.0],
+        "buffer_2.csv": [1.0, 2.0, 1.0],
+        "buffer_3.csv": [2.0, 3.0, 2.0],
+        "target_1.csv": [3.0, 4.0, 3.0],
+        "target_2.csv": [4.0, 5.0, 4.0],
+        "target_3.csv": [5.0, 6.0, 5.0],
+    }
+
+    def trace_arrays(path, *_args, **_kwargs):
+        return (
+            pd.Series([-0.5, -0.4, -0.3]).to_numpy(),
+            pd.Series(currents[path.name]).to_numpy(),
+            1,
+            0,
+            2,
+        )
+
+    monkeypatch.setattr(viewer, "_swv_trace_arrays", trace_arrays)
+    traces = [
+        {
+            "phase": phase,
+            "channel": "1",
+            "path": Path(f"{phase}_{replicate}.csv"),
+        }
+        for phase in ("buffer", "target")
+        for replicate in range(1, 4)
+    ]
+
+    figure, errors = _plot_traces(
+        {"root": Path(".")},
+        {"iteration": 1, "params": {}},
+        False,
+        ["1"],
+        {},
+        "session settings",
+        True,
+        traces,
+        show_phase_means=True,
+    )
+
+    assert not errors
+    mean_lines = [
+        line for line in figure.axes[0].lines
+        if "mean" in line.get_label().lower()
+    ]
+    assert len(mean_lines) == 2
+    assert all(line.get_linestyle() == "--" for line in mean_lines)
+    assert [line.get_color() for line in mean_lines] == [
+        viewer.SWV_PHASE_COLORS["buffer"],
+        viewer.SWV_PHASE_COLORS["target"],
+    ]
+    assert mean_lines[0].get_ydata().tolist() == pytest.approx([1.0, 2.0, 1.0])
+    assert mean_lines[1].get_ydata().tolist() == pytest.approx([4.0, 5.0, 4.0])
+    plt.close(figure)
+
+
+def test_paired_peak_height_layout_shows_three_points_and_dashed_means():
+    observation = {
+        "iteration": 47,
+        "group_id": 7,
+        "group_name": "Group 7",
+        "optimization_direction": "maximize",
+        "buffer_channel_metrics": {
+            "7_max": {
+                "peak_currents_uA": [0.0386, 0.0392, 0.0387],
+            },
+        },
+        "target_channel_metrics": {
+            "7_max": {
+                "peak_currents_uA": [0.0778, 0.0780, 0.0781],
+            },
+        },
+    }
+    traces = [
+        {"phase": phase, "channel": "7_max", "path": Path(f"{phase}.csv")}
+        for phase in ("buffer", "target")
+    ]
+
+    figure, errors = viewer._plot_paired_peak_height_replicates(
+        observation,
+        traces,
+        show_phase_means=True,
+    )
+
+    assert not errors
+    axes = figure.axes
+    assert len(axes) == 2
+    replicate_points = [
+        collection
+        for axis in axes
+        for collection in axis.collections
+        if "replicates" in collection.get_label().lower()
+    ]
+    mean_lines = [
+        line for axis in axes
+        for line in axis.lines
+        if line.get_label().lower().endswith(" mean")
+    ]
+    connecting_lines = [
+        line
+        for axis in axes
+        for line in axis.lines
+        if len(line.get_xdata()) == 3 and line.get_linestyle() == "-"
+    ]
+    assert len(replicate_points) == 2
+    assert [len(points.get_offsets()) for points in replicate_points] == [3, 3]
+    assert sorted(
+        points.get_offsets()[:, 0].tolist() for points in replicate_points
+    ) == [
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+    ]
+    assert len(connecting_lines) == 2
+    assert sorted(line.get_xdata().tolist() for line in connecting_lines) == [
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+    ]
+    assert len(mean_lines) == 2
+    assert all(line.get_linestyle() == "--" for line in mean_lines)
+    mean_lines_by_phase = {
+        line.get_label().split()[0].lower(): line
+        for line in mean_lines
+    }
+    assert mean_lines_by_phase["buffer"].get_ydata().tolist() == pytest.approx(
+        [sum([0.0386, 0.0392, 0.0387]) / 3] * 2
+    )
+    assert mean_lines_by_phase["target"].get_ydata().tolist() == pytest.approx(
+        [sum([0.0778, 0.0780, 0.0781]) / 3] * 2
+    )
+    assert [tick.get_text() for tick in axes[-1].get_xticklabels()] == [
+        "Buffer 1",
+        "Buffer 2",
+        "Buffer 3",
+        "Target 1",
+        "Target 2",
+        "Target 3",
+    ]
+    assert "iteration 47" in axes[0].get_title()
+    assert not any(
+        "Target - buffer mean" in annotation.get_text()
+        for axis in axes
+        for annotation in axis.texts
+    )
+    assert all(axis.get_legend() is None for axis in axes)
+    assert figure.get_size_inches()[1] == pytest.approx(4.25)
+    assert all(
+        (axis.get_ylim()[1] - axis.get_ylim()[0]) < 0.001
+        for axis in axes
+    )
+    assert figure._supylabel.get_fontsize() >= 12
+    plt.close(figure)
+
+    annotated_figure, errors = viewer._plot_paired_peak_height_replicates(
+        observation,
+        traces,
+        show_phase_means=True,
+        show_annotations=True,
+    )
+    assert not errors
+    assert any(
+        "Target - buffer mean" in annotation.get_text()
+        for axis in annotated_figure.axes
+        for annotation in axis.texts
+    )
+    plt.close(annotated_figure)
+
+
 def test_filtered_target_replicates_stay_orange(monkeypatch):
     monkeypatch.setattr(
         viewer,

@@ -39,7 +39,7 @@ from matplotlib.colors import (
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from matplotlib.text import Text
-from matplotlib.ticker import FixedFormatter, FixedLocator
+from matplotlib.ticker import FixedFormatter, FixedLocator, MaxNLocator, StrMethodFormatter
 from matplotlib.transforms import Bbox
 from matplotlib.backends.backend_pdf import PdfPages
 from mpl_toolkits.mplot3d import proj3d
@@ -126,6 +126,7 @@ SWV_PHASE_COLORS = {
     "target": "#ff7f0e",
 }
 PAIRED_MEASUREMENT_3D_LAYOUT = "Paired measurement 3D stack"
+PAIRED_PEAK_HEIGHT_LAYOUT = "Buffer/target peak-height replicates"
 OBSERVED_PATH_CMAP = LinearSegmentedColormap.from_list(
     "observed_iteration", OBSERVED_PATH_COLORS
 )
@@ -18250,6 +18251,421 @@ def _ordered_swv_replicate_legend_lines(lines: Sequence[Any]) -> list[Any]:
     )
 
 
+def _mean_swv_trace(
+    traces: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Average SWV curves on a shared voltage grid over their common range."""
+    cleaned: list[tuple[np.ndarray, np.ndarray]] = []
+    for voltage, current in traces:
+        x = np.asarray(voltage, dtype=float)
+        y = np.asarray(current, dtype=float)
+        finite = np.isfinite(x) & np.isfinite(y)
+        if not finite.any():
+            continue
+        x = x[finite]
+        y = y[finite]
+        order = np.argsort(x)
+        x = x[order]
+        y = y[order]
+        unique_x, unique_indices = np.unique(x, return_index=True)
+        if unique_x.size:
+            cleaned.append((unique_x, y[unique_indices]))
+    if not cleaned:
+        return None
+
+    overlap_min = max(float(x[0]) for x, _y in cleaned)
+    overlap_max = min(float(x[-1]) for x, _y in cleaned)
+    if overlap_min > overlap_max:
+        return None
+    reference_x = max(cleaned, key=lambda values: values[0].size)[0]
+    mean_x = reference_x[
+        (reference_x >= overlap_min) & (reference_x <= overlap_max)
+    ]
+    if not mean_x.size:
+        return None
+    interpolated = np.vstack([
+        np.interp(mean_x, x, y)
+        for x, y in cleaned
+    ])
+    return mean_x, np.nanmean(interpolated, axis=0)
+
+
+def _add_swv_phase_mean_lines(
+    ax: Any,
+    grouped_traces: Mapping[tuple[Any, ...], Sequence[tuple[np.ndarray, np.ndarray]]],
+) -> None:
+    """Draw a dashed pointwise mean through each buffer/target replicate set."""
+    for key, traces in grouped_traces.items():
+        if len(traces) < 2:
+            continue
+        phase = str(key[-1]).strip().lower()
+        if phase not in SWV_PHASE_COLORS:
+            continue
+        mean_trace = _mean_swv_trace(traces)
+        if mean_trace is None:
+            continue
+        mean_x, mean_y = mean_trace
+        identity = [str(value) for value in key[:-1] if str(value)]
+        suffix = f" · {' · '.join(identity)}" if identity else ""
+        ax.plot(
+            mean_x,
+            mean_y,
+            color=SWV_PHASE_COLORS[phase],
+            linewidth=2.2,
+            linestyle="--",
+            alpha=1.0,
+            zorder=5,
+            label=f"{phase.title()} mean{suffix}",
+        )
+
+
+def _paired_peak_height_values(
+    observation: Mapping[str, Any],
+    phase: str,
+    channel: Any,
+) -> list[float]:
+    """Return the saved three-replicate BO peak heights for one phase/channel."""
+    phase = str(phase).strip().lower()
+    if phase not in {"buffer", "target"}:
+        return []
+
+    metrics_by_channel = observation.get(f"{phase}_channel_metrics") or {}
+    if not isinstance(metrics_by_channel, Mapping):
+        metrics_by_channel = {}
+    direction = _rescore_direction(observation.get("optimization_direction"))
+    direction_suffix = {"maximize": "max", "minimize": "min"}.get(direction)
+    channel_text = str(channel).strip()
+    physical_match = re.search(r"\d+", channel_text)
+    physical_channel = physical_match.group(0) if physical_match else channel_text
+    candidates: list[Any] = [channel, channel_text]
+    if physical_channel:
+        candidates.extend([physical_channel])
+        if physical_channel.isdigit():
+            candidates.append(int(physical_channel))
+        if direction_suffix:
+            candidates.append(f"{physical_channel}_{direction_suffix}")
+
+    metrics: Mapping[str, Any] = {}
+    for candidate in candidates:
+        value = metrics_by_channel.get(candidate)
+        if isinstance(value, Mapping):
+            metrics = value
+            break
+    if not metrics and len(metrics_by_channel) == 1:
+        only_value = next(iter(metrics_by_channel.values()))
+        if isinstance(only_value, Mapping):
+            metrics = only_value
+
+    saved_values = metrics.get("peak_currents_uA") if metrics else None
+    values = [
+        numeric
+        for value in (saved_values or [])
+        if (numeric := _finite_float(value)) is not None
+    ]
+
+    # The paired-response score retains three replicate slots even when a
+    # failed peak was scored as zero. Prefer that complete record only when
+    # the phase summary contains fewer values than the saved replicate count.
+    quality = observation.get("quality") or {}
+    components_by_channel = quality.get("channel_components") or {}
+    components: Mapping[str, Any] = {}
+    if isinstance(components_by_channel, Mapping):
+        for candidate in candidates:
+            value = components_by_channel.get(candidate)
+            if isinstance(value, Mapping):
+                components = value
+                break
+        if not components and len(components_by_channel) == 1:
+            only_value = next(iter(components_by_channel.values()))
+            if isinstance(only_value, Mapping):
+                components = only_value
+    adjusted_values = components.get(
+        f"{phase}_failure_adjusted_peak_currents_uA"
+    ) if components else None
+    adjusted = [
+        numeric
+        for value in (adjusted_values or [])
+        if (numeric := _finite_float(value)) is not None
+    ]
+    if len(adjusted) > len(values):
+        return adjusted
+    return values
+
+
+def _plot_paired_peak_height_replicates(
+    observation: Mapping[str, Any],
+    traces: Sequence[Mapping[str, Any]],
+    *,
+    selected_phases: Optional[Sequence[str]] = ("buffer", "target"),
+    show_phase_means: bool = True,
+    show_annotations: bool = False,
+) -> tuple[Any, list[str]]:
+    """Plot buffer and target peak heights with a compact split y-axis."""
+    phases = [
+        phase
+        for phase in ("buffer", "target")
+        if selected_phases is None
+        or phase in {str(item).strip().lower() for item in selected_phases}
+    ]
+    channels = sorted(
+        {
+            str(trace.get("channel", "Unknown"))
+            for trace in traces
+            if str(trace.get("phase", "")).strip().lower() in phases
+        },
+        key=_channel_sort_key,
+    )
+    if not channels:
+        channels = sorted(
+            {
+                str(channel)
+                for phase in phases
+                for channel in (
+                    observation.get(f"{phase}_channel_metrics") or {}
+                )
+            },
+            key=_channel_sort_key,
+        )
+
+    series_by_channel: dict[str, dict[str, list[float]]] = {}
+    for channel in channels:
+        phase_values = {
+            phase: _paired_peak_height_values(observation, phase, channel)
+            for phase in phases
+        }
+        if any(phase_values.values()):
+            series_by_channel[channel] = phase_values
+    if not series_by_channel:
+        figure, axis = plt.subplots(figsize=(7.2, 3.5))
+        axis.set_axis_off()
+        axis.text(
+            0.5,
+            0.5,
+            "No saved buffer/target peak-height replicates are available.",
+            ha="center",
+            va="center",
+        )
+        return figure, [
+            "No saved buffer/target peak-height replicates were found for this selection."
+        ]
+
+    split_channels = {
+        channel
+        for channel, phase_values in series_by_channel.items()
+        if phase_values.get("buffer") and phase_values.get("target")
+    }
+    figure = plt.figure(
+        figsize=(
+            7.2,
+            sum(
+                4.25 if channel in split_channels else 3.5
+                for channel in series_by_channel
+            ),
+        )
+    )
+    outer_grid = figure.add_gridspec(
+        len(series_by_channel),
+        1,
+        hspace=0.38,
+    )
+    group_name = str(
+        observation.get("group_name")
+        or f"Group {observation.get('group_id', 1)}"
+    )
+    iteration = int(observation.get("iteration", 0))
+    errors: list[str] = []
+    for channel_index, (channel, phase_values) in enumerate(
+        series_by_channel.items()
+    ):
+        split_axis = channel in split_channels
+        if split_axis:
+            inner_grid = outer_grid[channel_index].subgridspec(
+                2,
+                1,
+                hspace=0.06,
+            )
+            top_axis = figure.add_subplot(inner_grid[0])
+            bottom_axis = figure.add_subplot(inner_grid[1], sharex=top_axis)
+            phase_axes = {
+                "target": top_axis,
+                "buffer": bottom_axis,
+            }
+            channel_axes = [top_axis, bottom_axis]
+        else:
+            only_axis = figure.add_subplot(outer_grid[channel_index])
+            phase_axes = {phase: only_axis for phase in phases}
+            channel_axes = [only_axis]
+
+        tick_positions: list[float] = []
+        tick_labels: list[str] = []
+        phase_positions: dict[str, list[float]] = {}
+        next_position = 1.0
+        means: dict[str, float] = {}
+        plotted_values: dict[str, list[float]] = {}
+        for phase in phases:
+            values = phase_values.get(phase) or []
+            if not values:
+                continue
+            axis = phase_axes[phase]
+            positions = list(
+                np.arange(next_position, next_position + len(values), dtype=float)
+            )
+            phase_positions[phase] = positions
+            color = SWV_PHASE_COLORS[phase]
+            axis.scatter(
+                positions,
+                values,
+                color=color,
+                s=58,
+                marker="o",
+                edgecolors="white",
+                linewidths=0.9,
+                label=f"{phase.title()} replicates",
+                zorder=4,
+            )
+            plotted_values[phase] = list(values)
+            mean_value = float(np.mean(values))
+            means[phase] = mean_value
+            if show_phase_means:
+                axis.plot(
+                    [positions[0] - 0.30, positions[-1] + 0.30],
+                    [mean_value, mean_value],
+                    color=color,
+                    linewidth=2.0,
+                    linestyle="--",
+                    label=f"{phase.title()} mean",
+                    zorder=4,
+                )
+            tick_positions.extend(positions)
+            tick_labels.extend(
+                f"{phase.title()} {index}"
+                for index in range(1, len(values) + 1)
+            )
+            next_position = positions[-1] + 1.0
+
+        for phase in phases:
+            positions = phase_positions.get(phase, [])
+            values = plotted_values.get(phase, [])
+            if len(positions) > 1:
+                phase_axes[phase].plot(
+                    positions,
+                    values,
+                    color=SWV_PHASE_COLORS[phase],
+                    linewidth=1.7,
+                    label="_nolegend_",
+                    zorder=2,
+                )
+
+        if (
+            show_annotations
+            and "buffer" in means
+            and "target" in means
+        ):
+            delta = means["target"] - means["buffer"]
+            channel_axes[-1].text(
+                0.985,
+                0.04,
+                f"Target - buffer mean = {delta:.5g} " + chr(181) + "A",
+                transform=channel_axes[-1].transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=10.5,
+                color="#222222",
+            )
+
+        for phase, values in plotted_values.items():
+            axis = phase_axes[phase]
+            lower = min(values)
+            upper = max(values)
+            span = upper - lower
+            padding = (
+                0.18 * span
+                if span > 0
+                else max(abs(lower) * 0.01, 0.00001)
+            )
+            axis.set_ylim(lower - padding, upper + padding)
+
+        for axis in channel_axes:
+            if tick_positions:
+                axis.set_xlim(
+                    min(tick_positions) - 0.55,
+                    max(tick_positions) + 0.55,
+                )
+            axis.tick_params(axis="both", labelsize=11)
+            axis.grid(axis="y", color="#d9dde3", linewidth=0.8, alpha=0.65)
+            axis.set_axisbelow(True)
+            axis.yaxis.set_major_locator(MaxNLocator(nbins=4))
+            axis.yaxis.set_major_formatter(StrMethodFormatter("{x:.5f}"))
+
+        bottom_axis = channel_axes[-1]
+        bottom_axis.set_xticks(tick_positions, tick_labels)
+        bottom_axis.set_xlabel("Replicate measurement", fontsize=12.5)
+        if split_axis:
+            top_axis.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+            top_axis.spines["bottom"].set_visible(False)
+            bottom_axis.spines["top"].set_visible(False)
+            break_size = 0.012
+            break_kwargs = {
+                "color": "#222222",
+                "clip_on": False,
+                "linewidth": 1.1,
+            }
+            top_axis.plot(
+                (-break_size, +break_size),
+                (-break_size, +break_size),
+                transform=top_axis.transAxes,
+                **break_kwargs,
+            )
+            top_axis.plot(
+                (1 - break_size, 1 + break_size),
+                (-break_size, +break_size),
+                transform=top_axis.transAxes,
+                **break_kwargs,
+            )
+            bottom_axis.plot(
+                (-break_size, +break_size),
+                (1 - break_size, 1 + break_size),
+                transform=bottom_axis.transAxes,
+                **break_kwargs,
+            )
+            bottom_axis.plot(
+                (1 - break_size, 1 + break_size),
+                (1 - break_size, 1 + break_size),
+                transform=bottom_axis.transAxes,
+                **break_kwargs,
+            )
+        else:
+            bottom_axis.set_ylabel(
+                "Peak Height (" + chr(181) + "A)",
+                fontsize=12.5,
+            )
+        physical_match = re.search(r"\d+", str(channel))
+        channel_title = (
+            f"Channel {physical_match.group(0)}"
+            if physical_match
+            else _trace_channel_label(channel)
+        )
+        direction = _rescore_direction(
+            observation.get("optimization_direction")
+        )
+        if direction in {"maximize", "minimize"}:
+            channel_title += f" | {direction.capitalize()}"
+        channel_axes[0].set_title(
+            f"{group_name} | iteration {iteration} | "
+            f"{channel_title}",
+            fontsize=14,
+            pad=7,
+        )
+    if split_channels:
+        figure.supylabel(
+            "Peak Height (" + chr(181) + "A)",
+            x=0.022,
+            fontsize=12.5,
+        )
+    figure.subplots_adjust(left=0.18, right=0.985, top=0.91, bottom=0.14)
+    return figure, errors
+
+
 def _compact_trace_stem(path: Path, *, max_chars: int = 42) -> str:
     stem = str(path.stem)
     if len(stem) <= max_chars:
@@ -19034,6 +19450,7 @@ def _plot_traces(
     offset_to_baseline: bool = False,
     voltage_min: float | None = None,
     voltage_max: float | None = None,
+    show_phase_means: bool = False,
 ):
     traces = [
         item for item in (
@@ -19059,6 +19476,9 @@ def _plot_traces(
         [trace.get("phase") for trace in traces]
     )
     phase_trace_labels = _swv_trace_legend_labels(traces)
+    mean_trace_groups: dict[
+        tuple[str, str], list[tuple[np.ndarray, np.ndarray]]
+    ] = {}
     for trace_index, item in enumerate(traces):
         phase, path, channel = item["phase"], item["path"], item["channel"]
         try:
@@ -19098,9 +19518,18 @@ def _plot_traces(
                 linestyle=_swv_trace_linestyle(item),
                 label=phase_trace_labels[trace_index],
             )
+            if show_phase_means:
+                phase = str(item.get("phase", "")).strip().lower()
+                if phase in SWV_PHASE_COLORS:
+                    mean_trace_groups.setdefault(
+                        (_trace_channel_label(_trace_channel_key(item)), phase),
+                        [],
+                    ).append((voltage, y))
         except Exception as exc:
             if not is_peak_height_below_cutoff_error(exc):
                 errors.append(f"{path.name}: {exc}")
+    if show_phase_means:
+        _add_swv_phase_mean_lines(ax, mean_trace_groups)
     if not traces:
         message = (
             "No traces match the selected channels."
@@ -19188,6 +19617,7 @@ def _plot_iteration_trace_overlay(
     offset_to_baseline: bool = False,
     voltage_min: float | None = None,
     voltage_max: float | None = None,
+    show_phase_means: bool = False,
 ):
     """Overlay traces from many observations with channel-aware colors."""
     entries = [
@@ -19246,6 +19676,9 @@ def _plot_iteration_trace_overlay(
         }
         iteration_norm = None
         iteration_cmap = None
+    mean_trace_groups: dict[
+        tuple[str, str, str], list[tuple[np.ndarray, np.ndarray]]
+    ] = {}
     for entry_index, (observation, item) in enumerate(entries):
         phase, path, channel = item["phase"], item["path"], _trace_channel_key(item)
         iteration = int(observation.get("iteration", 0))
@@ -19291,9 +19724,29 @@ def _plot_iteration_trace_overlay(
                 linestyle=_swv_trace_linestyle(item),
                 label=phase_trace_labels[entry_index],
             )
+            if show_phase_means:
+                phase = str(item.get("phase", "")).strip().lower()
+                if phase in SWV_PHASE_COLORS:
+                    group_name = str(
+                        observation.get("group_name")
+                        or f"Group {observation.get('group_id', 1)}"
+                    )
+                    iteration_label = (
+                        f"{group_name} iteration {iteration}"
+                    )
+                    mean_trace_groups.setdefault(
+                        (
+                            iteration_label,
+                            _trace_channel_label(channel),
+                            phase,
+                        ),
+                        [],
+                    ).append((voltage, y))
         except Exception as exc:
             if not is_peak_height_below_cutoff_error(exc):
                 errors.append(f"{path.name}: {exc}")
+    if show_phase_means:
+        _add_swv_phase_mean_lines(ax, mean_trace_groups)
     if not entries:
         ax.text(
             .5,
@@ -37821,6 +38274,8 @@ def render_bo_session_app() -> None:
                     "Plot each iteration separately",
                     "Overlay SWV traces",
                 ]
+                if trace_has_paired_phases:
+                    trace_layout_options.append(PAIRED_PEAK_HEIGHT_LAYOUT)
                 if (
                     not trace_all_mode
                     and selected_trace_phase_set == {"buffer", "target"}
@@ -37842,6 +38297,40 @@ def render_bo_session_app() -> None:
                     horizontal=True,
                     key=trace_layout_key,
                 )
+                show_phase_means = False
+                show_peak_height_annotations = False
+                if trace_has_paired_phases:
+                    peak_height_layout = (
+                        trace_layout == PAIRED_PEAK_HEIGHT_LAYOUT
+                    )
+                    show_phase_means = trace_settings_form.checkbox(
+                        (
+                            "Show dashed buffer/target mean lines"
+                            if peak_height_layout
+                            else "Show dashed buffer/target mean traces"
+                        ),
+                        value=peak_height_layout,
+                        key=(
+                            f"bo_trace_phase_means_{swv_group_scope}_"
+                            f"{'peak_heights' if peak_height_layout else 'swv_traces'}"
+                        ),
+                        disabled=trace_layout not in {
+                            "Plot each iteration separately",
+                            "Overlay SWV traces",
+                            PAIRED_PEAK_HEIGHT_LAYOUT,
+                        },
+                        help=(
+                            (
+                                "Adds a dashed horizontal mean across the saved "
+                                "peak-height replicate points for each phase."
+                                if peak_height_layout
+                                else
+                                "Adds a pointwise dashed mean through the replicate "
+                                "SWV curves for each buffer and target measurement "
+                                "within each BO iteration."
+                            )
+                        ),
+                    )
                 trace_type_options = [
                     "Raw",
                     "Offset raw",
@@ -38195,6 +38684,8 @@ def render_bo_session_app() -> None:
                     tuple(selected_channels),
                     trace_channel_layout,
                     trace_layout,
+                    show_phase_means,
+                    show_peak_height_annotations,
                     tuple(selected_trace_types),
                     trace_voltage_min,
                     trace_voltage_max,
@@ -38241,9 +38732,14 @@ def render_bo_session_app() -> None:
                     )
                     if not selected_channels:
                         st.info("Select at least one channel to display traces.")
-                    if not selected_trace_types:
+                    trace_type_required = (
+                        trace_layout != PAIRED_PEAK_HEIGHT_LAYOUT
+                    )
+                    if trace_type_required and not selected_trace_types:
                         st.info("Select at least one trace type to display traces.")
-                    if not selected_channels or not selected_trace_types:
+                    if not selected_channels or (
+                        trace_type_required and not selected_trace_types
+                    ):
                         channel_groups = []
                     for channel_group in channel_groups:
                         phase_targets = [(None, selected_trace_phases)]
@@ -38266,6 +38762,84 @@ def render_bo_session_app() -> None:
                         for phase_label, selected_stack_phases in phase_targets:
                             if phase_label is not None:
                                 st.markdown(f"**{phase_label.title()}**")
+                            if trace_layout == PAIRED_PEAK_HEIGHT_LAYOUT:
+                                iteration_entries = [
+                                    (trace_observation, trace)
+                                    for trace_observation, trace
+                                    in display_trace_entries
+                                    if _trace_channel_key(trace) in channel_group
+                                    and (
+                                        selected_stack_phases is None
+                                        or str(trace.get("phase", "")).lower()
+                                        in {
+                                            str(phase).lower()
+                                            for phase in selected_stack_phases
+                                        }
+                                    )
+                                ]
+                                grouped_iteration_entries = (
+                                    _trace_entries_by_iteration(iteration_entries)
+                                )
+                                if not grouped_iteration_entries:
+                                    st.info(
+                                        "No saved peak-height replicates match "
+                                        "this channel and phase selection."
+                                    )
+                                    continue
+                                for peak_plot_index, (
+                                    iteration_group_id,
+                                    iteration_value,
+                                    iteration_observation,
+                                    iteration_traces,
+                                ) in enumerate(grouped_iteration_entries, start=1):
+                                    figure, errors = (
+                                        _plot_paired_peak_height_replicates(
+                                            iteration_observation,
+                                            iteration_traces,
+                                            selected_phases=(
+                                                selected_stack_phases
+                                            ),
+                                            show_phase_means=show_phase_means,
+                                            show_annotations=(
+                                                show_peak_height_annotations
+                                            ),
+                                        )
+                                    )
+                                    iteration_group_name = str(
+                                        iteration_observation.get("group_name")
+                                        or f"Group {iteration_group_id}"
+                                    )
+                                    channel_token = (
+                                        "_".join(map(str, channel_group))
+                                        or "all_channels"
+                                    )
+                                    _render_downloadable_pyplot(
+                                        st,
+                                        figure,
+                                        key=(
+                                            f"bo_peak_height_replicates_"
+                                            f"{swv_group_scope}_"
+                                            f"{trace_iteration_token}_"
+                                            f"{peak_plot_index}_"
+                                            f"{iteration_group_id}_"
+                                            f"{iteration_value}_"
+                                            f"{phase_label or 'all'}_"
+                                            f"{channel_token}_"
+                                            f"{'means' if show_phase_means else 'no_means'}_"
+                                            f"{'annotations' if show_peak_height_annotations else 'no_annotations'}"
+                                        ),
+                                        file_stem=(
+                                            "bo_peak_height_replicates_"
+                                            f"{iteration_group_name}_"
+                                            f"iteration_{iteration_value}_"
+                                            f"{channel_token}"
+                                        ),
+                                        width_percent=plot_width_percent,
+                                        enable_series_customization=True,
+                                    )
+                                    for error in errors:
+                                        st.warning(error)
+                                continue
                             if trace_layout == "Each SWV trace separately":
                                 separate_entries = [
                                     (trace_observation, trace)
@@ -38504,6 +39078,7 @@ def render_bo_session_app() -> None:
                                                 current_offset_to_baseline,
                                                 trace_voltage_min,
                                                 trace_voltage_max,
+                                                show_phase_means,
                                             )
                                         if (
                                             trace_y_min is not None
@@ -38655,6 +39230,7 @@ def render_bo_session_app() -> None:
                                             current_offset_to_baseline,
                                             trace_voltage_min,
                                             trace_voltage_max,
+                                            show_phase_means,
                                         )
                                     else:
                                         figure, errors = _plot_traces(
@@ -38671,6 +39247,7 @@ def render_bo_session_app() -> None:
                                             current_offset_to_baseline,
                                             trace_voltage_min,
                                             trace_voltage_max,
+                                            show_phase_means,
                                         )
                                 if (
                                     trace_y_min is not None
@@ -38743,6 +39320,7 @@ def render_bo_session_app() -> None:
                         trace_all_mode
                         and selected_channels
                         and trace_layout != "Each SWV trace separately"
+                        and trace_layout != PAIRED_PEAK_HEIGHT_LAYOUT
                         and len(selected_trace_types) == 1
                     ):
                         selected_trace_type = selected_trace_types[0]
@@ -38756,6 +39334,7 @@ def render_bo_session_app() -> None:
                         trace_gif_key = (
                             f"bo_trace_gif_{swv_group_scope}_"
                             f"{trace_iteration_token}_{trace_layout}_{selected_trace_type}_"
+                            f"{'means_' if show_phase_means else ''}"
                             f"{selected_trace_phase_label}_"
                             f"{trace_voltage_min:g}_{trace_voltage_max:g}_"
                             f"{trace_y_min if trace_y_min is not None else 'auto'}_"
@@ -38856,6 +39435,7 @@ def render_bo_session_app() -> None:
                                                         offset_to_baseline=offset_to_baseline,
                                                         voltage_min=trace_voltage_min,
                                                         voltage_max=trace_voltage_max,
+                                                        show_phase_means=show_phase_means,
                                                     )
                                                     if errors:
                                                         fig.text(
@@ -38920,6 +39500,7 @@ def render_bo_session_app() -> None:
                                                     offset_to_baseline=offset_to_baseline,
                                                     voltage_min=trace_voltage_min,
                                                     voltage_max=trace_voltage_max,
+                                                    show_phase_means=show_phase_means,
                                                 )
                                                 if errors:
                                                     fig.text(
