@@ -90,18 +90,55 @@ def test_pyplot_renderer_returns_the_exact_displayed_preview(monkeypatch):
     assert container.image_width == 1000
 
 
-def test_matplotlib_individual_export_includes_tight_png_and_real_pdf():
+def test_matplotlib_individual_export_includes_png_pdf_and_svg():
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
     ax.plot([0.0, 1.0], [0.0, 1.0])
     png = viewer._matplotlib_png_bytes(fig, apply_global_style=False)
     pdf = viewer._matplotlib_pdf_bytes(fig)
+    svg = viewer._matplotlib_svg_bytes(fig)
     try:
         assert png.startswith(b"\x89PNG\r\n\x1a\n")
         assert pdf.startswith(b"%PDF-")
+        assert b"<svg" in svg[:500]
         assert len(pdf) > 500
+        assert len(svg) > 500
         with Image.open(BytesIO(png)) as image:
             assert image.width < 640
             assert image.height < 400
+    finally:
+        plt.close(fig)
+
+
+def test_paired_3d_export_bbox_includes_projected_axis_labels():
+    fig = plt.figure(figsize=(8.2, 6.2))
+    ax = fig.add_subplot(111, projection="3d")
+    ax._bo_paired_measurement_3d_stack = True
+    ax.plot([0.0, 1.0], [1.0, 6.0], [0.0, 1.0])
+    ax.set_xlabel("Voltage (V)")
+    ax.set_ylabel("Measurement")
+    ax.set_zlabel("Current (uA)")
+    ax.view_init(elev=20, azim=-55)
+    baseline = BytesIO()
+    fig.savefig(
+        baseline,
+        format="png",
+        dpi=100,
+        bbox_inches="tight",
+        pad_inches=0.03,
+    )
+    exported = viewer._matplotlib_png_bytes(
+        fig,
+        apply_global_style=False,
+    )
+    try:
+        assert viewer._matplotlib_export_bbox_extra_artists(fig) == (
+            ax.xaxis.label,
+            ax.yaxis.label,
+            ax.zaxis.label,
+        )
+        with Image.open(BytesIO(baseline.getvalue())) as baseline_image:
+            with Image.open(BytesIO(exported)) as exported_image:
+                assert exported_image.width > baseline_image.width
     finally:
         plt.close(fig)
 

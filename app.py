@@ -883,7 +883,9 @@ def render_downloadable_pyplot(
     reconstruction_y_tick_positions_text = ""
     reconstruction_y_tick_labels_text = ""
 
-    with settings_col.popover("Plot settings", use_container_width=True):
+    with settings_col.popover(
+        "Plot settings", use_container_width=True
+    ), st.form(f"{key}_plot_settings_form", border=False):
         if trace_alpha_key is not None:
             st.slider(
                 "Trace alpha",
@@ -1286,6 +1288,11 @@ def render_downloadable_pyplot(
                     if y_limits_require_positive
                     else "Y minimum must be smaller than Y maximum."
                 )
+        st.form_submit_button(
+            "Apply plot settings",
+            type="primary",
+            use_container_width=True,
+        )
 
     if primary_axis is not None:
         if override_plot_text:
@@ -1531,14 +1538,50 @@ def render_downloadable_pyplot(
         )
     else:
         plot_slot.pyplot(fig)
-    download_col.download_button(
-        "Download plot",
-        data=buffer.getvalue(),
-        file_name=f"{safe_download_stem(file_stem)}.png",
-        mime="image/png",
-        key=f"{key}_download",
-        use_container_width=True,
-    )
+    download_formats = {
+        "PNG": ("png", "image/png"),
+        "PDF": ("pdf", "application/pdf"),
+        "SVG": ("svg", "image/svg+xml"),
+    }
+    with download_col.popover("Download plot", use_container_width=True):
+        download_format_label = st.selectbox(
+            "Format",
+            list(download_formats),
+            key=f"{key}_download_format",
+        )
+        download_format, download_mime = download_formats[
+            download_format_label
+        ]
+        if download_format == "png":
+            download_bytes = buffer.getvalue()
+        else:
+            download_buffer = io.BytesIO()
+            fig.savefig(
+                download_buffer,
+                format=download_format,
+                dpi=output_dpi,
+                bbox_inches=(
+                    None
+                    if plot_kind in {
+                        "concentration_accuracy",
+                        "concentration_measurement",
+                        "concentration_reconstruction",
+                        "swv_trace",
+                    }
+                    else "tight"
+                ),
+            )
+            download_bytes = download_buffer.getvalue()
+        st.download_button(
+            f"Download {download_format_label}",
+            data=download_bytes,
+            file_name=(
+                f"{safe_download_stem(file_stem)}.{download_format}"
+            ),
+            mime=download_mime,
+            key=f"{key}_download",
+            use_container_width=True,
+        )
     plt.close(fig)
 
 # 

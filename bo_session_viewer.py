@@ -26033,6 +26033,29 @@ def _sanitize_matplotlib_text_for_png(fig, *, max_chars: int = 180) -> None:
                 continue
 
 
+def _matplotlib_export_bbox_extra_artists(fig) -> tuple:
+    """Include projected 3D labels that Matplotlib's tight bbox can miss."""
+    extra_artists = []
+    for axis in getattr(fig, "axes", []):
+        if not bool(
+            getattr(axis, "_bo_paired_measurement_3d_stack", False)
+        ):
+            continue
+        for matplotlib_axis in (
+            axis.xaxis,
+            axis.yaxis,
+            getattr(axis, "zaxis", None),
+        ):
+            label = getattr(matplotlib_axis, "label", None)
+            if (
+                label is not None
+                and label.get_visible()
+                and str(label.get_text()).strip()
+            ):
+                extra_artists.append(label)
+    return tuple(extra_artists)
+
+
 def _matplotlib_png_bytes(
     fig,
     *,
@@ -26042,6 +26065,7 @@ def _matplotlib_png_bytes(
     if apply_global_style:
         _apply_global_plot_style(fig)
     buffer = BytesIO()
+    bbox_extra_artists = _matplotlib_export_bbox_extra_artists(fig)
     try:
         fig.savefig(
             buffer,
@@ -26050,6 +26074,7 @@ def _matplotlib_png_bytes(
             bbox_inches="tight",
             pad_inches=0.03,
             facecolor=fig.get_facecolor(),
+            bbox_extra_artists=bbox_extra_artists or None,
         )
     except Exception:
         buffer = BytesIO()
@@ -26061,6 +26086,7 @@ def _matplotlib_png_bytes(
             bbox_inches="tight",
             pad_inches=0.03,
             facecolor=fig.get_facecolor(),
+            bbox_extra_artists=bbox_extra_artists or None,
         )
     return buffer.getvalue()
 
@@ -26074,12 +26100,35 @@ def _matplotlib_pdf_bytes(
     if apply_global_style:
         _apply_global_plot_style(fig)
     buffer = BytesIO()
+    bbox_extra_artists = _matplotlib_export_bbox_extra_artists(fig)
     fig.savefig(
         buffer,
         format="pdf",
         bbox_inches="tight",
         pad_inches=0.03,
         facecolor=fig.get_facecolor(),
+        bbox_extra_artists=bbox_extra_artists or None,
+    )
+    return buffer.getvalue()
+
+
+def _matplotlib_svg_bytes(
+    fig,
+    *,
+    apply_global_style: bool = False,
+) -> bytes:
+    """Return an editable vector SVG for the configured figure."""
+    if apply_global_style:
+        _apply_global_plot_style(fig)
+    buffer = BytesIO()
+    bbox_extra_artists = _matplotlib_export_bbox_extra_artists(fig)
+    fig.savefig(
+        buffer,
+        format="svg",
+        bbox_inches="tight",
+        pad_inches=0.03,
+        facecolor=fig.get_facecolor(),
+        bbox_extra_artists=bbox_extra_artists or None,
     )
     return buffer.getvalue()
 
@@ -26091,22 +26140,45 @@ def _render_matplotlib_download_links(
     *,
     file_stem: str,
 ) -> None:
-    """Offer both raster and publication-friendly vector exports."""
+    """Offer one format-selecting download control for a Matplotlib plot."""
     safe_stem = _safe_download_stem(file_stem)
-    _render_browser_download_link(
-        container,
-        "Download PNG",
-        png_bytes,
-        file_name=f"{safe_stem}.png",
-        mime="image/png",
-    )
-    _render_browser_download_link(
-        container,
-        "Download PDF",
-        _matplotlib_pdf_bytes(fig),
-        file_name=f"{safe_stem}.pdf",
-        mime="application/pdf",
-    )
+    if not hasattr(container, "popover"):
+        _render_browser_download_link(
+            container,
+            "Download plot",
+            png_bytes,
+            file_name=f"{safe_stem}.png",
+            mime="image/png",
+        )
+        return
+
+    with container.popover("Download plot", use_container_width=True):
+        selected_format = st.selectbox(
+            "Format",
+            ["PNG", "PDF", "SVG"],
+            key=f"bo_plot_download_format_{safe_stem}",
+        )
+        if selected_format == "PNG":
+            export_bytes, extension, mime = png_bytes, "png", "image/png"
+        elif selected_format == "PDF":
+            export_bytes, extension, mime = (
+                _matplotlib_pdf_bytes(fig),
+                "pdf",
+                "application/pdf",
+            )
+        else:
+            export_bytes, extension, mime = (
+                _matplotlib_svg_bytes(fig),
+                "svg",
+                "image/svg+xml",
+            )
+        _render_browser_download_link(
+            st,
+            f"Download {selected_format}",
+            export_bytes,
+            file_name=f"{safe_stem}.{extension}",
+            mime=mime,
+        )
 
 
 def _render_browser_download_link(
