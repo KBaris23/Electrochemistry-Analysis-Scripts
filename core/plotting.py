@@ -306,8 +306,10 @@ def _cmap_fig(
 
     offset_to_baseline: bool = False,
 
+    trace_modulo: int = 1,
 ) -> plt.Figure:
 
+    trace_modulo = max(1, int(trace_modulo))
     n = len(results)
 
     cmap = plt.get_cmap(colormap_name, max(n, 2))
@@ -323,6 +325,8 @@ def _cmap_fig(
         ax.axhline(0, color="gray", lw=1.0, linestyle="--", alpha=0.8)
 
     for i, r in enumerate(results, start=1):
+        if (i - 1) % trace_modulo:
+            continue
         if r.get(y_key) is None or r.get("voltage") is None:
 
             continue
@@ -2122,6 +2126,7 @@ def plot_overlaid_traces(
 
     offset_to_baseline: bool = False,
 
+    trace_modulo: int = 1,
 ) -> Optional[plt.Figure]:
     usable = [r for r in results if r.get(y_key) is not None and r.get("voltage") is not None]
 
@@ -2174,7 +2179,9 @@ def plot_overlaid_traces(
 
                      normalize_to_peak=normalize_to_peak,
 
-                     offset_to_baseline=offset_to_baseline)
+                     offset_to_baseline=offset_to_baseline,
+
+                     trace_modulo=trace_modulo)
 
 
 def plot_grouped_overlaid_traces(
@@ -2194,8 +2201,10 @@ def plot_grouped_overlaid_traces(
     show_legend: bool = True,
     show_grid: bool = False,
     outer_margin_fraction: float = 0.04,
+    trace_modulo: int = 1,
 ) -> Optional[plt.Figure]:
     """Overlay multiple SWV groups, using a separate time-gradient colormap per group."""
+    trace_modulo = max(1, int(trace_modulo))
     fig, ax = plt.subplots(figsize=(10, 5))
     if show_zero_baseline:
         ax.axhline(0, color="gray", lw=1.0, linestyle="--", alpha=0.8)
@@ -2217,6 +2226,8 @@ def plot_grouped_overlaid_traces(
         norm = Normalize(vmin=1, vmax=max(len(usable), 2))
         group_trace_count = 0
         for index, row in enumerate(usable, start=1):
+            if (index - 1) % trace_modulo:
+                continue
             voltage = np.asarray(row["voltage"], dtype=float)
             y_plot = np.asarray(row[y_key], dtype=float)
             try:
@@ -2285,7 +2296,7 @@ def plot_grouped_overlaid_traces(
             scalar_mappable = cm.ScalarMappable(cmap=cmap, norm=norm)
             scalar_mappable.set_array([])
             group_colorbars.append(
-                (scalar_mappable, group_number, group_trace_count)
+                (scalar_mappable, group_number, len(usable))
             )
 
     if not plotted_trace_count:
