@@ -743,6 +743,8 @@ def render_downloadable_pyplot(
     file_stem: str,
     dpi: int = 150,
     plot_kind: Optional[str] = None,
+    trace_modulo_key: Optional[str] = None,
+    trace_alpha_key: Optional[str] = None,
 ) -> None:
     settings_prefix = (
         "swv_langmuir_plot" if plot_kind == "langmuir_fit" else "swv_plot"
@@ -882,6 +884,29 @@ def render_downloadable_pyplot(
     reconstruction_y_tick_labels_text = ""
 
     with settings_col.popover("Plot settings", use_container_width=True):
+        if trace_alpha_key is not None:
+            st.slider(
+                "Trace alpha",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state.get("swv_overlay_line_alpha", 0.85)),
+                step=0.05,
+                key=trace_alpha_key,
+                help="Opacity of this plot's SWV trace lines: 0 is transparent; 1 is opaque.",
+            )
+        if trace_modulo_key is not None:
+            st.number_input(
+                "Modulo (n)",
+                min_value=1,
+                value=1,
+                step=1,
+                key=trace_modulo_key,
+                help=(
+                    "Plot every nth SWV trace, starting with the first: "
+                    "1 shows all traces; 2 shows traces 1, 3, 5, … . "
+                    "Applied separately within each group in grouped overlays."
+                ),
+            )
         override_plot_text = st.checkbox(
             "Override plot text",
             key=f"{key}_override_plot_text",
@@ -3509,10 +3534,18 @@ def build_channel_indexes(
             mapping[channel] = sorted(rows, key=_scan_sort_key)
 
     if scan_range is None:
+        all_in_range_by_channel = all_by_channel
         ok_in_range_by_channel = ok_by_channel
         failed_in_range_by_channel = failed_by_channel
     else:
         start, end = scan_range
+        all_in_range_by_channel = {
+            channel: [
+                row for row in rows
+                if row.get("scan_number") is not None and start <= row["scan_number"] <= end
+            ]
+            for channel, rows in all_by_channel.items()
+        }
         ok_in_range_by_channel = {
             channel: [
                 row for row in rows
@@ -3530,6 +3563,7 @@ def build_channel_indexes(
 
     return {
         "all_by_channel": all_by_channel,
+        "all_in_range_by_channel": all_in_range_by_channel,
         "ok_by_channel": ok_by_channel,
         "failed_by_channel": failed_by_channel,
         "ok_in_range_by_channel": ok_in_range_by_channel,
@@ -5832,8 +5866,13 @@ if view == "Overlays":
         }
         y_key = key_map[trace_type]
 
+        overlay_results_by_channel = (
+            plot_channel_indexes["all_in_range_by_channel"]
+            if trace_type == "Raw"
+            else plot_ok_results_by_channel
+        )
         for ch in plot_channels_display:
-            ch_res = plot_ok_results_by_channel.get(ch, [])
+            ch_res = overlay_results_by_channel.get(ch, [])
             if not ch_res:
                 continue
             with st.expander(f"Channel {ch}  ({len(ch_res)} cycles)", expanded=len(plot_channels_display) <= 4):
@@ -5946,6 +5985,11 @@ if view == "Overlays":
         y_key = key_map[trace_type]
         normalize_to_peak = trace_type == "Normalized Smoothed Corrected"
         offset_to_baseline = trace_type == "Offset Raw"
+        overlay_results_by_channel = (
+            plot_channel_indexes["all_in_range_by_channel"]
+            if trace_type == "Raw"
+            else plot_ok_results_by_channel
+        )
         overlay_ylabel = (
             "Normalized current (peak = 1)"
             if normalize_to_peak
@@ -5958,10 +6002,12 @@ if view == "Overlays":
                 plot_channels_display,
             )
             for original_ch, display_groups in grouped_channels.items():
+                trace_modulo_key = f"swv_grouped_overlay_{original_ch}_trace_modulo"
+                trace_alpha_key = f"swv_grouped_overlay_{original_ch}_trace_alpha"
                 grouped_trace_sets = []
                 total_trace_count = 0
                 for group_position, display_group in enumerate(display_groups):
-                    group_rows = plot_ok_results_by_channel.get(display_group, [])
+                    group_rows = overlay_results_by_channel.get(display_group, [])
                     if not group_rows:
                         continue
                     first_row = group_rows[0]
@@ -5990,6 +6036,7 @@ if view == "Overlays":
                 ):
                     fig = plot_grouped_overlaid_traces(
                         grouped_trace_sets,
+                        trace_modulo=int(st.session_state.get(trace_modulo_key, 1)),
                         y_key=y_key,
                         title=format_swv_overlay_title(
                             original_ch,
@@ -6000,7 +6047,7 @@ if view == "Overlays":
                             ],
                         ),
                         ylabel=overlay_ylabel,
-                        alpha=overlay_line_alpha,
+                        alpha=float(st.session_state.get(trace_alpha_key, overlay_line_alpha)),
                         show_anchors=show_anchors,
                         show_peak_markers=(
                             show_peak_markers and y_key != "wavelet_denoised_current"
@@ -6034,21 +6081,26 @@ if view == "Overlays":
                                 f"swv_grouped_overlay_ch{original_ch}_{trace_type}"
                             ),
                             plot_kind="swv_trace",
+                            trace_modulo_key=trace_modulo_key,
+                            trace_alpha_key=trace_alpha_key,
                         )
                     else:
                         st.warning("No plottable traces for this channel.")
         else:
             for ch in plot_channels_display:
-                ch_res = plot_ok_results_by_channel.get(ch, [])
+                trace_modulo_key = f"swv_overlay_{ch}_trace_modulo"
+                trace_alpha_key = f"swv_overlay_{ch}_trace_alpha"
+                ch_res = overlay_results_by_channel.get(ch, [])
                 if not ch_res:
                     continue
                 with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(plot_channels_display) <= 4):
                     fig = plot_overlaid_traces(
                         ch_res, y_key=y_key,
+                        trace_modulo=int(st.session_state.get(trace_modulo_key, 1)),
                         title=format_swv_overlay_title(ch, ch_res),
                         ylabel=overlay_ylabel,
                         colormap_name=cmap_name,
-                        alpha=overlay_line_alpha,
+                        alpha=float(st.session_state.get(trace_alpha_key, overlay_line_alpha)),
                         show_anchors=show_anchors,
                         show_peak_markers=(show_peak_markers and y_key != "wavelet_denoised_current"),
                         show_zero_baseline=(
@@ -6071,6 +6123,8 @@ if view == "Overlays":
                             ),
                             file_stem=f"swv_overlay_ch{ch}_{trace_type}",
                             plot_kind="swv_trace",
+                            trace_modulo_key=trace_modulo_key,
+                            trace_alpha_key=trace_alpha_key,
                         )
                     else:
                         st.warning("No plottable traces for this channel.")

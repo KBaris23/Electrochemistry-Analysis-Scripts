@@ -61,6 +61,36 @@
     let resizeTimer = null;
     let suppressCameraEvents = false;
     let lastCamera = null;
+    let plotVisible = !window.IntersectionObserver;
+    let renderPromise = Promise.resolve();
+    let exportInProgress = false;
+
+    function releasePlot() {
+      if (!graph._fullLayout) return;
+      const camera = renderedCamera();
+      if (camera) persistCameraNow(camera);
+      // Keep legend visibility, axis ranges and camera when recreating the plot.
+      latestArgs.figure = JSON.parse(JSON.stringify({data: graph.data, layout: graph.layout}));
+      const contexts = Object.keys(graph._fullLayout)
+        .filter(key => /^scene[0-9]*$/.test(key))
+        .map(key => graph._fullLayout[key]._scene)
+        .filter(scene => scene && scene.glplot)
+        .map(scene => scene.glplot.gl);
+      Plotly.purge(graph);
+      // Purging removes Plotly objects but does not explicitly release the
+      // browser's limited WebGL context slots.
+      contexts.forEach(function(gl) {
+        const extension = gl.getExtension("WEBGL_lose_context");
+        if (extension && !gl.isContextLost()) extension.loseContext();
+      });
+    }
+
+    function sceneContextLost() {
+      return graph._fullLayout && Object.keys(graph._fullLayout).some(function(key) {
+        const scene = /^scene[0-9]*$/.test(key) && graph._fullLayout[key]._scene;
+        return scene && scene.glplot && scene.glplot.gl.isContextLost();
+      });
+    }
 
     function streamlitMessage(type, data) {
       window.parent.postMessage({
@@ -253,50 +283,149 @@
       document.body.removeChild(link);
     }
 
-    function downloadCurrentPlot() {
-      if (!graph || !graph._fullLayout) {
-        return;
+    function loadSnapshotImage(source) {
+      return new Promise(function(resolve, reject) {
+        const picture = new Image();
+        picture.onload = () => resolve(picture);
+        picture.onerror = () => reject(new Error("Could not load the plot snapshot"));
+        picture.src = source;
+      });
+    }
+
+    async function captureSceneImage(scene) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        // Safari can clear a resized WebGL buffer before it has painted again.
+        await new Promise(resolve => window.requestAnimationFrame(resolve));
+        if (scene.glplot.gl.isContextLost()) {
+          throw new Error("The 3D graphics context was lost during download");
+        }
+        const check = document.createElement("canvas");
+        const gl = scene.glplot.gl;
+        check.width = gl.drawingBufferWidth;
+        check.height = gl.drawingBufferHeight;
+        const context = check.getContext("2d", {willReadFrequently: true});
+        if (attempt === 1) {
+          // Alternate capture path if the browser cannot copy a WebGL canvas.
+          const picture = await loadSnapshotImage(scene.toImage("png"));
+          context.drawImage(picture, 0, 0, check.width, check.height);
+        } else {
+          // Copy synchronously after drawing, before Safari can discard the
+          // drawing buffer. This also avoids Plotly's readPixels export path.
+          scene.glplot.redraw();
+          context.drawImage(gl.canvas, 0, 0, check.width, check.height);
+        }
+        const pixels = context.getImageData(0, 0, check.width, check.height).data;
+        // Check the scene alone; legends/colorbars must not make a blank scene
+        // pass validation. A uniform/transparent buffer has no rendered detail.
+        for (let i = 4; i < pixels.length; i += 4) {
+          if (pixels[i + 3] && (
+            pixels[i] !== pixels[0] || pixels[i + 1] !== pixels[1] ||
+            pixels[i + 2] !== pixels[2] || pixels[i + 3] !== pixels[3]
+          )) return check;
+        }
       }
-      const options = {
-        format: "png",
-        filename: safeFileStem(latestArgs && latestArgs.download_file_stem),
-        width: Number(latestArgs && latestArgs.download_width) || 1200,
-        height: Number(latestArgs && latestArgs.download_height) || Number(latestArgs && latestArgs.height) || 700,
-        scale: 2,
+      throw new Error("The browser returned an empty 3D snapshot. Rotate the plot and retry.");
+    }
+
+    async function captureLive3DPlot(options) {
+      // Capture the live WebGL scene and SVG overlays separately. Safari can
+      // omit PNGs embedded inside an SVG when that SVG is drawn to a canvas.
+      // Drawing decoded scene PNGs directly avoids that nested-image path.
+      const originalSize = {
+        width: graph.layout.width == null ? null : graph.layout.width,
+        height: graph.layout.height == null ? null : graph.layout.height,
+        autosize: graph.layout.autosize,
       };
-      requestPlotResize();
-      window.setTimeout(function() {
-        const camera = latestArgs.camera_enabled === false ? null : (
-          lastCamera ||
-          loadCamera(latestArgs && latestArgs.storage_key) ||
-          renderedCamera()
-        );
-        if (camera && camera.eye) {
-          persistCameraNow(camera);
-          graph.layout = graph.layout || {};
-          graph.layout.scene = graph.layout.scene || {};
-          graph.layout.scene.camera = JSON.parse(JSON.stringify(camera));
-          if (graph._fullLayout && graph._fullLayout.scene) {
-            graph._fullLayout.scene.camera = JSON.parse(JSON.stringify(camera));
+      try {
+        await Plotly.relayout(graph, {
+          width: options.width, height: options.height, autosize: false,
+        });
+        const layout = graph._fullLayout;
+        const canvas = document.createElement("canvas");
+        canvas.width = options.width * options.scale;
+        canvas.height = options.height * options.scale;
+        const context = canvas.getContext("2d");
+        context.scale(options.scale, options.scale);
+        context.fillStyle = layout.paper_bgcolor;
+        context.fillRect(0, 0, options.width, options.height);
+        const size = layout._size;
+        for (const id of layout._subplots.gl3d) {
+          const scene = layout[id];
+          const picture = await captureSceneImage(scene._scene);
+          context.drawImage(picture,
+            size.l + size.w * scene.domain.x[0],
+            size.t + size.h * (1 - scene.domain.y[1]),
+            size.w * (scene.domain.x[1] - scene.domain.x[0]),
+            size.h * (scene.domain.y[1] - scene.domain.y[0]));
+        }
+        const svg = layout._paper.node().cloneNode(true);
+        svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+        svg.setAttribute("width", options.width);
+        svg.setAttribute("height", options.height);
+        svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
+        svg.style.background = "";
+        if (layout._toppaper) {
+          for (const child of layout._toppaper.node().children) {
+            svg.appendChild(child.cloneNode(true));
           }
         }
-        new Promise(function(resolve) {
-          window.requestAnimationFrame(function() {
-            window.requestAnimationFrame(resolve);
-          });
-        }).then(function() {
-          requestPlotResize();
-          return new Promise(function(resolve) {
-            window.setTimeout(resolve, 150);
-          });
-        }).then(function() {
-          return Plotly.toImage(graph, options);
-        }).then(function(dataUrl) {
-          triggerDataUrlDownload(dataUrl, options.filename + ".png");
-        }).catch(function(error) {
-          console.error("Plotly image export failed", error);
-        });
-      }, 250);
+        svg.querySelectorAll(".glimages,.draglayer,.hoverlayer").forEach(node => node.remove());
+        const overlay = await loadSnapshotImage(
+          "data:image/svg+xml;charset=utf-8," + encodeURIComponent(
+            new XMLSerializer().serializeToString(svg)
+          )
+        );
+        context.drawImage(overlay, 0, 0, options.width, options.height);
+        return canvas.toDataURL("image/png");
+      } finally {
+        await Plotly.relayout(graph, originalSize);
+      }
+    }
+
+    async function downloadCurrentPlot() {
+      if (!latestArgs || exportInProgress) return;
+      exportInProgress = true;
+      downloadButton.disabled = true;
+      downloadButton.textContent = "Preparing download…";
+      const options = {
+        format: "png",
+        width: Number(latestArgs.download_width) || 1200,
+        height: Number(latestArgs.download_height) || Number(latestArgs.height) || 700,
+        scale: 2,
+      };
+      const filename = safeFileStem(latestArgs.download_file_stem) + ".png";
+      try {
+        await renderPromise;
+        if (sceneContextLost()) releasePlot();
+        if (!graph._fullLayout) {
+          render(latestArgs);
+          await renderPromise;
+        }
+        const camera = renderedCamera() || lastCamera;
+        if (latestArgs.camera_enabled !== false && camera && camera.eye) {
+          persistCameraNow(camera);
+          await Plotly.relayout(graph, {"scene.camera": camera});
+        }
+        // Await Plotly itself rather than racing delayed resizes against export.
+        const has3DScene = (graph._fullLayout._subplots.gl3d || []).length > 0;
+        const dataUrl = has3DScene
+          ? await captureLive3DPlot(options)
+          : await Plotly.toImage(graph, options);
+        triggerDataUrlDownload(dataUrl, filename);
+        downloadButton.textContent = "Download plot";
+        downloadButton.title = "";
+      } catch (error) {
+        console.error("Plotly image export failed", error);
+        downloadButton.textContent = "Download failed — retry";
+        downloadButton.title = error.message;
+      } finally {
+        exportInProgress = false;
+        downloadButton.disabled = false;
+        if (!plotVisible || sceneContextLost()) {
+          releasePlot();
+          if (plotVisible) render(latestArgs);
+        }
+      }
     }
 
     function cacheCurrentView() {
@@ -332,7 +461,7 @@
     function requestPlotResize() {
       window.clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(function() {
-        if (graph && graph._fullLayout) {
+        if (graph && graph._fullLayout && !exportInProgress) {
           Plotly.Plots.resize(graph);
         }
       }, 50);
@@ -351,59 +480,89 @@
       setFrameHeight(height + (showControls ? 52 : 0));
       window.clearTimeout(sendTimer);
 
-      const figure = latestArgs.figure || {};
-      figure.layout = figure.layout || {};
-      const cameraEnabled = latestArgs.camera_enabled !== false;
-      if (cameraEnabled) {
-        figure.layout.scene = figure.layout.scene || {};
-        figure.layout.scene.dragmode = "turntable";
-      }
-      const storedCamera = cameraEnabled ? loadCamera(latestArgs.storage_key) : null;
-      const initialCamera = cameraEnabled
-        ? latestArgs.sync_camera || storedCamera || latestArgs.camera
-        : null;
-      if (initialCamera) {
-        lastCamera = JSON.parse(JSON.stringify(initialCamera));
-        figure.layout.scene.camera = initialCamera;
-        saveCamera(latestArgs.storage_key, initialCamera);
-      } else {
-        lastCamera = null;
-      }
-      const config = {
-        responsive: true,
-        displaylogo: false,
-        scrollZoom: true,
-        preserveDrawingBuffer: true,
-        modeBarButtonsToRemove: ["toImage"],
-      };
-      suppressCameraEvents = true;
-      Plotly.react(graph, figure.data || [], figure.layout, config).then(function() {
-        requestPlotResize();
+      if (!plotVisible && !exportInProgress) return;
+      renderPromise = renderPromise.catch(function(error) {
+        console.error("Plotly render failed", error);
+      }).then(function() {
+        if (!plotVisible && !exportInProgress) return;
+        const figure = JSON.parse(JSON.stringify(latestArgs.figure || {}));
+        figure.layout = figure.layout || {};
+        const cameraEnabled = latestArgs.camera_enabled !== false;
+        if (cameraEnabled) {
+          figure.layout.scene = figure.layout.scene || {};
+          figure.layout.scene.dragmode = "turntable";
+        }
+        const storedCamera = cameraEnabled ? loadCamera(latestArgs.storage_key) : null;
+        const initialCamera = cameraEnabled
+          ? latestArgs.sync_camera || storedCamera || latestArgs.camera || figure.layout.scene.camera
+          : null;
         if (initialCamera) {
-          return Plotly.relayout(graph, {"scene.camera": initialCamera});
+          lastCamera = JSON.parse(JSON.stringify(initialCamera));
+          figure.layout.scene.camera = initialCamera;
+          saveCamera(latestArgs.storage_key, initialCamera);
+        } else {
+          lastCamera = null;
         }
-        return null;
-      }).finally(function() {
-        requestPlotResize();
-        window.setTimeout(requestPlotResize, 250);
-        window.setTimeout(function() {
-          suppressCameraEvents = false;
-        }, 0);
+        const config = {
+          responsive: true,
+          displaylogo: false,
+          scrollZoom: true,
+          preserveDrawingBuffer: true,
+          modeBarButtonsToRemove: ["toImage"],
+        };
+        suppressCameraEvents = true;
+        const pendingRender = Plotly.react(graph, figure.data || [], figure.layout, config).then(function() {
+          requestPlotResize();
+          if (initialCamera) {
+            return Plotly.relayout(graph, {"scene.camera": initialCamera});
+          }
+          return null;
+        }).finally(function() {
+          requestPlotResize();
+          window.setTimeout(requestPlotResize, 250);
+          window.setTimeout(function() {
+            suppressCameraEvents = false;
+          }, 0);
+        });
+        graph.removeAllListeners && graph.removeAllListeners("plotly_webglcontextlost");
+        graph.on("plotly_webglcontextlost", function() {
+          // Recreate a visible scene once rendering/export has settled.
+          renderPromise.then(function() {
+            if (exportInProgress) return;
+            releasePlot();
+            if (plotVisible) render(latestArgs);
+          });
+        });
+        graph.removeAllListeners && graph.removeAllListeners("plotly_relayout");
+        graph.removeAllListeners && graph.removeAllListeners("plotly_relayouting");
+        graph.on("plotly_relayout", function(update) {
+          if (suppressCameraEvents || !hasCameraUpdate(update)) {
+            return;
+          }
+          lastCamera = mergeCameraUpdate(update);
+        });
+        graph.on("plotly_relayouting", function(update) {
+          if (suppressCameraEvents || !hasCameraUpdate(update)) {
+            return;
+          }
+          lastCamera = mergeCameraUpdate(update);
+        });
+        return pendingRender;
       });
-      graph.removeAllListeners && graph.removeAllListeners("plotly_relayout");
-      graph.removeAllListeners && graph.removeAllListeners("plotly_relayouting");
-      graph.on("plotly_relayout", function(update) {
-        if (suppressCameraEvents || !hasCameraUpdate(update)) {
-          return;
+    }
+
+    if (window.IntersectionObserver) {
+      new IntersectionObserver(function(entries) {
+        plotVisible = entries.some(entry => entry.isIntersecting);
+        if (!latestArgs) return;
+        if (plotVisible) {
+          if (!graph._fullLayout) render(latestArgs);
+        } else {
+          renderPromise.then(function() {
+            if (!plotVisible && !exportInProgress) releasePlot();
+          });
         }
-        lastCamera = mergeCameraUpdate(update);
-      });
-      graph.on("plotly_relayouting", function(update) {
-        if (suppressCameraEvents || !hasCameraUpdate(update)) {
-          return;
-        }
-        lastCamera = mergeCameraUpdate(update);
-      });
+      }).observe(graph);
     }
 
     window.addEventListener("message", function(event) {
