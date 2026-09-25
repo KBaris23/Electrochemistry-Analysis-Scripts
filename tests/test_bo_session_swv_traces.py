@@ -1832,7 +1832,7 @@ def test_replicate_swv_traces_can_show_dashed_phase_means(monkeypatch):
     plt.close(figure)
 
 
-def test_paired_peak_height_layout_shows_three_points_and_dashed_means():
+def test_paired_peak_height_layout_shows_three_points_and_dashed_means(monkeypatch):
     observation = {
         "iteration": 47,
         "group_id": 7,
@@ -1926,6 +1926,73 @@ def test_paired_peak_height_layout_shows_three_points_and_dashed_means():
         for axis in axes
     )
     assert figure._supylabel.get_fontsize() >= 12
+    assert figure._supylabel.get_position()[0] == pytest.approx(0.047)
+    assert figure._bo_preserve_aspect_ratio == pytest.approx(7.2 / 4.25)
+    assert figure._bo_native_width_inches == pytest.approx(7.2)
+    assert figure._bo_uniform_fontsize_points == pytest.approx(16.0)
+    custom_xlabel = viewer._customizable_axis_label_artist(figure, "x")
+    custom_ylabel = viewer._customizable_axis_label_artist(figure, "y")
+    assert custom_xlabel is axes[-1].xaxis.label
+    assert custom_ylabel is figure._supylabel
+    monkeypatch.setattr(viewer, "_plot_show_grid", lambda: True)
+    monkeypatch.setattr(viewer, "_plot_perimeter_width", lambda: 0.8)
+    figure._bo_base_size_inches = (12.0, 4.25)
+    viewer._apply_matplotlib_global_plot_style(figure)
+    assert figure.get_size_inches()[0] / figure.get_size_inches()[1] == (
+        pytest.approx(7.2 / 4.25)
+    )
+    assert axes[0].get_position().x0 == pytest.approx(0.15)
+    assert axes[0].title.get_fontsize() == pytest.approx(16.0)
+    assert axes[-1].xaxis.label.get_fontsize() == pytest.approx(16.0)
+    assert figure._supylabel.get_fontsize() == pytest.approx(16.0)
+    assert all(
+        tick.get_fontsize() == pytest.approx(16.0)
+        for axis in axes
+        for tick in (*axis.get_xticklabels(), *axis.get_yticklabels())
+    )
+    assert not axes[0].spines["bottom"].get_visible()
+    assert not axes[1].spines["top"].get_visible()
+    assert all(
+        not gridline.get_visible()
+        for axis in axes
+        for gridline in axis.get_xgridlines()
+    )
+    assert all(
+        any(gridline.get_visible() for gridline in axis.get_ygridlines())
+        for axis in axes
+    )
+    default_ylabel_x = custom_ylabel.get_position()[0]
+    viewer._apply_per_plot_matplotlib_text_override(
+        axes[0],
+        None,
+        title="Custom title",
+        xlabel="Custom replicate label",
+        ylabel="Custom peak label",
+        legend_title="",
+        legend_labels=[],
+        title_text_size=20.0,
+        xlabel_text_size=21.0,
+        ylabel_text_size=40.0,
+        xlabel_artist=custom_xlabel,
+        ylabel_artist=custom_ylabel,
+    )
+    assert axes[0].get_title() == "Custom title"
+    assert custom_xlabel.get_text() == "Custom replicate label"
+    assert custom_ylabel.get_text() == "Custom peak label"
+    assert axes[0].title.get_fontsize() == pytest.approx(20.0)
+    assert custom_xlabel.get_fontsize() == pytest.approx(21.0)
+    assert custom_ylabel.get_fontsize() == pytest.approx(40.0)
+    assert custom_ylabel.get_position()[0] < default_ylabel_x
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    ylabel_box = custom_ylabel.get_window_extent(renderer)
+    tick_left = min(
+        tick.get_window_extent(renderer).x0
+        for axis in axes
+        for tick in axis.get_yticklabels()
+        if tick.get_visible() and tick.get_text().strip()
+    )
+    assert ylabel_box.x1 <= tick_left - 4.0
     plt.close(figure)
 
     annotated_figure, errors = viewer._plot_paired_peak_height_replicates(

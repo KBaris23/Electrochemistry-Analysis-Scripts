@@ -18619,6 +18619,7 @@ def _plot_paired_peak_height_replicates(
                     max(tick_positions) + 0.55,
                 )
             axis.tick_params(axis="both", labelsize=11)
+            axis._bo_grid_axis = "y"
             axis.grid(axis="y", color="#d9dde3", linewidth=0.8, alpha=0.65)
             axis.set_axisbelow(True)
             axis.yaxis.set_major_locator(MaxNLocator(nbins=4))
@@ -18627,6 +18628,7 @@ def _plot_paired_peak_height_replicates(
         bottom_axis = channel_axes[-1]
         bottom_axis.set_xticks(tick_positions, tick_labels)
         bottom_axis.set_xlabel("Replicate measurement", fontsize=12.5)
+        bottom_axis.xaxis.label._bo_customizable_xlabel = True
         if split_axis:
             top_axis.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
             top_axis.spines["bottom"].set_visible(False)
@@ -18666,6 +18668,7 @@ def _plot_paired_peak_height_replicates(
                 "Peak Height (" + chr(181) + "A)",
                 fontsize=12.5,
             )
+            bottom_axis.yaxis.label._bo_customizable_ylabel = True
         physical_match = re.search(r"\d+", str(channel))
         channel_title = (
             f"Channel {physical_match.group(0)}"
@@ -18684,12 +18687,21 @@ def _plot_paired_peak_height_replicates(
             pad=7,
         )
     if split_channels:
-        figure.supylabel(
+        shared_ylabel = figure.supylabel(
             "Peak Height (" + chr(181) + "A)",
-            x=0.022,
+            x=0.047,
             fontsize=12.5,
         )
-    figure.subplots_adjust(left=0.18, right=0.985, top=0.91, bottom=0.14)
+        shared_ylabel._bo_customizable_ylabel = True
+        shared_ylabel._bo_responsive_shared_ylabel = True
+    figure.subplots_adjust(left=0.15, right=0.985, top=0.91, bottom=0.14)
+    # This split-axis chart is tuned as one compact composition. Preserve its
+    # aspect when the global canvas width changes instead of stretching it
+    # horizontally while applying an unrelated fixed 1D-plot height.
+    width_inches, height_inches = figure.get_size_inches()
+    figure._bo_preserve_aspect_ratio = float(width_inches / height_inches)
+    figure._bo_native_width_inches = float(width_inches)
+    figure._bo_uniform_fontsize_points = 16.0
     return figure, errors
 
 
@@ -25002,12 +25014,32 @@ def _apply_matplotlib_global_plot_style(fig) -> None:
         fig._bo_base_size_inches = tuple(float(value) for value in fig.get_size_inches())
     base_width, _base_height = fig._bo_base_size_inches
     plot_kind = _matplotlib_plot_kind(fig)
-    target_height_inches = _plot_height_px(plot_kind) / 100.0
+    preserved_aspect = _finite_float(
+        getattr(fig, "_bo_preserve_aspect_ratio", None)
+    )
+    native_width = _finite_float(
+        getattr(fig, "_bo_native_width_inches", None)
+    )
+    layout_text_scale = (
+        float(base_width) / float(native_width)
+        if preserved_aspect is not None
+        and native_width is not None
+        and native_width > 0
+        else 1.0
+    )
+    target_height_inches = (
+        float(base_width) / float(preserved_aspect)
+        if preserved_aspect is not None and preserved_aspect > 0
+        else _plot_height_px(plot_kind) / 100.0
+    )
     fig.set_size_inches(base_width, target_height_inches, forward=True)
     for text in fig.findobj(match=Text):
         if not hasattr(text, "_bo_base_fontsize"):
             text._bo_base_fontsize = float(text.get_fontsize())
-        text.set_fontsize(max(1.0, float(text._bo_base_fontsize) * text_scale))
+        text.set_fontsize(max(
+            1.0,
+            float(text._bo_base_fontsize) * text_scale * layout_text_scale,
+        ))
     if title_override and getattr(fig, "_suptitle", None) is not None:
         _apply_optional_text_size(fig._suptitle, title_override_size)
     for ax in getattr(fig, "axes", []):
@@ -25057,7 +25089,11 @@ def _apply_matplotlib_global_plot_style(fig) -> None:
                     spine.set_linewidth(float(slice_perimeter_thickness or 1.0))
                     spine.set_edgecolor(slice_perimeter_color)
                 else:
-                    spine.set_visible(perimeter_width > 0)
+                    if not hasattr(spine, "_bo_base_visible"):
+                        spine._bo_base_visible = bool(spine.get_visible())
+                    spine.set_visible(
+                        bool(spine._bo_base_visible) and perimeter_width > 0
+                    )
                     spine.set_linewidth(perimeter_width)
                     spine.set_edgecolor(perimeter_color)
         if active_colorbar_label_override and is_colorbar_axis:
@@ -25086,7 +25122,10 @@ def _apply_matplotlib_global_plot_style(fig) -> None:
             else:
                 _apply_matplotlib_custom_ticks(ax.xaxis, "colorbar")
         if not is_colorbar_axis:
-            ax.grid(bool(show_grid))
+            grid_axis = str(getattr(ax, "_bo_grid_axis", "both"))
+            if grid_axis not in {"x", "y", "both"}:
+                grid_axis = "both"
+            ax.grid(bool(show_grid), axis=grid_axis)
             zaxis = getattr(ax, "zaxis", None)
             if zaxis is not None:
                 for axis in (ax.xaxis, ax.yaxis, zaxis):
@@ -25199,9 +25238,19 @@ def _apply_matplotlib_global_plot_style(fig) -> None:
                 continue
             if line_color_override is not None and isinstance(collection, LineCollection):
                 collection.set_color(line_color_override)
+    uniform_fontsize = _finite_float(
+        getattr(fig, "_bo_uniform_fontsize_points", None)
+    )
+    if uniform_fontsize is not None and uniform_fontsize > 0:
+        resolved_uniform_fontsize = float(uniform_fontsize) * text_scale
+        for text in fig.findobj(match=Text):
+            text.set_fontsize(resolved_uniform_fontsize)
     _apply_matplotlib_plot_margin(fig)
     _apply_matplotlib_colorbar_side(fig)
     _apply_matplotlib_canvas_aspect(fig)
+    for text_artist in getattr(fig, "texts", []):
+        if getattr(text_artist, "_bo_responsive_shared_ylabel", False):
+            _position_responsive_shared_ylabel(text_artist)
 
 
 def _plotly_trace_meta_dict(trace: Any) -> dict:
@@ -26208,6 +26257,47 @@ def _render_browser_download_link(
     )
 
 
+def _position_responsive_shared_ylabel(
+    label_artist,
+    *,
+    padding_points: float = 4.0,
+) -> None:
+    """Keep a shared y-label close to, but clear of, numeric tick labels."""
+    if label_artist is None or not getattr(
+        label_artist,
+        "_bo_responsive_shared_ylabel",
+        False,
+    ):
+        return
+    figure = getattr(label_artist, "figure", None)
+    if figure is None:
+        return
+    try:
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        tick_boxes = [
+            tick_label.get_window_extent(renderer)
+            for axis in getattr(figure, "axes", [])
+            if not _is_matplotlib_colorbar_axis(axis)
+            for tick_label in axis.get_yticklabels()
+            if tick_label.get_visible() and str(tick_label.get_text()).strip()
+        ]
+        if not tick_boxes:
+            return
+        label_box = label_artist.get_window_extent(renderer)
+        padding_px = float(padding_points) * float(figure.dpi) / 72.0
+        desired_right = min(box.x0 for box in tick_boxes) - padding_px
+        shift_px = desired_right - label_box.x1
+        figure_width_px = max(float(figure.bbox.width), 1.0)
+        current_x, current_y = label_artist.get_position()
+        label_artist.set_position((
+            max(0.002, float(current_x) + shift_px / figure_width_px),
+            current_y,
+        ))
+    except Exception:
+        return
+
+
 def _apply_per_plot_matplotlib_text_override(
     primary_axis,
     legend,
@@ -26258,6 +26348,7 @@ def _apply_per_plot_matplotlib_text_override(
         (ylabel_artist or primary_axis.yaxis.label).set_fontsize(
             float(ylabel_text_size)
         )
+    _position_responsive_shared_ylabel(ylabel_artist)
 
     if legend is None:
         return
@@ -26290,6 +26381,28 @@ def _apply_per_plot_matplotlib_text_override(
             and getattr(primary_axis, "_bo_chronological_swv_stack", False)
         ):
             legend.set_bbox_to_anchor((0.86, 0.98))
+
+
+def _customizable_axis_label_artist(fig, axis_name: str):
+    """Return a figure's explicitly designated x- or y-label artist."""
+    axis_name = str(axis_name).strip().lower()
+    if axis_name not in {"x", "y"}:
+        return None
+    marker = f"_bo_customizable_{axis_name}label"
+    candidates = list(getattr(fig, "texts", []))
+    for plot_axis in getattr(fig, "axes", []):
+        matplotlib_axis = getattr(plot_axis, f"{axis_name}axis", None)
+        label = getattr(matplotlib_axis, "label", None)
+        if label is not None:
+            candidates.append(label)
+    return next(
+        (
+            text_artist
+            for text_artist in candidates
+            if getattr(text_artist, marker, False)
+        ),
+        None,
+    )
 
 
 def _render_downloadable_pyplot(
@@ -26376,22 +26489,8 @@ def _render_downloadable_pyplot(
                 primary_axis,
                 chronological_order_label,
             )
-        custom_xlabel_artist = next(
-            (
-                text_artist
-                for text_artist in getattr(fig, "texts", [])
-                if getattr(text_artist, "_bo_customizable_xlabel", False)
-            ),
-            None,
-        )
-        custom_ylabel_artist = next(
-            (
-                text_artist
-                for text_artist in getattr(fig, "texts", [])
-                if getattr(text_artist, "_bo_customizable_ylabel", False)
-            ),
-            None,
-        )
+        custom_xlabel_artist = _customizable_axis_label_artist(fig, "x")
+        custom_ylabel_artist = _customizable_axis_label_artist(fig, "y")
         color_sources = legend_handles or series_artists
         default_series_colors = []
         for artist in color_sources:
