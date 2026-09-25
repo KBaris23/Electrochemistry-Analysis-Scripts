@@ -1,10 +1,12 @@
 from pathlib import Path
 import sys
+from io import BytesIO
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -86,6 +88,22 @@ def test_pyplot_renderer_returns_the_exact_displayed_preview(monkeypatch):
     assert styled_widths == [10.0]
     assert preview == container.image_data
     assert container.image_width == 1000
+
+
+def test_matplotlib_individual_export_includes_tight_png_and_real_pdf():
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    ax.plot([0.0, 1.0], [0.0, 1.0])
+    png = viewer._matplotlib_png_bytes(fig, apply_global_style=False)
+    pdf = viewer._matplotlib_pdf_bytes(fig)
+    try:
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        assert pdf.startswith(b"%PDF-")
+        assert len(pdf) > 500
+        with Image.open(BytesIO(png)) as image:
+            assert image.width < 640
+            assert image.height < 400
+    finally:
+        plt.close(fig)
 
 
 def test_surrogate_2d_axes_follow_selected_canvas_aspect(monkeypatch):

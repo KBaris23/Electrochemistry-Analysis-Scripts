@@ -42,6 +42,20 @@
       color: #6b7280;
       cursor: default;
     }
+    #delete-selected {
+      padding: 4px 10px;
+      border: 1px solid #dc2626;
+      border-radius: 5px;
+      background: #fff;
+      color: #b91c1c;
+      font: 12px/1.2 inherit;
+      cursor: pointer;
+    }
+    #delete-selected:disabled {
+      border-color: #cbd5e1;
+      color: #9ca3af;
+      cursor: default;
+    }
     #canvas {
       position: relative;
       box-sizing: border-box;
@@ -143,6 +157,7 @@
     <span>Mouse layout editor</span>
     <span id="selection-count"></span>
     <span id="status"></span>
+    <button id="delete-selected" type="button" disabled>Delete selected</button>
     <button id="apply-layout" type="button" disabled>Apply layout</button>
   </div>
   <div id="canvas"></div>
@@ -160,6 +175,8 @@
     <div class="separator"></div>
     <button data-command="distribute-h">Distribute horizontally</button>
     <button data-command="distribute-v">Distribute vertically</button>
+    <div class="separator"></div>
+    <button data-command="delete">Delete selected panel(s)</button>
   </div>
   <script>
     const canvas = document.getElementById("canvas");
@@ -167,6 +184,7 @@
     const selectionCount = document.getElementById("selection-count");
     const status = document.getElementById("status");
     const applyButton = document.getElementById("apply-layout");
+    const deleteButton = document.getElementById("delete-selected");
     let args = {};
     let rects = [];
     let selected = new Set();
@@ -242,6 +260,7 @@
         panel.style.zIndex = selected.has(index) ? String(100 + index) : String(index + 1);
       });
       selectionCount.textContent = selected.size > 1 ? `${selected.size} panels selected` : "";
+      deleteButton.disabled = selected.size === 0;
     }
     function draw() {
       canvas.replaceChildren();
@@ -346,16 +365,22 @@
       updateSelectionAppearance();
       const needsThree = new Set(["distribute-h", "distribute-v"]);
       menu.querySelectorAll("button").forEach(button => {
-        button.disabled = selected.size < (needsThree.has(button.dataset.command) ? 3 : 2);
+        button.disabled = button.dataset.command === "delete"
+          ? selected.size === 0
+          : selected.size < (needsThree.has(button.dataset.command) ? 3 : 2);
       });
       const menuWidth = 205;
-      const menuHeight = 320;
+      const menuHeight = 360;
       menu.style.left = `${Math.max(4, Math.min(event.clientX, window.innerWidth - menuWidth))}px`;
       menu.style.top = `${Math.max(4, Math.min(event.clientY, window.innerHeight - menuHeight))}px`;
       menu.classList.add("open");
     }
     function applyCommand(command) {
       const indices = [...selected];
+      if (command === "delete") {
+        deleteSelected();
+        return;
+      }
       if (indices.length < 2) return;
       const anchor = rects[contextAnchor ?? indices[0]];
       if (command === "left") {
@@ -412,6 +437,19 @@
     applyButton.addEventListener("click", () => {
       if (dirty) publishLayout("layout applied");
     });
+    function deleteSelected() {
+      const deletedIndices = [...selected].sort((a, b) => a - b);
+      if (!deletedIndices.length) return;
+      hideContextMenu();
+      setComponentValue({
+        event_id: `${Date.now()}-${Math.random()}`,
+        rects: rects.map(rect => [...rect]),
+        deleted_indices: deletedIndices,
+      });
+      status.textContent = "— deleting selected panel(s)";
+      deleteButton.disabled = true;
+    }
+    deleteButton.addEventListener("click", deleteSelected);
     canvas.addEventListener("pointerdown", event => {
       if (event.target === canvas) {
         selected.clear();
@@ -427,6 +465,9 @@
         selected.clear();
         hideContextMenu();
         updateSelectionAppearance();
+      } else if ((event.key === "Delete" || event.key === "Backspace") && selected.size) {
+        event.preventDefault();
+        deleteSelected();
       }
     });
     window.addEventListener("message", event => {

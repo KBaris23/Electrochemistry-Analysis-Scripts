@@ -285,6 +285,18 @@ def test_layout_editor_batches_mouse_changes_until_apply():
     assert 'publishLayout(finished.mode === "resize"' not in editor
 
 
+def test_layout_editor_can_delete_selected_panels():
+    editor = (
+        Path(viewer.__file__).parent
+        / ".streamlit_components"
+        / "figure_layout_editor"
+        / "index.html"
+    ).read_text(encoding="utf-8")
+    assert "Delete selected" in editor
+    assert 'event.key === "Delete"' in editor
+    assert "deleted_indices: deletedIndices" in editor
+
+
 def test_hyperparameter_sweep_uses_real_slices_without_zoom_boxes():
     observations = [
         {"params": {"step_potential": value}}
@@ -502,6 +514,68 @@ def test_composer_swaps_panel_contents_letters_and_zoom_links():
     assert state["bo_composer_label_2"] == "Custom"
     assert state["bo_composer_zoom_from_2"] == "A"
     assert state["bo_composer_auto_render"] is True
+
+
+def test_composer_deletes_selected_panels_and_compacts_state():
+    state = {
+        "bo_composer_count": 4,
+        "bo_composer_kind_0": "Global trend",
+        "bo_composer_kind_1": "Captured plot",
+        "bo_composer_kind_2": "Measured 2D map",
+        "bo_composer_kind_3": "SWV trace overlay",
+        "bo_composer_label_0": "A",
+        "bo_composer_label_1": "B",
+        "bo_composer_label_2": "Custom",
+        "bo_composer_label_3": "D",
+        "bo_composer_capture_id_1": "capture-1",
+        "bo_composer_zoom_from_2": "B",
+        "bo_composer_zoom_from_3": "A",
+    }
+
+    with patch.object(viewer.st, "session_state", state):
+        new_count = viewer._composer_delete_panels([1, 2], 4)
+
+    assert new_count == 2
+    assert state["bo_composer_count"] == 2
+    assert state["bo_composer_kind_0"] == "Global trend"
+    assert state["bo_composer_kind_1"] == "SWV trace overlay"
+    assert state["bo_composer_label_0"] == "A"
+    assert state["bo_composer_label_1"] == "B"
+    assert state["bo_composer_zoom_from_1"] == "A"
+    assert not any(key.startswith("bo_composer_capture_id_") for key in state)
+    assert state["bo_composer_auto_render"] is True
+
+
+def test_layout_editor_stages_deletion_until_before_widget_creation():
+    state = {"bo_composer_count": 3}
+    result = {"event_id": "delete-1", "deleted_indices": [1]}
+
+    with patch.object(viewer.st, "session_state", state):
+        assert viewer._composer_apply_layout_editor_result(result, 3) is True
+        assert state["bo_composer_count"] == 3
+        assert state["bo_composer_pending_delete_indices"] == [1]
+        assert viewer._composer_apply_pending_panel_deletions() == 1
+
+    assert state["bo_composer_count"] == 2
+    assert state["bo_composer_auto_render"] is True
+
+
+def test_deleting_every_panel_resets_to_one_empty_panel():
+    state = {
+        "bo_composer_count": 2,
+        "bo_composer_kind_0": "Global trend",
+        "bo_composer_kind_1": "Captured plot",
+        "bo_composer_label_0": "A",
+        "bo_composer_label_1": "B",
+        "bo_composer_pending_delete_indices": [0, 1],
+    }
+
+    with patch.object(viewer.st, "session_state", state):
+        assert viewer._composer_apply_pending_panel_deletions() == 2
+
+    assert state["bo_composer_count"] == 1
+    assert not any(key.startswith("bo_composer_kind_") for key in state)
+    assert not any(key.startswith("bo_composer_label_") for key in state)
 
 
 def test_composer_formats_captured_plotly_source_without_mutating_it():

@@ -42,7 +42,7 @@ from matplotlib.text import Text
 from matplotlib.ticker import FixedFormatter, FixedLocator, MaxNLocator, StrMethodFormatter
 from matplotlib.transforms import Bbox
 from matplotlib.backends.backend_pdf import PdfPages
-from mpl_toolkits.mplot3d import proj3d
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -17715,6 +17715,33 @@ def _trace_entries_by_iteration(
     ]
 
 
+def _paired_measurement_3d_layout_available(
+    trace_entries: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+    selected_channels: Sequence[str],
+    selected_phases: set[str] | None,
+) -> bool:
+    """Return whether the visible traces come from one paired BO observation."""
+    if selected_phases != {"buffer", "target"}:
+        return False
+    channel_set = {str(channel) for channel in selected_channels}
+    source_observations = set()
+    visible_phases = set()
+    for observation, trace in trace_entries:
+        if _trace_channel_key(dict(trace)) not in channel_set:
+            continue
+        phase = str(trace.get("phase", "")).strip().lower()
+        if phase not in {"buffer", "target"}:
+            continue
+        visible_phases.add(phase)
+        source_observations.add((
+            int(observation.get("group_id", 1) or 1),
+            int(observation.get("iteration", 0) or 0),
+            str(observation.get("optimization_direction") or "").lower(),
+            str(observation.get("method_id") or ""),
+        ))
+    return visible_phases == {"buffer", "target"} and len(source_observations) == 1
+
+
 def _channel_sort_key(channel: str):
     text = str(channel).strip()
 
@@ -19885,6 +19912,7 @@ def _chronological_swv_stack_entries(
     current_min: float | None = None,
     current_max: float | None = None,
     selected_phases: tuple[str, ...] | None = None,
+    include_analysis_landmarks: bool = False,
 ) -> tuple[list[dict], list[str], list[tuple[dict, dict]]]:
     batch_size = max(1, int((config or {}).get("paired_batch_size", 1) or 1))
     phase_filter = (
@@ -19946,18 +19974,64 @@ def _chronological_swv_stack_entries(
     for stack_index, (observation, item) in enumerate(entries):
         phase, path, channel = item["phase"], item["path"], _trace_channel_key(item)
         try:
-            voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
-                path,
-                corrected,
-                analysis,
-                corrected_trace_key,
-            )
+            if include_analysis_landmarks and not corrected:
+                # The Q-score noise term is evaluated on the unmodified raw
+                # current between the correction minima.  Requesting the
+                # ``raw_current`` analysis view preserves that exact raw trace
+                # while also returning the mapped landmark indices.
+                voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
+                    path,
+                    True,
+                    analysis,
+                    "raw_current",
+                )
+            else:
+                voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
+                    path,
+                    corrected,
+                    analysis,
+                    corrected_trace_key,
+                )
             if offset_to_baseline:
                 y = _offset_trace_to_minima_baseline(y, left_idx, right_idx)
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
             voltage = np.asarray(voltage, dtype=float)
             y = np.asarray(y, dtype=float)
+            landmarks: dict[str, Any] = {}
+            try:
+                landmark_indices = {
+                    "peak": int(peak_idx),
+                    "left_minimum": int(left_idx),
+                    "right_minimum": int(right_idx),
+                }
+                if all(
+                    0 <= index < len(voltage) and index < len(y)
+                    for index in landmark_indices.values()
+                ):
+                    for name, index in landmark_indices.items():
+                        landmarks[name] = (
+                            float(voltage[index]),
+                            float(y[index]),
+                        )
+                    lo = min(
+                        landmark_indices["left_minimum"],
+                        landmark_indices["right_minimum"],
+                    )
+                    hi = max(
+                        landmark_indices["left_minimum"],
+                        landmark_indices["right_minimum"],
+                    )
+                    landmarks["sigma_voltage"] = np.asarray(
+                        voltage[lo:hi + 1],
+                        dtype=float,
+                    )
+                    landmarks["sigma_current"] = np.asarray(
+                        y[lo:hi + 1],
+                        dtype=float,
+                    )
+            except (TypeError, ValueError, IndexError):
+                landmarks = {}
             finite = np.isfinite(voltage) & np.isfinite(y)
             if not finite.any():
                 raise ValueError("Trace has no finite voltage/current values.")
@@ -19996,11 +20070,184 @@ def _chronological_swv_stack_entries(
                 "trace": dict(item),
                 "voltage": voltage,
                 "current": current,
+                "landmarks": landmarks,
             })
         except Exception as exc:
             if not is_peak_height_below_cutoff_error(exc):
                 errors.append(f"{path.name}: {exc}")
     return loaded, errors, entries
+
+
+def _add_paired_3d_sigma_region_box(
+    ax,
+    row: Mapping[str, Any],
+    measurement: float,
+    color: str = "#d62728",
+) -> bool:
+    """Box the two raw-trace regions outside the minima-to-minima peak bracket."""
+    landmarks = row.get("landmarks") or {}
+    left = landmarks.get("left_minimum")
+    right = landmarks.get("right_minimum")
+    peak = landmarks.get("peak")
+    if not all(
+        isinstance(point, Sequence) and len(point) == 2
+        for point in (left, right, peak)
+    ):
+        return False
+    try:
+        left_x, left_z = map(float, left)
+        right_x, right_z = map(float, right)
+        peak_x, peak_z = map(float, peak)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite([
+        left_x, left_z, right_x, right_z, peak_x, peak_z,
+    ]).all():
+        return False
+    bracket_x0, bracket_x1 = sorted((left_x, right_x))
+    if bracket_x1 - bracket_x0 <= 0:
+        return False
+    voltage = np.asarray(row.get("voltage", []), dtype=float)
+    current = np.asarray(row.get("current", []), dtype=float)
+    finite = np.isfinite(voltage) & np.isfinite(current)
+    if finite.sum() < 2:
+        return False
+    voltage = voltage[finite]
+    current = current[finite]
+    y0, y1 = float(measurement) - .17, float(measurement) + .17
+    added = False
+    for region_mask in (
+        voltage <= bracket_x0,
+        voltage >= bracket_x1,
+    ):
+        if region_mask.sum() < 2:
+            continue
+        region_voltage = voltage[region_mask]
+        region_current = current[region_mask]
+        x0 = float(np.nanmin(region_voltage))
+        x1 = float(np.nanmax(region_voltage))
+        if np.isclose(x0, x1):
+            continue
+        z0 = float(np.nanmin(region_current))
+        z1 = float(np.nanmax(region_current))
+        z_padding = max((z1 - z0) * .08, abs(peak_z) * .004, 1e-6)
+        z0 -= z_padding
+        z1 += z_padding
+        vertices = {
+            "000": (x0, y0, z0), "100": (x1, y0, z0),
+            "010": (x0, y1, z0), "110": (x1, y1, z0),
+            "001": (x0, y0, z1), "101": (x1, y0, z1),
+            "011": (x0, y1, z1), "111": (x1, y1, z1),
+        }
+        faces = [
+            [vertices[key] for key in ("000", "100", "110", "010")],
+            [vertices[key] for key in ("001", "101", "111", "011")],
+            [vertices[key] for key in ("000", "100", "101", "001")],
+            [vertices[key] for key in ("010", "110", "111", "011")],
+            [vertices[key] for key in ("000", "010", "011", "001")],
+            [vertices[key] for key in ("100", "110", "111", "101")],
+        ]
+        box = Poly3DCollection(
+            faces,
+            facecolors=to_rgba(color, .025),
+            edgecolors=to_rgba(color, .88),
+            linewidths=1.0,
+            zorder=18,
+        )
+        box._bo_sigma_region_box = True
+        ax.add_collection3d(box)
+        added = True
+    return added
+
+
+def _add_paired_3d_correction_annotations(
+    ax,
+    row: Mapping[str, Any],
+    measurement: float,
+    color: str,
+) -> bool:
+    """Mark correction minima and the baseline-to-peak height in 3D."""
+    landmarks = row.get("landmarks") or {}
+    left = landmarks.get("left_minimum")
+    right = landmarks.get("right_minimum")
+    peak = landmarks.get("peak")
+    if not all(
+        isinstance(point, Sequence) and len(point) == 2
+        for point in (left, right, peak)
+    ):
+        return False
+    try:
+        left_x, left_z = map(float, left)
+        right_x, right_z = map(float, right)
+        peak_x, peak_z = map(float, peak)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite([
+        left_x, left_z, right_x, right_z, peak_x, peak_z,
+    ]).all():
+        return False
+    if np.isclose(left_x, right_x):
+        baseline_z = (left_z + right_z) / 2.0
+    else:
+        baseline_z = float(np.interp(
+            peak_x,
+            [left_x, right_x],
+            [left_z, right_z],
+        ))
+    minima_markers = ax.scatter(
+        [left_x, right_x],
+        [measurement, measurement],
+        [left_z, right_z],
+        s=30,
+        marker="o",
+        facecolors="white",
+        edgecolors=color,
+        linewidths=1.1,
+        depthshade=False,
+        zorder=30,
+    )
+    minima_markers._bo_correction_minima = True
+    peak_marker = ax.scatter(
+        [peak_x],
+        [measurement],
+        [peak_z],
+        s=35,
+        marker="D",
+        facecolors=color,
+        edgecolors="white",
+        linewidths=.7,
+        depthshade=False,
+        zorder=31,
+    )
+    peak_marker._bo_correction_peak = True
+    peak_height_line, = ax.plot(
+        [peak_x, peak_x],
+        [measurement, measurement],
+        [baseline_z, peak_z],
+        color=color,
+        linestyle="--",
+        linewidth=1.15,
+        alpha=.9,
+        zorder=25,
+    )
+    peak_height_line._bo_correction_peak_height = True
+    delta = peak_z - baseline_z
+    if not np.isclose(delta, 0.0):
+        arrow_start = peak_z - (.16 * delta)
+        ax.quiver(
+            peak_x,
+            measurement,
+            arrow_start,
+            0.0,
+            0.0,
+            peak_z - arrow_start,
+            color=color,
+            arrow_length_ratio=.55,
+            linewidth=1.15,
+            normalize=False,
+            zorder=32,
+        )
+    return True
 
 
 def _plot_paired_measurement_3d_stack(
@@ -20017,9 +20264,12 @@ def _plot_paired_measurement_3d_stack(
     current_min: float | None = None,
     current_max: float | None = None,
     show_axis_labels: bool = True,
-    voltage_label: str = "VOLTAGE (V)",
-    measurement_label: str = "MEASUREMENT",
+    voltage_label: str = "Voltage (V)",
+    measurement_label: str = "Measurement",
     current_label: str | None = None,
+    show_sigma_region_boxes: bool = False,
+    show_correction_annotations: bool = False,
+    legend_position: str = "Upper left",
 ):
     """Render one BO iteration's buffer/target replicates as a 3D stack."""
     fig = plt.figure(figsize=(8.2, 10.4))
@@ -20042,6 +20292,7 @@ def _plot_paired_measurement_3d_stack(
         None,
         None,
         ("buffer", "target"),
+        show_sigma_region_boxes or show_correction_annotations,
     )
     if not loaded:
         ax.text2D(
@@ -20071,6 +20322,8 @@ def _plot_paired_measurement_3d_stack(
         np.asarray(row["current"], dtype=float) for row in loaded
     ]
     phase_measurements: dict[str, list[int]] = {"buffer": [], "target": []}
+    sigma_boxes_added = False
+    correction_annotations_added = False
     plotted_rows = list(enumerate(zip(loaded, fade_values), start=1))
     for measurement, (row, _alpha) in plotted_rows:
         phase = str(row.get("phase", "")).strip().lower()
@@ -20092,6 +20345,20 @@ def _plot_paired_measurement_3d_stack(
             solid_capstyle="round",
             zorder=10 + len(loaded) - measurement,
         )
+        if show_sigma_region_boxes:
+            sigma_boxes_added = _add_paired_3d_sigma_region_box(
+                ax,
+                row,
+                float(measurement),
+                "#d62728",
+            ) or sigma_boxes_added
+        if show_correction_annotations:
+            correction_annotations_added = _add_paired_3d_correction_annotations(
+                ax,
+                row,
+                float(measurement),
+                SWV_PHASE_COLORS.get(phase, "#444444"),
+            ) or correction_annotations_added
 
     voltage_values = np.concatenate([
         np.asarray(row["voltage"], dtype=float) for row in loaded
@@ -20135,7 +20402,7 @@ def _plot_paired_measurement_3d_stack(
     ax.tick_params(axis="z", labelsize=13, pad=3)
     for tick, phase in zip(ax.get_yticklabels(), phases):
         tick.set_color(SWV_PHASE_COLORS.get(phase, "#333333"))
-        tick.set_fontweight("bold")
+        tick.set_fontweight("normal")
 
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis.pane.fill = False
@@ -20145,73 +20412,29 @@ def _plot_paired_measurement_3d_stack(
     ax.zaxis._axinfo["juggled"] = (1, 2, 0)
 
     if show_axis_labels:
-        ax.set_xlabel(voltage_label, fontsize=18, fontweight="bold", labelpad=14)
-        fig.canvas.draw()
-        depth_start = proj3d.proj_transform(
-            x_max,
-            1.0,
-            z_min,
-            ax.get_proj(),
-        )[:2]
-        depth_end = proj3d.proj_transform(
-            x_max,
-            float(len(loaded)),
-            z_min,
-            ax.get_proj(),
-        )[:2]
-        start_display = ax.transData.transform(depth_start)
-        end_display = ax.transData.transform(depth_end)
-        depth_vector = end_display - start_display
-        measurement_angle = math.degrees(math.atan2(
-            depth_vector[1],
-            depth_vector[0],
-        ))
-        if measurement_angle > 90:
-            measurement_angle -= 180
-        elif measurement_angle < -90:
-            measurement_angle += 180
-        outward_normal = np.array(
-            [depth_vector[1], -depth_vector[0]],
-            dtype=float,
+        ax.set_xlabel(
+            voltage_label,
+            fontsize=14,
+            fontweight="normal",
+            labelpad=7,
         )
-        normal_length = float(np.linalg.norm(outward_normal))
-        if normal_length > 0:
-            outward_normal /= normal_length
-        measurement_display = (
-            (start_display + end_display) / 2
-            + outward_normal * 94.0
-        )
-        measurement_figure_position = fig.transFigure.inverted().transform(
-            measurement_display
-        )
-        measurement_text = fig.text(
-            measurement_figure_position[0],
-            measurement_figure_position[1],
+        ax.set_ylabel(
             measurement_label,
-            ha="center",
-            va="center",
-            fontsize=18,
-            fontweight="bold",
-            rotation=measurement_angle,
-            rotation_mode="anchor",
+            fontsize=14,
+            fontweight="normal",
+            labelpad=8,
         )
-        measurement_text._bo_paired_measurement_label = True
-        current_text = fig.text(
-            .025,
-            .46,
+        ax.set_zlabel(
             current_label
             or (
-                "NORMALIZED CURRENT"
+                "Normalized current"
                 if normalize_to_peak
-                else "CURRENT (" + chr(181) + "A)"
+                else "Current (" + chr(181) + "A)"
             ),
-            ha="center",
-            va="center",
-            fontsize=18,
-            fontweight="bold",
-            rotation=90,
+            fontsize=14,
+            fontweight="normal",
+            labelpad=6,
         )
-        current_text._bo_paired_current_label = True
 
     legend_handles = []
     for phase in ("buffer", "target"):
@@ -20228,21 +20451,82 @@ def _plot_paired_measurement_3d_stack(
             [0],
             color=SWV_PHASE_COLORS[phase],
             linewidth=3.2,
-            label=f"{phase.upper()}   {measurement_text}",
+            label=f"{phase.title()}   {measurement_text}",
         ))
     if legend_handles:
+        legend_locations = {
+            "Upper left": ("upper left", (.02, .98)),
+            "Upper center": ("upper center", (.50, .98)),
+            "Upper right": ("upper right", (.98, .98)),
+            "Lower left": ("lower left", (.02, .02)),
+            "Lower center": ("lower center", (.50, .02)),
+            "Lower right": ("lower right", (.98, .02)),
+        }
+        legend_loc, legend_anchor = legend_locations.get(
+            legend_position,
+            legend_locations["Upper left"],
+        )
         legend = fig.legend(
             handles=legend_handles,
-            loc="upper left",
-            bbox_to_anchor=(.15, .97),
+            loc=legend_loc,
+            bbox_to_anchor=legend_anchor,
+            bbox_transform=ax.transAxes,
             frameon=False,
-            fontsize=16,
+            fontsize=12,
             handlelength=2.2,
             handletextpad=.7,
             borderaxespad=0,
             labelspacing=.55,
+            ncols=1,
         )
         legend.set_zorder(1000)
+    annotation_handles = []
+    if sigma_boxes_added:
+        annotation_handles.append(Line2D(
+            [0],
+            [0],
+            marker="s",
+            markersize=9,
+            markerfacecolor=to_rgba("#d62728", .08),
+            markeredgecolor="#d62728",
+            markeredgewidth=1.2,
+            linestyle="None",
+            label="Outside peak bracket",
+        ))
+    if correction_annotations_added:
+        annotation_handles.extend([
+            Line2D(
+                [0], [0], marker="o", markersize=6,
+                markerfacecolor="white", markeredgecolor="#444444",
+                linestyle="None", label="Correction minima",
+            ),
+            Line2D(
+                [0], [0], marker="D", markersize=6,
+                markerfacecolor="#444444", markeredgecolor="white",
+                linestyle="None", label="Corrected peak",
+            ),
+            Line2D(
+                [0], [0], color="#444444", linewidth=1.2,
+                linestyle="--", marker="^", markevery=[1], markersize=5,
+                label="Baseline-to-peak height",
+            ),
+        ])
+    if annotation_handles:
+        annotation_legend = fig.legend(
+            handles=annotation_handles,
+            loc="upper right",
+            bbox_to_anchor=(.98, .98),
+            bbox_transform=ax.transAxes,
+            frameon=False,
+            fontsize=11,
+            handlelength=2.0,
+            handletextpad=.7,
+            borderaxespad=0,
+            labelspacing=.55,
+            ncols=1,
+        )
+        annotation_legend._bo_paired_annotation_legend = True
+        annotation_legend.set_zorder(1001)
     return fig, errors
 
 
@@ -25759,12 +26043,70 @@ def _matplotlib_png_bytes(
         _apply_global_plot_style(fig)
     buffer = BytesIO()
     try:
-        fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=None)
+        fig.savefig(
+            buffer,
+            format="png",
+            dpi=dpi,
+            bbox_inches="tight",
+            pad_inches=0.03,
+            facecolor=fig.get_facecolor(),
+        )
     except Exception:
         buffer = BytesIO()
         _sanitize_matplotlib_text_for_png(fig)
-        fig.savefig(buffer, format="png", dpi=dpi, bbox_inches=None)
+        fig.savefig(
+            buffer,
+            format="png",
+            dpi=dpi,
+            bbox_inches="tight",
+            pad_inches=0.03,
+            facecolor=fig.get_facecolor(),
+        )
     return buffer.getvalue()
+
+
+def _matplotlib_pdf_bytes(
+    fig,
+    *,
+    apply_global_style: bool = False,
+) -> bytes:
+    """Return a vector PDF for the same configured figure shown on screen."""
+    if apply_global_style:
+        _apply_global_plot_style(fig)
+    buffer = BytesIO()
+    fig.savefig(
+        buffer,
+        format="pdf",
+        bbox_inches="tight",
+        pad_inches=0.03,
+        facecolor=fig.get_facecolor(),
+    )
+    return buffer.getvalue()
+
+
+def _render_matplotlib_download_links(
+    container,
+    fig,
+    png_bytes: bytes,
+    *,
+    file_stem: str,
+) -> None:
+    """Offer both raster and publication-friendly vector exports."""
+    safe_stem = _safe_download_stem(file_stem)
+    _render_browser_download_link(
+        container,
+        "Download PNG",
+        png_bytes,
+        file_name=f"{safe_stem}.png",
+        mime="image/png",
+    )
+    _render_browser_download_link(
+        container,
+        "Download PDF",
+        _matplotlib_pdf_bytes(fig),
+        file_name=f"{safe_stem}.pdf",
+        mime="application/pdf",
+    )
 
 
 def _render_browser_download_link(
@@ -26377,12 +26719,11 @@ def _render_downloadable_pyplot(
         apply_global_style=False,
     )
     image_slot.image(png_bytes, width=effective_width_px)
-    _render_browser_download_link(
+    _render_matplotlib_download_links(
         download_container,
-        "Download plot",
+        fig,
         png_bytes,
-        file_name=f"{_safe_download_stem(file_stem)}.png",
-        mime="image/png",
+        file_stem=file_stem,
     )
     primary_axis = next(
         (
@@ -27711,6 +28052,7 @@ def _add_plot_to_composer_callback(
             f"Added as Figure {panel_label}. Open Figure Composer to arrange it."
         )
     }
+    st.session_state["bo_composer_auto_render"] = True
 
 
 def _render_downloadable_plotly(
@@ -27839,12 +28181,11 @@ def _render_downloadable_plotly(
             )
         else:
             plot_column.image(png_bytes, width=effective_export_width)
-        _render_browser_download_link(
+        _render_matplotlib_download_links(
             plot_column,
-            "Download plot",
+            matplotlib_figure,
             png_bytes,
-            file_name=f"{_safe_download_stem(file_stem)}.png",
-            mime="image/png",
+            file_stem=file_stem,
         )
         _render_add_to_composer_button(
             plot_column,
@@ -30088,6 +30429,7 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_layout_editor",
     "bo_composer_captured_plots",
     "bo_composer_pending_captures",
+    "bo_composer_pending_delete_indices",
     "bo_composer_capture_flash",
     "bo_composer_capture_preview_",
     "bo_composer_add_flash_",
@@ -30347,6 +30689,92 @@ def _composer_swap_panels(
         elif zoom_from == second_letter:
             st.session_state[zoom_key] = first_letter
     st.session_state["bo_composer_auto_render"] = True
+
+
+def _composer_delete_panels(
+    deleted_indices: Sequence[int],
+    panel_count: int,
+) -> int:
+    """Delete selected panels and compact all remaining panel widget state."""
+    deleted = {
+        int(index)
+        for index in deleted_indices
+        if isinstance(index, (int, np.integer))
+        and 0 <= int(index) < panel_count
+    }
+    if not deleted:
+        return panel_count
+
+    remaining = [index for index in range(panel_count) if index not in deleted]
+    reset_to_empty_panel = not remaining
+    indexed_state: list[tuple[str, int, Any]] = []
+    for state_key in list(st.session_state):
+        state_key = str(state_key)
+        if any(
+            state_key.startswith(prefix)
+            for prefix in _COMPOSER_STATE_EXCLUSIONS
+        ):
+            continue
+        match = re.fullmatch(r"(bo_composer_.+_)(\d+)", state_key)
+        if match is None:
+            continue
+        old_index = int(match.group(2))
+        if old_index >= panel_count:
+            continue
+        indexed_state.append(
+            (match.group(1), old_index, st.session_state[state_key])
+        )
+        del st.session_state[state_key]
+
+    old_to_new = {
+        old_index: new_index
+        for new_index, old_index in enumerate(remaining)
+    }
+    for prefix, old_index, value in indexed_state:
+        if old_index not in old_to_new:
+            continue
+        new_index = old_to_new[old_index]
+        if (
+            prefix == "bo_composer_label_"
+            and value == chr(ord("A") + old_index)
+        ):
+            value = chr(ord("A") + new_index)
+        elif prefix == "bo_composer_zoom_from_" and value not in {None, "None"}:
+            try:
+                linked_old_index = ord(str(value)) - ord("A")
+            except TypeError:
+                linked_old_index = -1
+            value = (
+                chr(ord("A") + old_to_new[linked_old_index])
+                if linked_old_index in old_to_new
+                else "None"
+            )
+        st.session_state[f"{prefix}{new_index}"] = value
+
+    new_count = 1 if reset_to_empty_panel else len(remaining)
+    st.session_state["bo_composer_count"] = new_count
+    st.session_state["bo_composer_auto_render"] = True
+    return new_count
+
+
+def _composer_apply_pending_panel_deletions() -> int:
+    """Apply editor deletions before any Composer widgets are instantiated."""
+    pending_key = "bo_composer_pending_delete_indices"
+    pending = st.session_state.pop(pending_key, [])
+    if not isinstance(pending, list) or not pending:
+        return 0
+    try:
+        panel_count = int(st.session_state.get("bo_composer_count", 0) or 0)
+    except (TypeError, ValueError):
+        panel_count = 0
+    valid_deleted_count = len({
+        int(index)
+        for index in pending
+        if isinstance(index, (int, np.integer))
+        and 0 <= int(index) < panel_count
+    })
+    _composer_delete_panels(pending, panel_count)
+    return valid_deleted_count
 
 
 def _composer_open_source(metadata: Mapping[str, Any]) -> None:
@@ -30715,6 +31143,11 @@ def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
     seen_key = "bo_composer_layout_editor_seen_event"
     if event_id is None or event_id == st.session_state.get(seen_key):
         return False
+    deleted_indices = result.get("deleted_indices")
+    if isinstance(deleted_indices, list) and deleted_indices:
+        st.session_state[seen_key] = event_id
+        st.session_state["bo_composer_pending_delete_indices"] = deleted_indices
+        return True
     raw_rects = result.get("rects")
     if not isinstance(raw_rects, list) or len(raw_rects) != panel_count:
         return False
@@ -31991,6 +32424,7 @@ def _render_figure_composer(
     paired_objective: bool,
 ) -> None:
     added_captures, skipped_captures = _composer_apply_pending_captures()
+    deleted_panels = _composer_apply_pending_panel_deletions()
     auto_render_requested = bool(
         st.session_state.pop("bo_composer_auto_render", False)
     )
@@ -32007,8 +32441,9 @@ def _render_figure_composer(
             1. Choose the canvas, panel count, and a layout.
             2. Open each panel section and choose its plot and data options.
             3. Adjust settings and arrange panels without waiting for a render.
-            4. Direct captures and panel moves update the preview automatically.
-               For other edits, click **Render figure** to update exports.
+            4. Direct captures, panel moves, and panel deletions render the
+               figure and exports automatically. For other edits, click
+               **Render figure**.
 
             **Manual mouse layout**
 
@@ -32016,6 +32451,8 @@ def _render_figure_composer(
             - Drag its lower-right square to resize it.
             - Make as many mouse edits as needed, then click **Apply layout** once.
             - Ctrl-click (Cmd-click on macOS) to select multiple panels.
+            - Click **Delete selected**, press Delete/Backspace, or use the
+              right-click menu to remove selected panels.
             - Right-click a selected panel to align, match sizes, or distribute.
             - Click empty canvas space to clear the selection.
             - Use the coordinate fields for exact final adjustments.
@@ -32024,7 +32461,7 @@ def _render_figure_composer(
         )
     st.caption(
         "Assemble a multipanel figure from the active BO scoring/group view. "
-        "Direct captures and panel moves refresh automatically; other edits remain "
+        "Direct captures, panel moves, and deletions refresh automatically; other edits remain "
         "pending until Render figure is clicked."
     )
     if added_captures:
@@ -32060,6 +32497,11 @@ def _render_figure_composer(
             f"Could not add {skipped_captures} captured plot"
             f"{'s' if skipped_captures != 1 else ''}: the Composer supports "
             "at most 12 panels."
+        )
+    if deleted_panels:
+        st.success(
+            f"Deleted {deleted_panels} panel"
+            f"{'s' if deleted_panels != 1 else ''} and compacted the layout."
         )
     channel_metrics = {
         metric: columns
@@ -32231,10 +32673,11 @@ def _render_figure_composer(
                         "are satisfied."
                     )
 
+    st.session_state.setdefault("bo_composer_layout", "Manual")
     c1, c2, c3, c4 = st.columns(4)
     aspect = c1.selectbox("Canvas", ["4:3", "16:9", "1:1", "Letter"], key="bo_composer_aspect")
     panel_count = int(c2.number_input("Panels", min_value=1, max_value=12, value=4, step=1, key="bo_composer_count"))
-    preset = c3.selectbox("Layout", ["Grid", "Main left + stack", "Top wide + grid", "Manual"], key="bo_composer_layout")
+    preset = c3.selectbox("Layout", ["Manual", "Grid", "Main left + stack", "Top wide + grid"], key="bo_composer_layout")
     dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25, key="bo_composer_dpi"))
     c5, c6, c7 = st.columns(3)
     font_family = c5.selectbox("Font", ["Arial", "DejaVu Sans", "Times New Roman", "Calibri"], key="bo_composer_font")
@@ -32257,10 +32700,13 @@ def _render_figure_composer(
             default=None,
         )
         if _composer_apply_layout_editor_result(editor_result, panel_count):
+            if st.session_state.get("bo_composer_pending_delete_indices"):
+                st.rerun()
             manual_rects = _composer_manual_rects(panel_count)
         st.caption(
             "Drag to move · drag the corner to resize · Ctrl/Cmd-click to "
-            "multi-select · right-click for alignment tools · Apply layout when done"
+            "multi-select · Delete/Backspace removes selected panels · "
+            "right-click for tools · Apply layout when done"
         )
         rects = manual_rects
     else:
@@ -33007,8 +33453,8 @@ def _render_figure_composer(
     if render_clicked or automatic_render:
         figure = None
         try:
-            preview_only = bool(automatic_render and not render_clicked)
-            active_render_dpi = min(dpi, 120) if preview_only else dpi
+            preview_only = False
+            active_render_dpi = dpi
             metadata = _composer_metadata(
                 session,
                 config,
@@ -33068,7 +33514,7 @@ def _render_figure_composer(
                 plt.close(figure)
 
     if automatic_render:
-        st.caption("Composer preview refreshed automatically.")
+        st.caption("Composer figure and exports refreshed automatically.")
 
     rendered = st.session_state.get(render_key) or {}
     if not rendered:
@@ -38276,9 +38722,10 @@ def render_bo_session_app() -> None:
                 ]
                 if trace_has_paired_phases:
                     trace_layout_options.append(PAIRED_PEAK_HEIGHT_LAYOUT)
-                if (
-                    not trace_all_mode
-                    and selected_trace_phase_set == {"buffer", "target"}
+                if _paired_measurement_3d_layout_available(
+                    display_trace_entries,
+                    selected_channels,
+                    selected_trace_phase_set,
                 ):
                     trace_layout_options.append(PAIRED_MEASUREMENT_3D_LAYOUT)
                 if len(swv_observations) > 1:
@@ -38649,18 +39096,57 @@ def render_bo_session_app() -> None:
                 paired_3d_label_columns = paired_3d_settings.columns(3)
                 paired_3d_voltage_label = paired_3d_label_columns[0].text_input(
                     "Voltage label",
-                    value="VOLTAGE (V)",
+                    value="Voltage (V)",
                     key=f"bo_trace_paired_3d_voltage_label_{swv_group_scope}",
                 )
                 paired_3d_measurement_label = paired_3d_label_columns[1].text_input(
                     "Measurement label",
-                    value="MEASUREMENT",
+                    value="Measurement",
                     key=f"bo_trace_paired_3d_measurement_label_{swv_group_scope}",
                 )
                 paired_3d_current_label = paired_3d_label_columns[2].text_input(
                     "Current label",
-                    value="CURRENT (" + chr(181) + "A)",
+                    value="Current (" + chr(181) + "A)",
                     key=f"bo_trace_paired_3d_current_label_{swv_group_scope}",
+                )
+                paired_3d_annotation_columns = paired_3d_settings.columns(2)
+                paired_3d_show_sigma_regions = paired_3d_annotation_columns[0].checkbox(
+                    "Box raw regions outside the peak bracket",
+                    value=False,
+                    key=f"bo_trace_paired_3d_sigma_regions_{swv_group_scope}",
+                    help=(
+                        "Adds two red depth boxes per raw trace: one before the "
+                        "left minimum and one after the right minimum. The complete "
+                        "minima-to-minima peak region remains open."
+                    ),
+                )
+                paired_3d_show_correction_annotations = (
+                    paired_3d_annotation_columns[1].checkbox(
+                        "Mark minima and peak height on corrected traces",
+                        value=False,
+                        key=(
+                            f"bo_trace_paired_3d_correction_annotations_"
+                            f"{swv_group_scope}"
+                        ),
+                        help=(
+                            "Marks both correction minima and draws a dashed, "
+                            "arrow-tipped line from the interpolated minima baseline "
+                            "to the corrected peak."
+                        ),
+                    )
+                )
+                paired_3d_legend_position = paired_3d_settings.selectbox(
+                    "Buffer/target legend position",
+                    (
+                        "Upper left",
+                        "Upper center",
+                        "Upper right",
+                        "Lower left",
+                        "Lower center",
+                        "Lower right",
+                    ),
+                    index=0,
+                    key=f"bo_trace_paired_3d_legend_position_v3_{swv_group_scope}",
                 )
                 trace_gif_duration = trace_settings_form.slider(
                     "SWV GIF frame duration (ms)",
@@ -38701,6 +39187,9 @@ def render_bo_session_app() -> None:
                     paired_3d_voltage_label,
                     paired_3d_measurement_label,
                     paired_3d_current_label,
+                    paired_3d_show_sigma_regions,
+                    paired_3d_show_correction_annotations,
+                    paired_3d_legend_position,
                     trace_gif_duration,
                 )
                 trace_render_key = "bo_swv_traces_render_signature"
@@ -39175,9 +39664,9 @@ def render_bo_session_app() -> None:
                                         if (
                                             current_normalize_to_peak
                                             and current_axis_label
-                                            == "CURRENT (" + chr(181) + "A)"
+                                            == "Current (" + chr(181) + "A)"
                                         ):
-                                            current_axis_label = "NORMALIZED CURRENT"
+                                            current_axis_label = "Normalized current"
                                         figure, errors = _plot_paired_measurement_3d_stack(
                                             display_trace_entries,
                                             current_corrected,
@@ -39195,6 +39684,18 @@ def render_bo_session_app() -> None:
                                             paired_3d_voltage_label,
                                             paired_3d_measurement_label,
                                             current_axis_label,
+                                            (
+                                                paired_3d_show_sigma_regions
+                                                and selected_trace_type == "Raw"
+                                            ),
+                                            (
+                                                paired_3d_show_correction_annotations
+                                                and selected_trace_type in {
+                                                    "Corrected",
+                                                    "Normalized corrected",
+                                                }
+                                            ),
+                                            paired_3d_legend_position,
                                         )
                                     elif trace_layout == "Chronological diagonal stack":
                                         figure, errors = _plot_chronological_swv_stack(

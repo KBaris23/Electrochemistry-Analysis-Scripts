@@ -2265,18 +2265,132 @@ def test_paired_measurement_3d_stack_orders_and_fades_six_replicates(monkeypatch
     ]
     # Rear traces are drawn first; the opaque foreground trace is drawn last.
     assert axis.lines[0].get_alpha() < axis.lines[-1].get_alpha()
-    assert axis.get_xlabel() == "VOLTAGE (V)"
-    assert [
-        text.get_text() for text in figure.texts
-        if getattr(text, "_bo_paired_measurement_label", False)
-    ] == ["MEASUREMENT"]
-    assert [
-        text.get_text() for text in figure.texts
-        if getattr(text, "_bo_paired_current_label", False)
-    ] == ["CURRENT (" + chr(181) + "A)"]
+    assert axis.get_xlabel() == "Voltage (V)"
+    assert axis.get_ylabel() == "Measurement"
+    assert axis.get_zlabel() == "Current (" + chr(181) + "A)"
+    assert axis.xaxis.label.get_fontweight() == "normal"
     assert [text.get_text() for text in figure.legends[0].get_texts()] == [
-        "BUFFER   1-3",
-        "TARGET   4-6",
+        "Buffer   1-3",
+        "Target   4-6",
+    ]
+    assert figure.legends[0]._loc == 2
+    plt.close(figure)
+
+
+def test_paired_measurement_3d_layout_uses_visible_observation_not_hidden_direction():
+    maximize = {
+        "group_id": 7,
+        "iteration": 50,
+        "optimization_direction": "maximize",
+        "method_id": "g7_max_i50",
+    }
+    minimize = {
+        "group_id": 7,
+        "iteration": 50,
+        "optimization_direction": "minimize",
+        "method_id": "g7_min_i50",
+    }
+    entries = [
+        *[
+            (maximize, {
+                "phase": phase,
+                "channel": "7",
+                "display_channel": "Ch 7 maximize",
+            })
+            for phase in ("buffer", "target")
+        ],
+        *[
+            (minimize, {
+                "phase": phase,
+                "channel": "7",
+                "display_channel": "Ch 7 minimize",
+            })
+            for phase in ("buffer", "target")
+        ],
+    ]
+
+    assert viewer._paired_measurement_3d_layout_available(
+        entries,
+        ["Ch 7 maximize"],
+        {"buffer", "target"},
+    )
+    assert not viewer._paired_measurement_3d_layout_available(
+        entries,
+        ["Ch 7 maximize", "Ch 7 minimize"],
+        {"buffer", "target"},
+    )
+    assert not viewer._paired_measurement_3d_layout_available(
+        entries,
+        ["Ch 7 maximize"],
+        {"buffer"},
+    )
+
+
+def test_paired_measurement_3d_stack_can_show_sigma_boxes_and_peak_annotations(
+    monkeypatch,
+):
+    phases = ["buffer"] * 3 + ["target"] * 3
+    loaded = [
+        {
+            "iteration": 47,
+            "stack_index": index,
+            "phase": phase,
+            "channel": "7_max",
+            "trace": {"phase": phase},
+            "voltage": pd.Series([-.55, -.40, -.30, -.20, 0.0]).to_numpy(),
+            "current": pd.Series([.01, .02, .08 + index * .01, .02, .01]).to_numpy(),
+            "landmarks": {
+                "left_minimum": (-.40, .02),
+                "peak": (-.30, .08 + index * .01),
+                "right_minimum": (-.20, .02),
+                "sigma_voltage": pd.Series([-.40, -.30, -.20]).to_numpy(),
+                "sigma_current": pd.Series([.02, .08 + index * .01, .02]).to_numpy(),
+            },
+        }
+        for index, phase in enumerate(phases)
+    ]
+    monkeypatch.setattr(
+        viewer,
+        "_chronological_swv_stack_entries",
+        lambda *_args, **_kwargs: (loaded, [], []),
+    )
+
+    figure, errors = viewer._plot_paired_measurement_3d_stack(
+        [],
+        True,
+        ["7_max"],
+        {},
+        {},
+        show_sigma_region_boxes=True,
+        show_correction_annotations=True,
+        legend_position="Upper left",
+    )
+
+    axis = figure.axes[0]
+    assert not errors
+    assert len([
+        collection for collection in axis.collections
+        if getattr(collection, "_bo_sigma_region_box", False)
+    ]) == 12
+    assert len([
+        collection for collection in axis.collections
+        if getattr(collection, "_bo_correction_minima", False)
+    ]) == 6
+    assert len([
+        collection for collection in axis.collections
+        if getattr(collection, "_bo_correction_peak", False)
+    ]) == 6
+    assert len([
+        line for line in axis.lines
+        if getattr(line, "_bo_correction_peak_height", False)
+    ]) == 6
+    assert figure.legends[0]._loc == 2
+    assert figure.legends[1]._loc == 1
+    assert [text.get_text() for text in figure.legends[1].get_texts()] == [
+        "Outside peak bracket",
+        "Correction minima",
+        "Corrected peak",
+        "Baseline-to-peak height",
     ]
     plt.close(figure)
 

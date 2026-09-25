@@ -112,9 +112,12 @@ measured 1D/2D/3D landscapes, surrogate evolution for every saved artifact,
 and all locally accessible raw and corrected SWV traces.
 
 The **Figure Composer** tab keeps most expensive plot generation behind
-**Render figure**. Directly captured plots and panel-order changes refresh a
-lightweight current preview automatically; other controls, exact manual
-coordinates, and mouse drag/resize operations change the pending configuration.
+**Render figure**. Directly captured plots, panel-order changes, and panel
+deletions refresh the current figure and exports automatically; other controls,
+exact manual coordinates, and mouse drag/resize operations change the pending
+configuration. The default layout is a manually editable grid. Select one or
+more panels in its mouse editor and use **Delete selected**, Delete/Backspace,
+or the right-click menu to remove them.
 Use the earlier/later controls to reorder panels and reassign their default
 letters. New in-session captures retain their plot source, so the Composer can
 re-render them at final panel DPI and adjust text, titles, axes, legends, grids,
