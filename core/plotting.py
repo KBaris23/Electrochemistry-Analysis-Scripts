@@ -2202,8 +2202,10 @@ def plot_grouped_overlaid_traces(
     show_grid: bool = False,
     outer_margin_fraction: float = 0.04,
     trace_modulo: int = 1,
+    series_colors: Optional[Dict[str, Any]] = None,
+    legend_title: str = "SWV group",
 ) -> Optional[plt.Figure]:
-    """Overlay multiple SWV groups, using a separate time-gradient colormap per group."""
+    """Overlay trace sets with time gradients or explicit solid series colors."""
     trace_modulo = max(1, int(trace_modulo))
     fig, ax = plt.subplots(figsize=(10, 5))
     if show_zero_baseline:
@@ -2253,7 +2255,7 @@ def plot_grouped_overlaid_traces(
             except (TypeError, ValueError):
                 continue
 
-            color = cmap(norm(index))
+            color = series_colors[group_label] if series_colors is not None else cmap(norm(index))
             ax.plot(voltage, y_plot, color=color, lw=linewidth, alpha=alpha)
             group_trace_count += 1
             plotted_trace_count += 1
@@ -2288,16 +2290,21 @@ def plot_grouped_overlaid_traces(
                 Line2D(
                     [0],
                     [0],
-                color=cmap(0.65),
+                    color=series_colors[group_label] if series_colors is not None else cmap(0.65),
                     lw=3,
-                    label=f"G{group_number} · {group_label} ({group_trace_count})",
+                    label=(
+                        f"{group_label} ({group_trace_count})"
+                        if series_colors is not None
+                        else f"G{group_number} · {group_label} ({group_trace_count})"
+                    ),
                 )
             )
-            scalar_mappable = cm.ScalarMappable(cmap=cmap, norm=norm)
-            scalar_mappable.set_array([])
-            group_colorbars.append(
-                (scalar_mappable, group_number, len(usable))
-            )
+            if series_colors is None:
+                scalar_mappable = cm.ScalarMappable(cmap=cmap, norm=norm)
+                scalar_mappable.set_array([])
+                group_colorbars.append(
+                    (scalar_mappable, group_number, len(usable))
+                )
 
     if not plotted_trace_count:
         plt.close(fig)
@@ -2311,9 +2318,9 @@ def plot_grouped_overlaid_traces(
     if legend_handles and show_legend:
         ax.legend(
             handles=legend_handles,
-            title="SWV group",
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.14),
+            title=legend_title,
+            loc="upper right" if series_colors is not None else "upper center",
+            bbox_to_anchor=None if series_colors is not None else (0.5, -0.14),
             ncol=min(2, len(legend_handles)),
             fontsize=8,
         )
@@ -2387,7 +2394,9 @@ def plot_grouped_overlaid_traces(
         ax.grid(True, alpha=0.2)
     else:
         ax.grid(False)
-    fig._swv_manual_layout = True
+    fig._swv_manual_layout = series_colors is None
+    if series_colors is not None:
+        fig.tight_layout()
     return fig
 
 

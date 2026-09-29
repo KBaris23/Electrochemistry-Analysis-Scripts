@@ -284,7 +284,7 @@ def _apply_swv_plot_formatting(
         perimeter_color = "#222222"
     marker_size = float(plot_setting("marker_size", 6.0))
     marker_opacity = float(plot_setting("marker_opacity", 0.85))
-    show_legend = bool(plot_setting("show_legend", True))
+    show_legend = bool(plot_setting("show_legend", plot_kind != "swv_trace"))
     show_grid = bool(plot_setting("show_grid", False))
     line_color = str(plot_setting("line_color_override", "") or "").strip()
     if line_color and not is_color_like(line_color):
@@ -395,6 +395,35 @@ def _apply_swv_plot_formatting(
             count = min(len(positions), len(colorbar_tick_labels))
             if count:
                 axis.set_yticks(positions[:count], labels=colorbar_tick_labels[:count])
+
+
+def _wrap_swv_plot_titles(fig: plt.Figure) -> None:
+    """Wrap titles using their final font size and available rendered width."""
+    renderer = fig.canvas.get_renderer()
+    for axis in fig.axes:
+        if getattr(axis, "_swv_colorbar_axis", False) or axis.get_label() == "<colorbar>":
+            continue
+        title = axis.title
+        available_width = min(axis.get_window_extent(renderer).width, fig.bbox.width * 0.9)
+        font = title.get_fontproperties()
+        lines = []
+        for paragraph in title.get_text().split("\n"):
+            line = ""
+            for word in paragraph.split():
+                candidate = f"{line} {word}" if line else word
+                width, _, _ = renderer.get_text_width_height_descent(candidate, font, ismath=False)
+                if line and width > available_width:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = candidate
+            lines.append(line)
+        title.set_text("\n".join(lines))
+        if bool(getattr(fig, "_swv_manual_layout", False)):
+            title_height = title.get_window_extent(renderer).height
+            top = 1.0 - (title_height + 20) / fig.bbox.height
+            if top > fig.subplotpars.bottom + 0.2:
+                fig.subplots_adjust(top=min(fig.subplotpars.top, top))
 
 
 def _position_swv_colorbars(fig: plt.Figure) -> None:
@@ -1517,6 +1546,9 @@ def render_downloadable_pyplot(
             if name in custom_text_sizes:
                 for artist in artists:
                     artist.set_fontsize(custom_text_sizes[name])
+
+        if plot_kind == "swv_trace":
+            _wrap_swv_plot_titles(fig)
 
         if not bool(getattr(fig, "_swv_manual_layout", False)):
             try:
@@ -3525,6 +3557,34 @@ def group_swv_display_channels(
     return dict(sorted(grouped.items(), key=lambda item: _channel_display_sort_key(item[0])))
 
 
+def group_swv_channels_by_display_group(
+    results: List[dict],
+    channels: List[Any],
+    by_settings: bool,
+) -> Dict[Any, List[Any]]:
+    """Collect selected channels by matching settings or modulo group number."""
+    selected = set(channels)
+    grouped: Dict[Any, List[Any]] = {}
+    original_channels = {}
+    for row in results:
+        channel = row.get("channel")
+        if channel not in selected or row.get("display_group_index") is None:
+            continue
+        group = (
+            swv_settings_signature(row)
+            if by_settings else int(row["display_group_index"])
+        )
+        members = grouped.setdefault(group, [])
+        if channel not in members:
+            members.append(channel)
+        original_channels[channel] = row.get("original_channel", channel)
+    for members in grouped.values():
+        members.sort(key=lambda channel: _channel_display_sort_key(original_channels[channel]))
+    if not by_settings:
+        return dict(sorted(grouped.items()))
+    return grouped
+
+
 def build_channel_indexes(
     results: List[dict],
     scan_range: Optional[Tuple[int, int]] = None,
@@ -4015,7 +4075,7 @@ with st.sidebar:
     use_swv_modulo_split = False
     swv_modulo_split_count = 2
     swv_group_overlay_colormaps = list(DEFAULT_SWV_GROUP_COLORMAPS)
-    swv_plot_show_legend = True
+    swv_plot_show_legend = False
     swv_plot_show_grid = False
     swv_colorbar_height_fraction = 0.85
     swv_colorbar_side = "right"
@@ -4063,7 +4123,8 @@ with st.sidebar:
             disabled=not (use_swv_settings_grouping or use_swv_modulo_split),
             help=(
                 "Comma-separated Matplotlib colormap names. Group 1 uses the first, "
-                "group 2 the second, and so on; the list cycles if needed."
+                "group 2 the second, and so on; the list cycles if needed. "
+                "Channel overlays use the Colour map control above the plots instead."
             ),
         )
         parsed_group_colormaps, invalid_group_colormaps = parse_colormap_names(
@@ -4177,7 +4238,7 @@ with st.sidebar:
                 )
             swv_plot_show_legend = st.checkbox(
                 "Show plot legends",
-                value=True,
+                value=False,
                 key="swv_plot_show_legend",
                 on_change=_sync_shared_swv_style_to_metrics,
                 args=("show_legend",),
@@ -5931,18 +5992,22 @@ if view == "Overlays":
                     st.warning("No plottable traces for this channel.")
     else:
         overlay_groups_by_channel = False
+        overlay_channels_by_group = False
         if use_swv_display_grouping:
             overlay_layout = st.radio(
                 "Group layout",
-                ["Separate group plots", "Overlay groups by channel"],
+                ["Separate group plots", "Overlay groups by channel", "Overlay channels by group"],
                 horizontal=True,
                 key="swv_overlay_group_layout",
                 help=(
                     "Overlay groups by channel creates one plot per original channel "
-                    "and assigns each group its sidebar colormap."
+                    "and assigns each group its sidebar colormap. Overlay channels by group "
+                    "compares selected channels in one plot per matching SWV settings "
+                    "or modulo group, with a distinct color for each channel."
                 ),
             )
             overlay_groups_by_channel = overlay_layout == "Overlay groups by channel"
+            overlay_channels_by_group = overlay_layout == "Overlay channels by group"
 
         ov_c1, ov_c2, ov_c3, ov_c4, ov_c5 = st.columns([2, 2, 1, 1, 1])
         trace_type_options = [
@@ -5958,12 +6023,12 @@ if view == "Overlays":
         trace_type   = ov_c1.radio("Trace type", trace_type_options,
                                     horizontal=True, key="overlay_type")
         cmap_name    = ov_c2.selectbox("Colour map",
-                                       ["plasma", "viridis", "inferno", "magma", "cividis", "turbo"],
+                                       ["plasma", "viridis", "inferno", "magma", "cividis", "turbo", "tab10", "tab20"],
                                        key="overlay_cmap",
                                        disabled=overlay_groups_by_channel,
                                        help=(
-                                           "Used for separate plots. Grouped overlays use "
-                                           "the colormap list in the left sidebar."
+                                           "Colors traces in separate plots and channels in channel overlays. "
+                                           "Group overlays use the colormap list in the left sidebar."
                                        ))
         show_anchors = ov_c3.checkbox("Show correction anchors", value=True,
                                       help="Dots mark the two bracketing-minima points used for baseline correction.")
@@ -5983,7 +6048,7 @@ if view == "Overlays":
         overlay_show_legend = bool(_resolve_swv_plot_setting(
             "swv_plot",
             "show_legend",
-            True,
+            False,
             inherit_metrics_style=True,
         ))
         overlay_show_grid = bool(_resolve_swv_plot_setting(
@@ -6028,14 +6093,33 @@ if view == "Overlays":
             else ("Offset raw current (uA)" if offset_to_baseline else "Current (uA)")
         )
 
-        if overlay_groups_by_channel:
-            grouped_channels = group_swv_display_channels(
-                plot_results,
-                plot_channels_display,
+        if overlay_groups_by_channel or overlay_channels_by_group:
+            grouped_channels = (
+                group_swv_channels_by_display_group(
+                    plot_results, plot_channels_display, use_swv_settings_grouping,
+                )
+                if overlay_channels_by_group
+                else group_swv_display_channels(plot_results, plot_channels_display)
             )
+            channel_order = list(group_swv_display_channels(plot_results, plot_channels_display))
+            channel_colors = None
+            if overlay_channels_by_group:
+                channel_cmap = plt.get_cmap(cmap_name)
+                channel_colors = {
+                    f"Channel {channel}": channel_cmap(
+                        position % channel_cmap.N
+                        if cmap_name in ("tab10", "tab20")
+                        else 0.1 + 0.75 * position / max(len(channel_order) - 1, 1)
+                    )
+                    for position, channel in enumerate(channel_order)
+                }
             for original_ch, display_groups in grouped_channels.items():
-                trace_modulo_key = f"swv_grouped_overlay_{original_ch}_trace_modulo"
-                trace_alpha_key = f"swv_grouped_overlay_{original_ch}_trace_alpha"
+                plot_id = (
+                    f"channels_by_group_{original_ch}"
+                    if overlay_channels_by_group else str(original_ch)
+                )
+                trace_modulo_key = f"swv_grouped_overlay_{plot_id}_trace_modulo"
+                trace_alpha_key = f"swv_grouped_overlay_{plot_id}_trace_alpha"
                 grouped_trace_sets = []
                 total_trace_count = 0
                 for group_position, display_group in enumerate(display_groups):
@@ -6043,7 +6127,11 @@ if view == "Overlays":
                     if not group_rows:
                         continue
                     first_row = group_rows[0]
-                    if use_swv_settings_grouping:
+                    if overlay_channels_by_group:
+                        channel = first_row["original_channel"]
+                        group_label = f"Channel {channel}"
+                        group_position = channel_order.index(channel)
+                    elif use_swv_settings_grouping:
                         group_label = str(first_row.get("swv_settings_label") or display_group)
                     else:
                         group_label = (
@@ -6059,25 +6147,30 @@ if view == "Overlays":
                     total_trace_count += len(group_rows)
                 if not grouped_trace_sets:
                     continue
-                with st.expander(
+                all_group_rows = [
+                    row for _, group_rows, _ in grouped_trace_sets for row in group_rows
+                ]
+                plot_title = (
                     (
-                        f"Channel {original_ch} ({len(grouped_trace_sets)} groups, "
-                        f"{total_trace_count} traces)"
-                    ),
+                        format_swv_settings_label(all_group_rows[0])
+                        if use_swv_settings_grouping else f"Group {original_ch}"
+                    )
+                    if overlay_channels_by_group
+                    else format_swv_overlay_title(original_ch, all_group_rows)
+                )
+                plot_heading = plot_title if overlay_channels_by_group else f"Channel {original_ch}"
+                member_label = "channels" if overlay_channels_by_group else "groups"
+                with st.expander(
+                    f"{plot_heading} ({len(grouped_trace_sets)} {member_label}, {total_trace_count} traces)",
                     expanded=len(grouped_channels) <= 4,
                 ):
                     fig = plot_grouped_overlaid_traces(
                         grouped_trace_sets,
                         trace_modulo=int(st.session_state.get(trace_modulo_key, 1)),
                         y_key=y_key,
-                        title=format_swv_overlay_title(
-                            original_ch,
-                            [
-                                row
-                                for _, group_rows, _ in grouped_trace_sets
-                                for row in group_rows
-                            ],
-                        ),
+                        title=plot_title,
+                        series_colors=channel_colors,
+                        legend_title="Channel" if overlay_channels_by_group else "SWV group",
                         ylabel=overlay_ylabel,
                         alpha=float(st.session_state.get(trace_alpha_key, overlay_line_alpha)),
                         show_anchors=show_anchors,
@@ -6106,11 +6199,13 @@ if view == "Overlays":
                             st,
                             fig,
                             key=(
-                                f"swv_grouped_overlay_{original_ch}_{y_key}_"
+                                f"swv_grouped_overlay_{plot_id}_{y_key}_"
                                 f"{normalize_to_peak}_{offset_to_baseline}"
                             ),
                             file_stem=(
-                                f"swv_grouped_overlay_ch{original_ch}_{trace_type}"
+                                f"swv_grouped_overlay_{plot_id}_{trace_type}"
+                                if overlay_channels_by_group
+                                else f"swv_grouped_overlay_ch{original_ch}_{trace_type}"
                             ),
                             plot_kind="swv_trace",
                             trace_modulo_key=trace_modulo_key,
