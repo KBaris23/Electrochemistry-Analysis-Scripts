@@ -24,7 +24,7 @@ Updated 8 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage
    `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\planar_BO_kana_20260918_112056\bo_sessions\bo_113013_8dd581`
 3. Wait for it to load. Select the BO group containing **channel 5** and select **maximize**.
 4. Open **Figure Composer -> Load a preset or saved figure**.
-5. Choose **Type 2 - BO validation**, then click **Load preset**.
+5. Choose **Type 2 - BO validation**, then click **Load preset**. Use **Type 2A - BO validation (focused)** instead when you want the same cube/trends without the chronological stack and parallel-coordinates panels.
 6. Confirm panel B is **Q_run** with the dashed **5-point running mean**. Do not turn display clipping on for the first export.
 7. Use **Render figure**, inspect it, then download PNG/PDF. Before leaving, save an analysis session named `kana_try_bo_ch5`.
 
@@ -39,11 +39,42 @@ No snapshot is used in this BO workflow. A `bo_config_snapshot.json` is a settin
 | Kana station 2 | `C:\TEMP\BO\500um_planar_kana_20260917_170330\500um_planar_kana_20260917_170349\bo_sessions\bo_171120_dc5dbc` | Type 2; channel 10 group; **maximize**. |
 | Setup-5 sweep | `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\parameter_sweep_20260921_110003\bo_sessions\bo_111904_a0d8ad` | Type 1A: cube left. Select real signal-on/off observations and two measured step planes. |
 
-For a side-by-side comparison, render the second survey session with **Type 1B - Sweep comparison (support left)**. It mirrors the SWV/maps inward. The original square Type 1 remains for a standalone eight-panel landscape.
+For a side-by-side comparison, render the second survey session with **Type 1B - Sweep comparison (support left)**. It mirrors the SWV/maps inward. The original square Type 1 remains for a standalone eight-panel landscape. Every Type 2 session can also use the three-panel **Type 2A - BO validation (focused)** preset.
 
-### 0.4 Later: SWV/titration analysis
+### 0.4 Template gallery
 
-Only after BO figures: choose **Analysis mode -> SWV**, select the appropriate `titration_only` folder, then load that dataset's `bo_config_snapshot.json` in **Peak / Baseline -> BO analysis match**. The full click-by-click SWV settings, paths, and titration figure instructions are in section 1 below.
+| Template | Panels / canvas | Use |
+|---|---|---|
+| Type 1 | 8 panels; 7 × 7 in | Full standalone parameter-sweep landscape: two cubes, two traces, four maps. |
+| Type 1A | 6 panels; 3.3 × 7 in | Compact survey half: cube left, signal-on/off SWVs and two maps right. |
+| Type 1B | 6 panels; 3.3 × 7 in | Mirrored Type 1A: supporting plots left, cube right. |
+| Type 2 | 5 panels; 7 × 7 in | Full BO validation: path cube, Q trend, phase trend, chronological stack, parallel coordinates. |
+| Type 2A | 3 panels; 7 × 5.25 in | Focused BO validation: path cube, Q trend, phase trend only. |
+| Type 3 | 4+ panels per row | Flexible manual-vs-one-optimized titration comparison. |
+| Type 3B | 7 panels; 2 × 4 grid | Fixed signal-on/manual and signal-off/manual rows; shared optimized-only Langmuir panel. |
+| Type 4 | 2 panels per row | Concentration-by-measurement plus predicted-vs-known. |
+
+```text
+Type 2                         Type 2A (focused)
+┌─────────┬───────┐            ┌──────────────┬───────┐
+│ A cube  │ B Q   │            │    A cube    │ B Q   │
+│         ├───────┤            │    + path    ├───────┤
+│         │ C phase│           │              │ C phase│
+├─────────┼───────┤            └──────────────┴───────┘
+│ D stack │ E ||| │
+└─────────┴───────┘
+
+Type 3B
+┌──────┬──────┬────────┬─────────────────┐
+│manual│  ON  │ON/manual│                 │
+├──────┼──────┼────────┤  shared ON/OFF  │
+│manual│ OFF  │OFF/manual│   Langmuir     │
+└──────┴──────┴────────┴─────────────────┘
+```
+
+### 0.5 Later: SWV/titration analysis
+
+Only after BO figures: choose **Analysis mode -> SWV** and select the data folder. Leave **Automatically load one uniquely matched snapshot when folders change** on. For a normal experiment tree, the app finds the snapshot beside its BO sessions; for the extracted `titration_only` folders, it uses `session_log.txt` to locate the corresponding experiment under `C:\TEMP\BO`. It loads the matched settings automatically, shows the source in **Peak / Baseline -> BO analysis match**, and leaves every widget editable. Use **Check current settings** to see changes or **Reload matched settings** to revert. Manual path entry remains the fallback when no unique match exists.
 
 ## 1. Later: verify one titration channel and save the results
 
@@ -52,9 +83,8 @@ After the BO figures, the next deliverable is a channel-5 titration results bund
 1. In the running app choose **Analysis mode: SWV**. Select only:
    `C:\TEMP\BO\titration_only\kana_try`
 2. Set **Group plotted traces by: SWV settings**. Choose the folder before loading settings, because folder changes can reset crop controls.
-3. Open **Peak / Baseline -> BO analysis match**. Paste this exact config file, avoiding automatic session selection:
-   `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\planar_BO_kana_20260918_112056\bo_sessions\bo_113013_8dd581\bo_config_snapshot.json`
-   Click **Load analysis settings from BO config**.
+3. Open **Peak / Baseline -> BO analysis match**. The matched setup-5 snapshot should already be shown and loaded automatically. Click **Check current settings** before running. If automatic matching is unavailable, paste this fallback path and click **Load analysis settings from BO config**:
+   `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\planar_BO_kana_20260918_112056\bo_sessions\bo_113013_8dd581\bo_config_snapshot.json`.
 4. Verify crop **-0.55 to 0.00 V**, smoothing **15 / 2**, minima window **0.30 V**, minimum start voltage **-0.6 V**, double correction **on**, minimum peak **0.001 uA**, prominent minima **on**, and **Apply BO acceptance windows on**. Peak window: **-0.45 to -0.10 V**; left minimum: **-0.54 to -0.10 V**; right minimum: **-0.45 to -0.01 V**; require local minima on both sides **on**. In Experimental, leave wavelet correction and background recentering **off**. The loader does not reset every experimental option.
 5. Click **Run Analysis** once and wait for completion. Use **Channels to plot: 5** for inspection; avoid restricting the analysis to selected doses or favorable scans.
 6. In Scan Annotations verify **Autotitration detected** and alternating buffer/target intervals. All four titration-only folders now contain `session_log.txt`; manual vline files are absent from the current analysis-plan folder. Check that boundaries land between blocks before fitting. Do not substitute guessed vlines if detection fails.
@@ -123,6 +153,7 @@ The app deliberately has two figure tools:
 | Type 1 – Parameter sweep | BO Session, **survey** session only | Standalone eight-panel setup-5 kanamycin landscape. The station-2 sweep can be supplementary, not a required main figure. |
 | Type 1A / 1B – Sweep comparison | BO Session, **survey** session only | Compact mirrored one-column halves for a planar/nanoporous side-by-side comparison: cube-left (1A) and support-left (1B). Select real signal-on/off observations and two measured step planes with the linked controls. |
 | Type 2 – BO validation | BO Session, BO experiment session | setup-5 kana, amp0, vanco, and optionally station-2 kana. |
+| Type 2A – BO validation (focused) | BO Session, BO experiment session | The Type 2 cube and the two essential quantitative trends only; omit the chronological stack and parallel coordinates. |
 | Type 3 – SWV and titration response | SWV → Paper Figures | each selected physical channel: manual/reference vs one optimized method, traces + time course + Langmuir response. |
 | Type 3B – Signal-on/off shared Langmuir | SWV → Paper Figures | One physical channel with fixed ON/manual and OFF/manual rows; one optimized-ON/OFF-only Langmuir panel spans the fourth column. |
 | Type 4 – Concentration validation | SWV → Paper Figures | the same selected channel/method pair: concentration-by-measurement and predicted-vs-known. |

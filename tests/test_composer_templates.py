@@ -485,6 +485,13 @@ def test_paper_figure_types_have_requested_linked_layouts():
     assert validation["bo_composer_count"] == 5
     assert validation["bo_composer_global_running_mean_1"] == 5
     assert validation["bo_composer_paired_metric_2"] == "Peak prominence"
+    focused = viewer._paper_bo_validation_focused_preset()["config"]["state"]
+    assert focused["bo_composer_count"] == 3
+    assert [focused[f"bo_composer_kind_{i}"] for i in range(3)] == [
+        "Measured 3D tensor", "Global trend", "Buffer/target trend",
+    ]
+    assert focused["bo_composer_aspect"] == "ACS 2-col (7.0 x 5.25 in)"
+    assert focused["bo_composer_global_running_mean_1"] == 5
 
 
 def test_compact_sweep_comparison_presets_are_mirrored_and_directional():

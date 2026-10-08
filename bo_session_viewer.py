@@ -32001,6 +32001,30 @@ def _paper_bo_validation_preset() -> dict[str, Any]:
     )
 
 
+def _paper_bo_validation_focused_preset() -> dict[str, Any]:
+    """Three-panel BO validation without the stack or parallel-coordinates panels."""
+    return _composer_builtin_preset(
+        "Type 2A - BO validation (focused)",
+        layout="Manual",
+        kinds=("Measured 3D tensor", "Global trend", "Buffer/target trend"),
+        # One large BO path cube, then the two essential quantitative checks.
+        rects=[(.05, .08, .60, .85), (.70, .55, .26, .38), (.70, .08, .26, .38)],
+        aspect="ACS 2-col (7.0 x 5.25 in)",
+        extra_state={
+            "bo_composer_direction": "maximize",
+            "bo_composer_measured_metric_0": "Paired Q",
+            "bo_composer_measured_x_0": "amplitude",
+            "bo_composer_measured_y_0": "step_potential",
+            "bo_composer_measured_z_0": "frequency",
+            "bo_composer_measured_iteration_path_0": True,
+            "bo_composer_measured_dot_size_0": 8,
+            "bo_composer_global_metric_1": "Q_run",
+            "bo_composer_global_running_mean_1": 5,
+            "bo_composer_paired_metric_2": "Peak prominence",
+        },
+    )
+
+
 def _composer_channel_options_by_kind(
     real_channels: Sequence[str],
     trace_channels: Sequence[str],
@@ -34305,6 +34329,9 @@ def _render_figure_composer(
         )
     else:
         saved_presets["Type 2 - BO validation"] = _paper_bo_validation_preset()
+        saved_presets["Type 2A - BO validation (focused)"] = (
+            _paper_bo_validation_focused_preset()
+        )
     saved_presets.update(_composer_load_presets())
     with st.expander("Load a preset or saved figure", expanded=False):
         preset_cols = st.columns([2.2, 1])

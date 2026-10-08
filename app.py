@@ -4190,6 +4190,7 @@ for k, v in dict(
     swv_show_titration_fit_details=False,
     swv_fit_titration_langmuir=False,
     swv_titration_concentration_unit="uM",
+    swv_bo_auto_load_recommended=True,
     mat_conversion_report=None,
 ).items():
     if k not in st.session_state:
@@ -4232,16 +4233,70 @@ def _find_bo_config_snapshot(path_text: str) -> Optional[Path]:
     return max(candidates, key=state_size)
 
 
-def _load_bo_analysis_into_sidebar() -> None:
+def _path_basename(path_text: str) -> str:
+    """Return a basename when a session log contains Windows or POSIX paths."""
+    return str(path_text).strip().strip('"').replace("\\", "/").rstrip("/").split("/")[-1]
+
+
+def _bo_snapshot_candidates_for_folders(folders: List[str]) -> list[Path]:
+    """Find snapshots beside normal inputs and beside safely extracted titrations.
+
+    A normal experiment folder contains ``bo_sessions`` and is detected directly.
+    For an intentionally extracted titration folder, its copied ``session_log``
+    preserves the original session/experiment folder names.  We use only those
+    exact names under a few parent directories; there is no expensive recursive
+    scan through raw measurement folders and no fuzzy scientific matching.
+    """
+    found: dict[str, Path] = {}
+
+    def add(candidate: Optional[Path]) -> None:
+        if candidate is not None and candidate.is_file():
+            found[str(candidate.resolve())] = candidate.resolve()
+
+    for folder_text in folders:
+        folder = Path(str(folder_text)).expanduser()
+        add(_find_bo_config_snapshot(str(folder)))
+        if not folder.is_dir():
+            continue
+        session_name = ""
+        experiment_name = ""
+        log = folder / "session_log.txt"
+        if log.is_file():
+            try:
+                for line in log.read_text(encoding="utf-8", errors="replace").splitlines()[:80]:
+                    if "Session started:" in line:
+                        session_name = _path_basename(line.split("Session started:", 1)[1])
+                    elif "Experiment started:" in line:
+                        experiment_name = _path_basename(line.split("Experiment started:", 1)[1])
+            except OSError:
+                pass
+        # An ordinary nested titration folder may be below its experiment.
+        for parent in list(folder.parents)[:3]:
+            add(_find_bo_config_snapshot(str(parent)))
+            if experiment_name:
+                add(_find_bo_config_snapshot(str(parent / experiment_name)))
+            if session_name:
+                add(_find_bo_config_snapshot(str(parent / session_name)))
+                if experiment_name:
+                    add(_find_bo_config_snapshot(str(parent / session_name / experiment_name)))
+    return sorted(found.values(), key=lambda item: str(item).lower())
+
+
+def _read_bo_analysis_snapshot(snapshot: Path) -> dict[str, Any]:
+    return dict(json.loads(snapshot.read_text(encoding="utf-8")).get("analysis") or {})
+
+
+def _load_bo_analysis_into_sidebar(snapshot_path: Optional[str] = None) -> None:
     """Copy a BO session's analysis block into the SWV sidebar widgets."""
-    snapshot = _find_bo_config_snapshot(st.session_state.get("swv_bo_config_path", ""))
+    requested_path = snapshot_path or st.session_state.get("swv_bo_config_path", "")
+    snapshot = _find_bo_config_snapshot(str(requested_path))
     if snapshot is None:
         st.session_state["swv_bo_config_flash"] = (
             "error", "No bo_config_snapshot.json found at that path."
         )
         return
     try:
-        analysis = dict(json.loads(snapshot.read_text(encoding="utf-8")).get("analysis") or {})
+        analysis = _read_bo_analysis_snapshot(snapshot)
     except (OSError, ValueError) as exc:
         st.session_state["swv_bo_config_flash"] = ("error", f"Could not read {snapshot}: {exc}")
         return
@@ -4288,10 +4343,64 @@ def _load_bo_analysis_into_sidebar() -> None:
     state["swv_bo_apply_windows"] = have_windows
     state["swv_bo_require_minima"] = require_minima
     state["swv_bo_config_loaded_path"] = str(snapshot.resolve())
+    state["swv_bo_config_path"] = str(snapshot.resolve())
     state["swv_bo_config_flash"] = (
         "success",
         f"Loaded analysis settings from {snapshot}. Click Run Analysis to apply them.",
     )
+
+
+def _check_bo_analysis_match(snapshot_path: str) -> None:
+    """Report whether the editable SWV controls still match a saved BO snapshot."""
+    snapshot = _find_bo_config_snapshot(snapshot_path)
+    if snapshot is None:
+        st.session_state["swv_bo_config_check"] = ("error", "No snapshot found to check.")
+        return
+    try:
+        analysis = _read_bo_analysis_snapshot(snapshot)
+    except (OSError, ValueError) as exc:
+        st.session_state["swv_bo_config_check"] = ("error", f"Could not read {snapshot}: {exc}")
+        return
+    state = st.session_state
+    comparisons = [
+        ("Crop minimum", "swv_crop_min", analysis.get("crop_min_v")),
+        ("Crop maximum", "swv_crop_max", analysis.get("crop_max_v")),
+        ("Minimum start voltage", "swv_min_start_voltage", analysis.get("min_start_voltage_v")),
+        ("Smoothing window", "swv_smooth_window", analysis.get("smooth_window")),
+        ("Smoothing polynomial order", "swv_smooth_polyorder", analysis.get("smooth_polyorder")),
+        ("Minima search window", "swv_minima_window", analysis.get("minima_search_window_v")),
+        ("Minimum peak height", "swv_min_peak_height", analysis.get("min_peak_height_ua")),
+    ]
+    differences = []
+    for label, widget_key, expected in comparisons:
+        if expected in (None, "", "none"):
+            continue
+        actual = state.get(widget_key)
+        try:
+            matches = abs(float(actual) - float(expected)) < 1e-9
+        except (TypeError, ValueError):
+            matches = actual == expected
+        if not matches:
+            differences.append(f"{label}: current {actual}; BO {expected}")
+    expected_prominent = bool(
+        analysis.get("use_prominent_minima", False)
+        or analysis.get("require_local_minima_on_both_sides", False)
+    )
+    if bool(state.get("swv_use_prominent_minima", False)) != expected_prominent:
+        differences.append("Prominent minima setting differs")
+    expected_windows = any(
+        analysis.get(key) not in (None, "", "none") for key in (
+            "peak_voltage_min_v", "peak_voltage_max_v", "left_min_voltage_min_v",
+            "left_min_voltage_max_v", "right_min_voltage_min_v", "right_min_voltage_max_v",
+        )
+    )
+    if bool(state.get("swv_bo_apply_windows", False)) != expected_windows:
+        differences.append("BO acceptance-window toggle differs")
+    message = (
+        f"Current editable controls match {snapshot.name}."
+        if not differences else "Differences from BO snapshot:\n\n- " + "\n- ".join(differences)
+    )
+    st.session_state["swv_bo_config_check"] = ("success" if not differences else "warning", message)
 
 
 _render_workspace_manager()
@@ -4371,6 +4480,29 @@ with st.sidebar:
     if folder_errors:
         for fe in folder_errors:
             st.error(f"Not found: `{fe}`")
+
+    # Match analysis settings before sidebar widgets are instantiated.  This
+    # permits an automatic one-click-free load for ordinary experiment trees,
+    # while extracted titration folders are resolved from their copied session
+    # log only when it points to one exact local experiment.
+    if analysis_mode == "SWV" and folders and not folder_errors:
+        snapshot_candidates = _bo_snapshot_candidates_for_folders(folders)
+        st.session_state["swv_bo_recommended_snapshots"] = [
+            str(item) for item in snapshot_candidates
+        ]
+        auto_key = (tuple(folders), tuple(map(str, snapshot_candidates)))
+        if (
+            st.session_state.get("swv_bo_auto_load_recommended", True)
+            and len(snapshot_candidates) == 1
+            and st.session_state.get("swv_bo_auto_loaded_key") != auto_key
+        ):
+            _load_bo_analysis_into_sidebar(str(snapshot_candidates[0]))
+            st.session_state["swv_bo_auto_loaded_key"] = auto_key
+            # The crop selector below normally resets after a folder change;
+            # mark this selection as initialized so it keeps the loaded values.
+            st.session_state["swv_crop_folder_key"] = (
+                "SWV", tuple(folders), DEFAULT_SWV_CROP_RANGE
+            )
 
     if analysis_mode == "SWV" and folders and not folder_errors:
         st.caption("MAT-file discovery runs only when conversion is requested.")
@@ -4539,10 +4671,47 @@ with st.sidebar:
 
         with st.expander("BO analysis match", expanded=False):
             st.caption(
-                "Reproduce a Bayesian-optimization session's analysis exactly: "
-                "load its saved settings, then optionally reject scans whose "
-                "peak or bracketing minima fall outside the BO acceptance windows."
+                "Recommended BO settings can load automatically from the selected "
+                "experiment. You can then change any control, or check it against "
+                "the snapshot before running analysis."
             )
+            st.checkbox(
+                "Automatically load one uniquely matched snapshot when folders change",
+                key="swv_bo_auto_load_recommended",
+                help=(
+                    "Normal experiment folders are detected directly. Extracted titration "
+                    "folders use the original experiment name recorded in session_log.txt."
+                ),
+            )
+            recommended_paths = list(st.session_state.get("swv_bo_recommended_snapshots") or [])
+            if len(recommended_paths) == 1:
+                recommended = recommended_paths[0]
+                st.success(f"Matched BO snapshot: `{recommended}`")
+                action_cols = st.columns(2)
+                action_cols[0].button(
+                    "Reload matched settings",
+                    key="swv_bo_config_reload_recommended",
+                    on_click=_load_bo_analysis_into_sidebar,
+                    args=(recommended,),
+                    use_container_width=True,
+                )
+                action_cols[1].button(
+                    "Check current settings",
+                    key="swv_bo_config_check_recommended",
+                    on_click=_check_bo_analysis_match,
+                    args=(recommended,),
+                    use_container_width=True,
+                )
+            elif len(recommended_paths) > 1:
+                st.warning(
+                    "More than one BO snapshot matched these folders. Select the intended "
+                    "one below and load it manually; automatic loading is intentionally off."
+                )
+            else:
+                st.info(
+                    "No adjacent snapshot was found. Paste a snapshot, BO-session, or "
+                    "experiment-folder path below to load it manually."
+                )
             st.text_input(
                 "BO config path (bo_config_snapshot.json, session or experiment folder)",
                 key="swv_bo_config_path",
@@ -4555,7 +4724,12 @@ with st.sidebar:
             )
             flash = st.session_state.get("swv_bo_config_flash")
             if flash:
-                getattr(st, "success" if flash[0] == "success" else "error")(flash[1])
+                getattr(st, flash[0] if flash[0] in {"success", "warning", "error"} else "info")(flash[1])
+            check_result = st.session_state.get("swv_bo_config_check")
+            if check_result:
+                getattr(st, check_result[0] if check_result[0] in {"success", "warning", "error"} else "info")(
+                    check_result[1]
+                )
             apply_bo_windows = st.checkbox(
                 "Apply BO acceptance windows",
                 value=bool(st.session_state.get("swv_bo_apply_windows", False)),
