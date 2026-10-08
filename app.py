@@ -385,7 +385,7 @@ def _apply_swv_plot_formatting(
         perimeter_color = "#222222"
     marker_size = float(plot_setting("marker_size", 6.0))
     marker_opacity = float(plot_setting("marker_opacity", 0.85))
-    show_legend = bool(plot_setting("show_legend", True))
+    show_legend = bool(plot_setting("show_legend", plot_kind != "swv_trace"))
     show_grid = bool(plot_setting("show_grid", False))
     line_color = str(plot_setting("line_color_override", "") or "").strip()
     if line_color and not is_color_like(line_color):
@@ -498,6 +498,35 @@ def _apply_swv_plot_formatting(
                 axis.set_yticks(positions[:count], labels=colorbar_tick_labels[:count])
 
 
+def _wrap_swv_plot_titles(fig: plt.Figure) -> None:
+    """Wrap titles using their final font size and available rendered width."""
+    renderer = fig.canvas.get_renderer()
+    for axis in fig.axes:
+        if getattr(axis, "_swv_colorbar_axis", False) or axis.get_label() == "<colorbar>":
+            continue
+        title = axis.title
+        available_width = min(axis.get_window_extent(renderer).width, fig.bbox.width * 0.9)
+        font = title.get_fontproperties()
+        lines = []
+        for paragraph in title.get_text().split("\n"):
+            line = ""
+            for word in paragraph.split():
+                candidate = f"{line} {word}" if line else word
+                width, _, _ = renderer.get_text_width_height_descent(candidate, font, ismath=False)
+                if line and width > available_width:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = candidate
+            lines.append(line)
+        title.set_text("\n".join(lines))
+        if bool(getattr(fig, "_swv_manual_layout", False)):
+            title_height = title.get_window_extent(renderer).height
+            top = 1.0 - (title_height + 20) / fig.bbox.height
+            if top > fig.subplotpars.bottom + 0.2:
+                fig.subplots_adjust(top=min(fig.subplotpars.top, top))
+
+
 def _position_swv_colorbars(fig: plt.Figure) -> None:
     if bool(getattr(fig, "_swv_manual_layout", False)):
         return
@@ -567,6 +596,7 @@ def _apply_all_metrics_plot_settings() -> None:
     # Saved plot-specific widget state otherwise supersedes the shared values.
     plot_override_suffixes = (
         "_override_plot_text",
+        "_customize_text_sizes",
         "_custom_title",
         "_custom_xlabel",
         "_custom_ylabel",
@@ -718,7 +748,7 @@ def _apply_all_langmuir_plot_settings() -> None:
             )
 
     plot_override_suffixes = (
-        "_override_plot_text", "_custom_title", "_custom_xlabel",
+        "_override_plot_text", "_customize_text_sizes", "_custom_title", "_custom_xlabel",
         "_custom_ylabel", "_show_legend", "_custom_legend_title",
         "_custom_legend_labels", "_override_series_colors",
         "_custom_series_colors",
@@ -836,6 +866,44 @@ def _render_all_langmuir_plot_settings() -> None:
             st.success("Applied these settings to all Langmuir fit plots.")
 
 
+def _plot_text_size_groups(fig: plt.Figure) -> Dict[str, List[Any]]:
+    """Collect existing text artists without resetting their content or style."""
+    groups: Dict[str, List[Any]] = {}
+
+    def add_axis(axis, prefix):
+        groups[f"{prefix}Title"] = [axis.title]
+        groups[f"{prefix}X-axis label"] = [axis.xaxis.label]
+        groups[f"{prefix}Y-axis label"] = [axis.yaxis.label]
+        groups[f"{prefix}X tick labels"] = [
+            *axis.get_xticklabels(), *axis.get_xticklabels(minor=True),
+            axis.xaxis.get_offset_text(),
+        ]
+        groups[f"{prefix}Y tick labels"] = [
+            *axis.get_yticklabels(), *axis.get_yticklabels(minor=True),
+            axis.yaxis.get_offset_text(),
+        ]
+        legend = axis.get_legend()
+        if legend is not None:
+            groups[f"{prefix}Legend title"] = [legend.get_title()]
+            groups[f"{prefix}Legend entries"] = list(legend.get_texts())
+        if axis.texts:
+            groups[f"{prefix}Annotations"] = list(axis.texts)
+        for index, child in enumerate(axis.child_axes, start=1):
+            add_axis(child, f"{prefix}Secondary axis {index} · ")
+
+    main_count = 0
+    colorbar_count = 0
+    for axis in fig.axes:
+        if getattr(axis, "_swv_colorbar_axis", False) or axis.get_label() == "<colorbar>":
+            colorbar_count += 1
+            prefix = f"Colorbar {colorbar_count} · "
+        else:
+            main_count += 1
+            prefix = "" if main_count == 1 else f"Axis {main_count} · "
+        add_axis(axis, prefix)
+    return groups
+
+
 def render_downloadable_pyplot(
     container,
     fig: plt.Figure,
@@ -891,12 +959,13 @@ def render_downloadable_pyplot(
     )
     series_artists = []
     if primary_axis is not None:
-        legend_artists, legend_artist_labels = primary_axis.get_legend_handles_labels()
-        series_artists = [
-            artist
-            for artist, label in zip(legend_artists, legend_artist_labels)
-            if str(label) and not str(label).startswith("_")
-        ]
+        for axis in fig.axes:
+            legend_artists, legend_artist_labels = axis.get_legend_handles_labels()
+            series_artists.extend(
+                artist
+                for artist, label in zip(legend_artists, legend_artist_labels)
+                if str(label) and not str(label).startswith("_")
+            )
     default_series_colors = []
     for artist in series_artists:
         artist_color = None
@@ -984,9 +1053,32 @@ def render_downloadable_pyplot(
     reconstruction_y_tick_positions_text = ""
     reconstruction_y_tick_labels_text = ""
 
+    text_size_groups = _plot_text_size_groups(fig)
+    custom_text_sizes = {}
     with settings_col.popover(
         "Plot settings", use_container_width=True
     ), st.form(f"{key}_plot_settings_form", border=False):
+        customize_text_sizes = st.checkbox(
+            "Customize text sizes",
+            key=f"{key}_customize_text_sizes",
+            help="Set font sizes independently for this plot. Sizes are in points and also apply to downloads.",
+        )
+        if customize_text_sizes:
+            with st.expander("Text sizes (pt)", expanded=True):
+                text_size_columns = st.columns(2)
+                for index, (name, artists) in enumerate(text_size_groups.items()):
+                    if not artists:
+                        continue
+                    custom_text_sizes[name] = float(
+                        text_size_columns[index % 2].number_input(
+                            name,
+                            min_value=1.0,
+                            max_value=100.0,
+                            value=float(artists[0].get_fontsize()),
+                            step=0.5,
+                            key=f"{key}_font_size_{name}",
+                        )
+                    )
         if trace_alpha_key is not None:
             st.slider(
                 "Trace alpha",
@@ -1140,65 +1232,11 @@ def render_downloadable_pyplot(
                 key=f"{key}_text_size",
                 help="Sets the base size used by plot text, as in the BO viewer.",
             ))
-            use_individual_text_sizes = st.checkbox(
-                "Set individual text sizes",
-                key=f"{key}_individual_text_sizes",
-                help=(
-                    "When off, the base text-size control scales the title, axis "
-                    "labels, ticks, and legend together."
-                ),
-            )
-            reconstruction_title_size = float(st.number_input(
-                "Title size",
-                min_value=1.0,
-                max_value=100.0,
-                value=float(reconstruction_text_size * 1.2),
-                step=0.5,
-                key=f"{key}_title_size",
-                disabled=not use_individual_text_sizes,
-            ))
-            reconstruction_tick_size = float(st.number_input(
-                "Tick size",
-                min_value=1.0,
-                max_value=100.0,
-                value=float(reconstruction_text_size * 0.9),
-                step=0.5,
-                key=f"{key}_tick_size",
-                disabled=not use_individual_text_sizes,
-            ))
-            reconstruction_x_label_size = float(st.number_input(
-                "X label size",
-                min_value=1.0,
-                max_value=100.0,
-                value=float(reconstruction_text_size),
-                step=0.5,
-                key=f"{key}_x_label_size",
-                disabled=not use_individual_text_sizes,
-            ))
-            reconstruction_y_label_size = float(st.number_input(
-                "Y label size",
-                min_value=1.0,
-                max_value=100.0,
-                value=float(reconstruction_text_size),
-                step=0.5,
-                key=f"{key}_y_label_size",
-                disabled=not use_individual_text_sizes,
-            ))
-            reconstruction_legend_size = float(st.number_input(
-                "Legend text size",
-                min_value=1.0,
-                max_value=100.0,
-                value=float(reconstruction_text_size * 0.8),
-                step=0.5,
-                key=f"{key}_legend_size",
-                disabled=not use_individual_text_sizes,
-            ))
-            if not use_individual_text_sizes:
-                reconstruction_title_size = reconstruction_text_size * 1.2
-                reconstruction_x_label_size = reconstruction_text_size
-                reconstruction_y_label_size = reconstruction_text_size
-                reconstruction_tick_size = reconstruction_text_size * 0.9
-                reconstruction_legend_size = reconstruction_text_size * 0.8
+            reconstruction_title_size = reconstruction_text_size * 1.2
+            reconstruction_x_label_size = reconstruction_text_size
+            reconstruction_y_label_size = reconstruction_text_size
+            reconstruction_tick_size = reconstruction_text_size * 0.9
+            reconstruction_legend_size = reconstruction_text_size * 0.8
 
             st.markdown("**Lines, markers, and frame**")
             reconstruction_line_scale = float(st.slider(
@@ -1397,9 +1435,10 @@ def render_downloadable_pyplot(
 
     if primary_axis is not None:
         if override_plot_text:
-            primary_axis.set_title(custom_title)
-            primary_axis.set_xlabel(custom_xlabel)
-            primary_axis.set_ylabel(custom_ylabel)
+            # Change only the text: Axes.set_title reapplies rcParams font defaults.
+            primary_axis.title.set_text(custom_title)
+            primary_axis.xaxis.label.set_text(custom_xlabel)
+            primary_axis.yaxis.label.set_text(custom_ylabel)
         if legend is not None:
             legend.set_visible(show_legend)
             if override_plot_text:
@@ -1603,6 +1642,22 @@ def render_downloadable_pyplot(
                 float(reconstruction_y_min),
                 float(reconstruction_y_max),
             )
+        # Match measurement labels to the final trace color, including overrides.
+        for axis in fig.axes:
+            for annotation in axis.texts:
+                series = getattr(annotation, "_swv_series_artist", None)
+                if series is not None:
+                    annotation.set_color(series.get_color())
+
+        # Apply after plot-specific formatting so explicit sizes take precedence.
+        for name, artists in _plot_text_size_groups(fig).items():
+            if name in custom_text_sizes:
+                for artist in artists:
+                    artist.set_fontsize(custom_text_sizes[name])
+
+        if plot_kind == "swv_trace":
+            _wrap_swv_plot_titles(fig)
+
         if not bool(getattr(fig, "_swv_manual_layout", False)):
             try:
                 margin_px = (
@@ -1985,6 +2040,7 @@ def run_batch_dispatch(
     input_signature,
     _progress_callback=None,
     bo_acceptance=None,
+    channels=None,
 ):
     # The signature is included in the caller's explicit session cache key.
     del input_signature
@@ -2002,6 +2058,7 @@ def run_batch_dispatch(
 
     batch_results = run_batch(
         folders=list(folders),
+        channels=channels,
         crop_range=crop_range,
         smooth_window=smooth_window,
         smooth_polyorder=smooth_polyorder,
@@ -3915,6 +3972,34 @@ def group_swv_display_channels(
     return dict(sorted(grouped.items(), key=lambda item: _channel_display_sort_key(item[0])))
 
 
+def group_swv_channels_by_display_group(
+    results: List[dict],
+    channels: List[Any],
+    by_settings: bool,
+) -> Dict[Any, List[Any]]:
+    """Collect selected channels by matching settings or modulo group number."""
+    selected = set(channels)
+    grouped: Dict[Any, List[Any]] = {}
+    original_channels = {}
+    for row in results:
+        channel = row.get("channel")
+        if channel not in selected or row.get("display_group_index") is None:
+            continue
+        group = (
+            swv_settings_signature(row)
+            if by_settings else int(row["display_group_index"])
+        )
+        members = grouped.setdefault(group, [])
+        if channel not in members:
+            members.append(channel)
+        original_channels[channel] = row.get("original_channel", channel)
+    for members in grouped.values():
+        members.sort(key=lambda channel: _channel_display_sort_key(original_channels[channel]))
+    if not by_settings:
+        return dict(sorted(grouped.items()))
+    return grouped
+
+
 def build_channel_indexes(
     results: List[dict],
     scan_range: Optional[Tuple[int, int]] = None,
@@ -4567,21 +4652,29 @@ with st.sidebar:
     #  Channels 
     st.subheader(" Channels")
     channels_input = st.text_input(
-        "Channels to plot (comma-separated, blank = all)",
+        (
+            "Channels to analyze and plot (comma-separated, blank = all)"
+            if analysis_mode == "SWV"
+            else "Channels to plot (comma-separated, blank = all)"
+        ),
         value="1,2,3,4,5,6,7,8,9,10",
     )
     channels_to_plot: Optional[List[int]] = None
+    channel_selection_invalid = False
     if channels_input.strip():
         try:
             channels_to_plot = [int(c.strip()) for c in channels_input.split(",") if c.strip()]
+            if not channels_to_plot:
+                raise ValueError("Empty channel list")
         except ValueError:
+            channel_selection_invalid = True
             st.error("Invalid channel list  use integers separated by commas.")
     swv_grouping_mode = "None"
     use_swv_settings_grouping = False
     use_swv_modulo_split = False
     swv_modulo_split_count = 2
     swv_group_overlay_colormaps = list(DEFAULT_SWV_GROUP_COLORMAPS)
-    swv_plot_show_legend = True
+    swv_plot_show_legend = False
     swv_plot_show_grid = False
     swv_colorbar_height_fraction = 0.85
     swv_colorbar_side = "right"
@@ -4629,7 +4722,8 @@ with st.sidebar:
             disabled=not (use_swv_settings_grouping or use_swv_modulo_split),
             help=(
                 "Comma-separated Matplotlib colormap names. Group 1 uses the first, "
-                "group 2 the second, and so on; the list cycles if needed."
+                "group 2 the second, and so on; the list cycles if needed. "
+                "Channel overlays use the Colour map control above the plots instead."
             ),
         )
         parsed_group_colormaps, invalid_group_colormaps = parse_colormap_names(
@@ -4743,7 +4837,7 @@ with st.sidebar:
                 )
             swv_plot_show_legend = st.checkbox(
                 "Show plot legends",
-                value=True,
+                value=False,
                 key="swv_plot_show_legend",
                 on_change=_sync_shared_swv_style_to_metrics,
                 args=("show_legend",),
@@ -5032,7 +5126,7 @@ with st.sidebar:
     run_clicked = st.button(
         "  Run Analysis",
         type="primary",
-        disabled=not folders or bool(folder_errors) or scan_selection_invalid,
+        disabled=not folders or bool(folder_errors) or scan_selection_invalid or channel_selection_invalid,
         use_container_width=True,
     )
 
@@ -5047,6 +5141,10 @@ if run_clicked and folders and not folder_errors:
             input_signature = _analysis_input_signature(tuple(folders))
             requested_cache_key = (
                 ANALYSIS_CACHE_SCHEMA_VERSION,
+                (
+                    tuple(sorted(set(channels_to_plot)))
+                    if analysis_mode == "SWV" and channels_to_plot else None
+                ),
                 analysis_mode,
                 tuple(folders),
                 (float(crop_min), float(crop_max)),
@@ -5099,6 +5197,7 @@ if run_clicked and folders and not folder_errors:
                 with st.spinner("Running analysis (first run may take a moment, cached runs are instant)"):
                     results = run_batch_dispatch(
                         analysis_mode=analysis_mode,
+                        channels=channels_to_plot or None,
                         folders=tuple(folders),
                         crop_range=(crop_min, crop_max),
                         smooth_window=smooth_window,
@@ -5165,6 +5264,7 @@ if run_clicked and folders and not folder_errors:
             else:
                 results = run_batch(
                     folders=list(folders),
+                    channels=channels_to_plot or None,
                     crop_range=(crop_min, crop_max),
                     smooth_window=smooth_window,
                     smooth_polyorder=smooth_polyorder,
@@ -5380,18 +5480,18 @@ if analysis_mode == "CV":
 selected_peak_height_source = "peak_current"
 selected_peak_height_source_label = "Corrected"
 selected_peak_height_metric_label = "Peak current (corrected)"
-selected_peak_height_ylabel = "Change in Peak Height (uA)"
+selected_peak_height_ylabel = "Peak Height (uA)"
 if analysis_mode == "SWV":
     peak_height_source_options = {
         "Corrected": (
             "peak_current",
             "Peak current (corrected)",
-            "Change in Peak Height (uA)",
+            "Peak Height (uA)",
         ),
         "Corrected + smoothed": (
             "peak_current_smoothed_corrected",
             "Peak current (corrected + smoothed)",
-            "Change in Peak Height (uA)",
+            "Peak Height (uA)",
         ),
     }
     peak_source_label = st.radio(
@@ -6824,18 +6924,22 @@ if view == "Overlays":
                     st.warning("No plottable traces for this channel.")
     else:
         overlay_groups_by_channel = False
+        overlay_channels_by_group = False
         if use_swv_display_grouping:
             overlay_layout = st.radio(
                 "Group layout",
-                ["Separate group plots", "Overlay groups by channel"],
+                ["Separate group plots", "Overlay groups by channel", "Overlay channels by group"],
                 horizontal=True,
                 key="swv_overlay_group_layout",
                 help=(
                     "Overlay groups by channel creates one plot per original channel "
-                    "and assigns each group its sidebar colormap."
+                    "and assigns each group its sidebar colormap. Overlay channels by group "
+                    "compares selected channels in one plot per matching SWV settings "
+                    "or modulo group, with a distinct color for each channel."
                 ),
             )
             overlay_groups_by_channel = overlay_layout == "Overlay groups by channel"
+            overlay_channels_by_group = overlay_layout == "Overlay channels by group"
 
         ov_c1, ov_c2, ov_c3, ov_c4, ov_c5 = st.columns([2, 2, 1, 1, 1])
         trace_type_options = [
@@ -6851,12 +6955,12 @@ if view == "Overlays":
         trace_type   = ov_c1.radio("Trace type", trace_type_options,
                                     horizontal=True, key="overlay_type")
         cmap_name    = ov_c2.selectbox("Colour map",
-                                       ["plasma", "viridis", "inferno", "magma", "cividis", "turbo"],
+                                       ["plasma", "viridis", "inferno", "magma", "cividis", "turbo", "tab10", "tab20"],
                                        key="overlay_cmap",
                                        disabled=overlay_groups_by_channel,
                                        help=(
-                                           "Used for separate plots. Grouped overlays use "
-                                           "the colormap list in the left sidebar."
+                                           "Colors traces in separate plots and channels in channel overlays. "
+                                           "Group overlays use the colormap list in the left sidebar."
                                        ))
         show_anchors = ov_c3.checkbox("Show correction anchors", value=True,
                                       help="Dots mark the two bracketing-minima points used for baseline correction.")
@@ -6876,7 +6980,7 @@ if view == "Overlays":
         overlay_show_legend = bool(_resolve_swv_plot_setting(
             "swv_plot",
             "show_legend",
-            True,
+            False,
             inherit_metrics_style=True,
         ))
         overlay_show_grid = bool(_resolve_swv_plot_setting(
@@ -6921,14 +7025,33 @@ if view == "Overlays":
             else ("Offset raw current (uA)" if offset_to_baseline else "Current (uA)")
         )
 
-        if overlay_groups_by_channel:
-            grouped_channels = group_swv_display_channels(
-                plot_results,
-                plot_channels_display,
+        if overlay_groups_by_channel or overlay_channels_by_group:
+            grouped_channels = (
+                group_swv_channels_by_display_group(
+                    plot_results, plot_channels_display, use_swv_settings_grouping,
+                )
+                if overlay_channels_by_group
+                else group_swv_display_channels(plot_results, plot_channels_display)
             )
+            channel_order = list(group_swv_display_channels(plot_results, plot_channels_display))
+            channel_colors = None
+            if overlay_channels_by_group:
+                channel_cmap = plt.get_cmap(cmap_name)
+                channel_colors = {
+                    f"Channel {channel}": channel_cmap(
+                        position % channel_cmap.N
+                        if cmap_name in ("tab10", "tab20")
+                        else 0.1 + 0.75 * position / max(len(channel_order) - 1, 1)
+                    )
+                    for position, channel in enumerate(channel_order)
+                }
             for original_ch, display_groups in grouped_channels.items():
-                trace_modulo_key = f"swv_grouped_overlay_{original_ch}_trace_modulo"
-                trace_alpha_key = f"swv_grouped_overlay_{original_ch}_trace_alpha"
+                plot_id = (
+                    f"channels_by_group_{original_ch}"
+                    if overlay_channels_by_group else str(original_ch)
+                )
+                trace_modulo_key = f"swv_grouped_overlay_{plot_id}_trace_modulo"
+                trace_alpha_key = f"swv_grouped_overlay_{plot_id}_trace_alpha"
                 grouped_trace_sets = []
                 total_trace_count = 0
                 for group_position, display_group in enumerate(display_groups):
@@ -6936,7 +7059,11 @@ if view == "Overlays":
                     if not group_rows:
                         continue
                     first_row = group_rows[0]
-                    if use_swv_settings_grouping:
+                    if overlay_channels_by_group:
+                        channel = first_row["original_channel"]
+                        group_label = f"Channel {channel}"
+                        group_position = channel_order.index(channel)
+                    elif use_swv_settings_grouping:
                         group_label = str(first_row.get("swv_settings_label") or display_group)
                     else:
                         group_label = (
@@ -6952,25 +7079,30 @@ if view == "Overlays":
                     total_trace_count += len(group_rows)
                 if not grouped_trace_sets:
                     continue
-                with st.expander(
+                all_group_rows = [
+                    row for _, group_rows, _ in grouped_trace_sets for row in group_rows
+                ]
+                plot_title = (
                     (
-                        f"Channel {original_ch} ({len(grouped_trace_sets)} groups, "
-                        f"{total_trace_count} traces)"
-                    ),
+                        format_swv_settings_label(all_group_rows[0])
+                        if use_swv_settings_grouping else f"Group {original_ch}"
+                    )
+                    if overlay_channels_by_group
+                    else format_swv_overlay_title(original_ch, all_group_rows)
+                )
+                plot_heading = plot_title if overlay_channels_by_group else f"Channel {original_ch}"
+                member_label = "channels" if overlay_channels_by_group else "groups"
+                with st.expander(
+                    f"{plot_heading} ({len(grouped_trace_sets)} {member_label}, {total_trace_count} traces)",
                     expanded=len(grouped_channels) <= 4,
                 ):
                     fig = plot_grouped_overlaid_traces(
                         grouped_trace_sets,
                         trace_modulo=int(st.session_state.get(trace_modulo_key, 1)),
                         y_key=y_key,
-                        title=format_swv_overlay_title(
-                            original_ch,
-                            [
-                                row
-                                for _, group_rows, _ in grouped_trace_sets
-                                for row in group_rows
-                            ],
-                        ),
+                        title=plot_title,
+                        series_colors=channel_colors,
+                        legend_title="Channel" if overlay_channels_by_group else "SWV group",
                         ylabel=overlay_ylabel,
                         alpha=float(st.session_state.get(trace_alpha_key, overlay_line_alpha)),
                         show_anchors=show_anchors,
@@ -6999,11 +7131,13 @@ if view == "Overlays":
                             st,
                             fig,
                             key=(
-                                f"swv_grouped_overlay_{original_ch}_{y_key}_"
+                                f"swv_grouped_overlay_{plot_id}_{y_key}_"
                                 f"{normalize_to_peak}_{offset_to_baseline}"
                             ),
                             file_stem=(
-                                f"swv_grouped_overlay_ch{original_ch}_{trace_type}"
+                                f"swv_grouped_overlay_{plot_id}_{trace_type}"
+                                if overlay_channels_by_group
+                                else f"swv_grouped_overlay_ch{original_ch}_{trace_type}"
                             ),
                             plot_kind="swv_trace",
                             trace_modulo_key=trace_modulo_key,
@@ -7098,6 +7232,25 @@ if view == "Metrics":
         horizontal=True,
         key="metric_view_mode",
     )
+    offset_overlay_peak_height = True
+    if analysis_mode == "SWV" and (
+        view_mode == "Combined"
+        or (grouped_overlay_view is not None and view_mode == grouped_overlay_view)
+    ):
+        peak_height_display = st.radio(
+            "Peak height display",
+            ["Change in peak height", "Peak height"],
+            horizontal=True,
+            key="swv_metric_peak_height_display",
+            help=(
+                "Peak height shows the measured values without subtracting each channel's "
+                "baseline. Change in peak height subtracts the buffer baseline (or the "
+                "first finite value when no buffer baseline is available) in overlays. "
+                "Explicitly normalized and percent-change metrics keep their selected scale."
+            ),
+        )
+        offset_overlay_peak_height = peak_height_display == "Change in peak height"
+
     combined_plot_channels = list(plot_channels_display)
     if view_mode == "Combined":
         combined_channel_options_signature = tuple(
@@ -7261,21 +7414,53 @@ if view == "Metrics":
         else:
             highlight_titration_channels = [highlight_ch]
 
+    if analysis_mode == "SWV":
+        st.caption(
+            "Legend rates are average scans/min over each displayed trace's timestamped "
+            "points: (point count − 1) / elapsed minutes. Pauses and plot filters affect "
+            "this average; filename timestamps have minute precision."
+        )
+
     metric_x_key = "scan_number"
+    metric_show_time_axis = False
+    metric_annotate_measurements = False
+    metric_annotation_every = 1
+    metric_annotation_every_by_channel = {}
+    metric_annotation_offset_by_channel = {}
     metric_x_label = plot_x_axis_label
     if analysis_mode == "SWV":
         axis_options = ["Scan number", "Time from filename"]
+        if view_mode in ("Individual channels", individual_method_view):
+            axis_options.append("Measurement number + time")
+        elif st.session_state.get("swv_metric_x_axis") == "Measurement number + time":
+            st.session_state["swv_metric_x_axis"] = "Time from filename"
         if st.session_state.get("swv_metric_x_axis") not in axis_options:
             st.session_state["swv_metric_x_axis"] = "Scan number"
         metric_axis = metric_columns[2].selectbox(
             "X axis",
             axis_options,
             key="swv_metric_x_axis",
-            help="Time is read from the YYYYMMDD_HHMM portion of each native SWV filename.",
+            help=(
+                "Time is read from the YYYYMMDD_HHMM portion of each native SWV filename. "
+                "Elapsed minutes start at the earliest timestamp in each plot, shared across "
+                "channels to preserve their timing. Measurement numbers can "
+                "be labeled at each point. Dual axes are available for individual-channel plots."
+            ),
         )
+        metric_show_time_axis = metric_axis == "Measurement number + time"
+        if metric_show_time_axis:
+            metric_x_label = "SWV Measurement Number"
+            if not any(r.get("measurement_time") is not None for r in plot_results):
+                st.warning("No filename timestamps are available for the top time axis.")
         if metric_axis == "Time from filename":
             metric_x_key = "measurement_time"
-            metric_x_label = "Measurement time"
+            metric_x_label = "Elapsed time (min)"
+            metric_annotate_measurements = st.checkbox(
+                "Show measurement number annotations",
+                value=True,
+                key="swv_metric_annotate_measurements",
+                help="Label points with their channel's measurement number, using the trace color.",
+            )
             missing_time_count = sum(r.get("measurement_time") is None for r in plot_results)
             if missing_time_count == len(plot_results):
                 st.warning(
@@ -7341,6 +7526,35 @@ if view == "Metrics":
                 "Each plot represents one original channel. Its modulo groups are overlaid "
                 "against their shared group-local iteration axis."
             )
+
+    if metric_annotate_measurements:
+        annotation_channels = (
+            combined_plot_channels if view_mode == "Combined"
+            else method_view_channels if view_mode == individual_method_view
+            else plot_channels_display
+        )
+        with st.expander("Measurement annotation settings", expanded=True):
+            st.caption("Set every nth measurement separately for each channel. 1 labels every point.")
+            annotation_columns = st.columns(max(1, min(3, len(annotation_channels))))
+            for index, channel in enumerate(annotation_channels):
+                metric_annotation_every_by_channel[channel] = int(
+                    annotation_columns[index % len(annotation_columns)].number_input(
+                        f"{_swv_settings_channel_label(channel)} — annotate every nth measurement",
+                        min_value=1,
+                        value=int(st.session_state.get("swv_metric_annotation_every", 1)),
+                        step=1,
+                        key=f"swv_metric_annotation_every_channel_{channel}",
+                    )
+                )
+                metric_annotation_offset_by_channel[channel] = float(
+                    annotation_columns[index % len(annotation_columns)].number_input(
+                        f"{_swv_settings_channel_label(channel)} — label height (pt)",
+                        value=10.0,
+                        step=1.0,
+                        key=f"swv_metric_annotation_offset_channel_{channel}",
+                        help="Distance from the trace in points. Positive values place labels above; negative values place them below.",
+                    )
+                )
 
     # Langmuir plots always group displayed SWV methods by physical channel so
     # the Optimized and Manual fits can be compared directly on one axis.
@@ -7451,8 +7665,13 @@ if view == "Metrics":
             "peak_current_selected",
             "peak_current_raw",
         }
+        offset_metric_in_overlay = (
+            offset_overlay_peak_height
+            or metric not in {"peak_current_selected", "peak_current_raw"}
+        )
         offset_combined_metric_to_buffer = (
-            view_mode == "Combined"
+            offset_metric_in_overlay
+            and view_mode == "Combined"
             and len(combined_plot_channels) > 1
             and metric in buffer_offset_metric_labels
             and not normalize_per_channel
@@ -7507,6 +7726,13 @@ if view == "Metrics":
                     highlight_channel=highlight_ch,
                     xlabel=metric_x_label,
                     x_key=metric_x_key,
+                    show_time_axis=metric_show_time_axis,
+                    elapsed_time=analysis_mode == "SWV",
+                    annotate_measurement_numbers=metric_annotate_measurements,
+                    annotation_every=metric_annotation_every,
+                    annotation_every_by_channel=metric_annotation_every_by_channel,
+                    annotation_offset_by_channel=metric_annotation_offset_by_channel,
+                    show_measurement_rate=analysis_mode == "SWV",
                     normalize_per_channel=normalize_per_channel,
                     percent_change_per_channel=percent_change_per_channel,
                     response_directions=metric_response_directions,
@@ -7549,6 +7775,13 @@ if view == "Metrics":
                         else "SWV Measurement Number"
                     ),
                     x_key=metric_x_key,
+                    show_time_axis=metric_show_time_axis,
+                    elapsed_time=analysis_mode == "SWV",
+                    annotate_measurement_numbers=metric_annotate_measurements,
+                    annotation_every=metric_annotation_every,
+                    annotation_every_by_channel=metric_annotation_every_by_channel,
+                    annotation_offset_by_channel=metric_annotation_offset_by_channel,
+                    show_measurement_rate=analysis_mode == "SWV",
                     normalize_per_channel=normalize_per_channel,
                     percent_change_per_channel=percent_change_per_channel,
                     response_directions=metric_response_directions,
@@ -7581,6 +7814,13 @@ if view == "Metrics":
                     ),
                     scan_range=plot_display_scan_range, figsize=(5, 3),
                     xlabel=metric_x_label, x_key=metric_x_key,
+                    show_time_axis=metric_show_time_axis,
+                    elapsed_time=analysis_mode == "SWV",
+                    annotate_measurement_numbers=metric_annotate_measurements,
+                    annotation_every=metric_annotation_every,
+                    annotation_every_by_channel=metric_annotation_every_by_channel,
+                    annotation_offset_by_channel=metric_annotation_offset_by_channel,
+                    show_measurement_rate=analysis_mode == "SWV",
                     normalize_per_channel=normalize_per_channel,
                     percent_change_per_channel=percent_change_per_channel,
                     response_directions=metric_response_directions,
@@ -7607,7 +7847,8 @@ if view == "Metrics":
                     if row.get("channel") in display_groups
                 ]
                 offset_group_metric_to_buffer = (
-                    len(display_groups) > 1
+                    offset_metric_in_overlay
+                    and len(display_groups) > 1
                     and metric in buffer_offset_metric_labels
                     and not normalize_per_channel
                     and not percent_change_per_channel
@@ -7629,6 +7870,13 @@ if view == "Metrics":
                     figsize=(5, 3),
                     xlabel=metric_x_label,
                     x_key=metric_x_key,
+                    show_time_axis=metric_show_time_axis,
+                    elapsed_time=analysis_mode == "SWV",
+                    annotate_measurement_numbers=metric_annotate_measurements,
+                    annotation_every=metric_annotation_every,
+                    annotation_every_by_channel=metric_annotation_every_by_channel,
+                    annotation_offset_by_channel=metric_annotation_offset_by_channel,
+                    show_measurement_rate=analysis_mode == "SWV",
                     response_directions=metric_response_directions,
                     response_baselines=response_baselines_by_metric.get(metric),
                     offset_to_response_baseline=offset_group_metric_to_buffer,
@@ -7643,7 +7891,10 @@ if view == "Metrics":
                         render_downloadable_pyplot(
                             st,
                             fig,
-                            key=f"metric_group_overlay_ch{original_ch}_{metric}_{swv_grouping_mode}",
+                            key=(
+                                f"metric_group_overlay_ch{original_ch}_{metric}_{swv_grouping_mode}_"
+                                f"buffer_offset_{offset_group_metric_to_buffer}"
+                            ),
                             file_stem=f"metric_{label}_ch{original_ch}_group_overlay",
                         )
 
@@ -7651,7 +7902,8 @@ if view == "Metrics":
             st.caption("Titration plateaus")
             if view_mode == "Combined":
                 offset_combined_plateaus_to_buffer = (
-                    len(combined_titration_channels) > 1
+                    offset_metric_in_overlay
+                    and len(combined_titration_channels) > 1
                     and metric in buffer_offset_metric_labels
                 )
                 fig = (
@@ -7690,7 +7942,10 @@ if view == "Metrics":
                     render_downloadable_pyplot(
                         st,
                         fig,
-                        key=f"titration_plateau_combined_{metric}_{highlight_ch or 'all'}",
+                        key=(
+                            f"titration_plateau_combined_{metric}_{highlight_ch or 'all'}_"
+                            f"buffer_offset_{offset_combined_plateaus_to_buffer}"
+                        ),
                         file_stem=f"titration_plateau_{label}_combined",
                     )
             else:
@@ -8921,7 +9176,9 @@ if view == "Export":
 
             for title, (metric, ylabel) in display_metric_cfg.items():
                 offset_export_metric_to_buffer = (
-                    len(combined_plot_channels) > 1
+                    st.session_state.get("swv_metric_peak_height_display", "Change in peak height")
+                    == "Change in peak height"
+                    and len(combined_plot_channels) > 1
                     and metric in {"peak_current_selected", "peak_current_raw"}
                 )
                 export_response_directions = (
@@ -8974,7 +9231,13 @@ if view == "Export":
             if titration_ready:
                 for title, (metric, ylabel) in display_metric_cfg.items():
                     offset_export_plateaus_to_buffer = (
-                        len(combined_titration_channels) > 1
+                        (
+                            metric not in {"peak_current_selected", "peak_current_raw"}
+                            or st.session_state.get(
+                                "swv_metric_peak_height_display", "Change in peak height"
+                            ) == "Change in peak height"
+                        )
+                        and len(combined_titration_channels) > 1
                         and metric in {
                             "peak_current_selected",
                             "peak_current_raw",
