@@ -1,0 +1,12 @@
+BO session bo_113013_8dd581 (group 5): exceptions []
+  after loading 'BO optimization (main)': layout=Manual, count=5
+  BO optimization (main): errors=[] exceptions=[]
+  wrote C:\TEMP\BO\analysis_plan\examples\bo_optimization_main.png
+BO session bo_145633_9f5760 (group 10): exceptions []
+  after loading 'BO compact (SI 2x2)': layout=Grid, count=4
+  BO compact (SI 2x2): errors=[] exceptions=[]
+  wrote C:\TEMP\BO\analysis_plan\examples\bo_compact_si.png
+BO session bo_111904_a0d8ad (group all): exceptions []
+  after loading 'Landscape (3D + traces + 2D slices)': layout=Manual, count=10
+  Landscape (3D + traces + 2D slices): errors=[] exceptions=[]
+  wrote C:\TEMP\BO\analysis_plan\examples\landscape.png

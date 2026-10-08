@@ -57,11 +57,19 @@ from core.processing import (
 )
 from bo_session_viewer import (
     _bo_swv_settings_key,
+    _render_add_to_composer_button,
     bo_swv_optimization_direction_map,
     render_bo_session_app,
 )
+from bo_headless import _apply_result_constraints
 from core.mat_conversion import convert_mat_folders_to_swv_csv
 from core.io import collect_measurement_csvs_from_folders, parse_measurement_time_from_filename
+from core.workspace_sessions import (
+    RECOVERY_STEM,
+    list_workspaces,
+    load_workspace,
+    save_workspace,
+)
 
 
 def _pick_folder_windows() -> str:
@@ -106,6 +114,99 @@ def _clear_loaded_analysis_state() -> None:
     st.session_state.swv_annotated_results = None
     st.session_state.analysis_cache_key = None
     st.session_state.analysis_cache_results = None
+
+
+def _render_workspace_manager() -> None:
+    """Save/reopen a compact analysis recipe, with an optional derived-data cache."""
+    with st.sidebar.expander("Saved analysis sessions", expanded=False):
+        session_dir = Path.cwd() / "analysis_sessions"
+        saved = list_workspaces(session_dir)
+        labels = {path.name.removesuffix(".analysis-session.json"): path for path in saved}
+        recovery = session_dir / f"{RECOVERY_STEM}.analysis-session.json"
+        if recovery.is_file():
+            labels = {"Autosaved recovery": recovery, **labels}
+        selected = st.selectbox(
+            "Saved session",
+            ["", *labels],
+            format_func=lambda value: value or "Choose a saved session",
+            key="workspace_session_choice",
+        )
+        open_col, save_col = st.columns(2)
+        if open_col.button("Open", disabled=not selected, use_container_width=True):
+            try:
+                payload, cached_results = load_workspace(labels[selected])
+                cache_note = ""
+                saved_signature = payload.get("source_signature")
+                if cached_results is not None and saved_signature is not None:
+                    saved_folders = payload["state"].get("folders", [])
+                    if not isinstance(saved_folders, (list, tuple)):
+                        saved_folders = []
+                    current_signature = _analysis_input_signature(
+                        tuple(map(str, saved_folders))
+                    )
+                    if json.dumps(saved_signature, sort_keys=True) != json.dumps(
+                        current_signature, sort_keys=True
+                    ):
+                        cached_results = None
+                        cache_note = "; cached results skipped because source files changed"
+                preserved = {
+                    "workspace_session_choice": selected,
+                    "workspace_session_flash": f"Opened {selected}{cache_note}",
+                }
+                for key, value in payload["state"].items():
+                    st.session_state[key] = value
+                st.session_state.update(preserved)
+                if cached_results is not None:
+                    st.session_state.results = cached_results
+                    st.session_state.last_results = cached_results
+                    st.session_state.analysis_cache_results = cached_results
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not open session: {exc}")
+        session_name = st.text_input(
+            "Save as",
+            key="workspace_session_name",
+            placeholder="Uses date and time when blank",
+        )
+        cache_results = st.checkbox(
+            "Include derived analysis cache for fast reopen",
+            value=False,
+            key="workspace_cache_results",
+            help="May be much larger. Raw source files are never copied.",
+        )
+        if save_col.button("Save", use_container_width=True):
+            try:
+                recipe, cache = save_workspace(
+                    session_dir,
+                    session_name,
+                    st.session_state,
+                    results=st.session_state.get("results"),
+                    cache_results=cache_results,
+                    source_signature=(
+                        _analysis_input_signature(
+                            tuple(map(str, st.session_state.get("folders", [])))
+                        )
+                        if cache_results else None
+                    ),
+                )
+                detail = f"; cache {cache.stat().st_size / 1_048_576:.1f} MB" if cache else ""
+                st.success(f"Saved {recipe.name}{detail}")
+            except Exception as exc:
+                st.error(f"Could not save session: {exc}")
+        flash = st.session_state.pop("workspace_session_flash", None)
+        if flash:
+            st.success(flash)
+        st.caption(
+            "Recipes store paths, analysis choices, figure settings, and annotations. "
+            "Cached results are optional; source data remain in their original folders."
+        )
+    # Browser close events cannot reliably run Python.  Persist the compact
+    # recipe on every ordinary Streamlit rerun instead; named saves remain the
+    # durable checkpoints and may optionally include computed results.
+    try:
+        save_workspace(session_dir, RECOVERY_STEM, st.session_state, cache_results=False)
+    except OSError:
+        pass
 
 
 ANALYSIS_CACHE_SCHEMA_VERSION = 2
@@ -1582,7 +1683,256 @@ def render_downloadable_pyplot(
             key=f"{key}_download",
             use_container_width=True,
         )
+    # Forward the exact rendered plot (with its current plot settings) to the
+    # Figure Composer, which lives under Analysis mode -> BO Session.
+    _render_add_to_composer_button(
+        container,
+        buffer.getvalue(),
+        key=key,
+        file_stem=file_stem,
+        figure=fig,
+        label=default_title,
+    )
     plt.close(fig)
+
+
+_PAPER_LEGEND_STORE: Dict[str, Any] = {}
+_PAPER_LEGEND_EXCLUDE: Optional["re.Pattern[str]"] = None
+_PAPER_METHOD_LABEL = re.compile(
+    r"SWV Method (\d+) · (\d+(?:\.\d+)?) Hz; amplitude ([\d.]+) V; step ([\d.]+) V"
+)
+
+
+def _paper_short_label(label: str) -> str:
+    """'SWV Method 1 · 500 Hz; amplitude 0.04 V; step 0.002 V' -> 'M1: 500 Hz, 40 mV, 2 mV'."""
+    def shorten(match):
+        return (
+            f"M{match[1]}: {match[2]} Hz, {float(match[3]) * 1000:g} mV amp., "
+            f"{float(match[4]) * 1000:g} mV step"
+        )
+    return _PAPER_METHOD_LABEL.sub(shorten, label)
+
+
+def _paper_proxy_handle(handle: Any) -> Any:
+    """A figure-independent copy of a legend handle (sources are closed later)."""
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    if isinstance(handle, Line2D):
+        return Line2D(
+            [0], [0], color=handle.get_color(), linestyle=handle.get_linestyle(),
+            linewidth=handle.get_linewidth(), marker=handle.get_marker(),
+            markersize=min(float(handle.get_markersize()), 5.0),
+            markerfacecolor=handle.get_markerfacecolor(),
+        )
+    if isinstance(handle, Patch):
+        return Patch(
+            facecolor=handle.get_facecolor(), edgecolor=handle.get_edgecolor(),
+            alpha=handle.get_alpha(),
+        )
+    return None
+
+
+def _paper_collect_legend(source: plt.Figure) -> None:
+    """Move a source's legend entries into the shared figure legend."""
+    entries = _PAPER_LEGEND_STORE.setdefault("entries", {})
+    for source_axis in source.axes:
+        legend = source_axis.get_legend()
+        if legend is None:
+            continue
+        handles = list(getattr(legend, "legend_handles", getattr(legend, "legendHandles", [])))
+        for handle, text_item in zip(handles, legend.get_texts()):
+            label = text_item.get_text().strip()
+            if not label or label.startswith("_"):
+                continue
+            if _PAPER_LEGEND_EXCLUDE is not None and _PAPER_LEGEND_EXCLUDE.search(label):
+                continue
+            proxy = _paper_proxy_handle(handle)
+            if proxy is not None:
+                entries.setdefault(_paper_short_label(label), proxy)
+        legend.remove()
+
+
+def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cell_h: float) -> None:
+    """Size one source figure to its grid cell so every panel prints the same point sizes."""
+    _paper_collect_legend(source)
+    source.set_size_inches(cell_w, cell_h)
+    for source_axis in source.axes:
+        source_axis.title.set_fontsize(font_size * 1.05)
+        source_axis.xaxis.label.set_fontsize(font_size)
+        source_axis.yaxis.label.set_fontsize(font_size)
+        source_axis.tick_params(labelsize=max(4.5, font_size * .85))
+        for annotation in list(source_axis.texts):
+            if abs(float(annotation.get_rotation()) - 90.0) < 1e-6:
+                # Dose labels on the titration boundaries: keep the doses, drop
+                # the repeated "buffer" labels, and shrink so they fit.
+                if annotation.get_text().strip().lower().startswith("buffer"):
+                    annotation.set_visible(False)
+                else:
+                    annotation.set_fontsize(max(3.5, font_size * .55))
+            else:
+                annotation.set_fontsize(max(4.0, font_size * .8))
+    try:
+        source.tight_layout()
+    except Exception:
+        pass
+
+
+def _paper_figure_image(source: plt.Figure, dpi: int = 220) -> np.ndarray:
+    buffer = io.BytesIO()
+    source.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
+    buffer.seek(0)
+    return plt.imread(buffer)
+
+
+def _paper_stack_vertically(
+    figures: List[Optional[plt.Figure]],
+    font_size: float,
+    cell_w: float,
+    cell_h: float,
+) -> Optional[plt.Figure]:
+    """Two or more figures sharing one grid cell, stacked top to bottom."""
+    usable = [figure for figure in figures if figure is not None]
+    if not usable:
+        return None
+    images = []
+    for figure in usable:
+        _paper_style_source(figure, font_size, cell_w, cell_h / len(usable))
+        images.append(_paper_figure_image(figure))
+        plt.close(figure)
+    width = max(image.shape[1] for image in images)
+    padded = []
+    for image in images:
+        pad = width - image.shape[1]
+        padded.append(np.pad(
+            image, ((0, 0), (pad // 2, pad - pad // 2), (0, 0)), constant_values=1.0,
+        ))
+    stacked = np.vstack(padded)
+    output = plt.figure(figsize=(stacked.shape[1] / 220.0, stacked.shape[0] / 220.0))
+    axis = output.add_axes([0, 0, 1, 1])
+    axis.imshow(stacked)
+    axis.set_axis_off()
+    output._paper_prestyled = True
+    return output
+
+
+def _paper_stacked_traces(
+    rows: List[dict],
+    *,
+    y_key: str,
+    title: str,
+    colormap_name: str,
+    stride: int = 1,
+    offset_fraction: float = 0.35,
+) -> Optional[plt.Figure]:
+    """Chronological SWVs offset vertically (oldest at the bottom), with a scale bar."""
+    usable = sorted(
+        (row for row in rows if row.get(y_key) is not None and row.get("voltage") is not None),
+        key=lambda row: float(row.get("scan_number", 0)),
+    )[::max(1, int(stride))]
+    if not usable:
+        return None
+    traces = [
+        (np.asarray(row["voltage"], dtype=float), np.asarray(row[y_key], dtype=float))
+        for row in usable
+    ]
+    spans = [float(np.nanmax(y) - np.nanmin(y)) for _, y in traces if np.isfinite(y).any()]
+    if not spans:
+        return None
+    reference_span = float(np.nanpercentile(spans, 75))
+    step = reference_span * float(offset_fraction)
+    colormap = plt.get_cmap(colormap_name)
+    figure, axis = plt.subplots(figsize=(4, 3))
+    count = len(traces)
+    for index, (voltage, current) in enumerate(traces):
+        axis.plot(
+            voltage, current + index * step,
+            color=colormap(0.35 + 0.6 * index / max(1, count - 1)), lw=0.8,
+        )
+    axis.set_xlabel("Voltage (V)")
+    axis.set_ylabel("Current (offset)")
+    axis.set_title(title)
+    axis.set_yticks([])
+    for side in ("top", "right", "left"):
+        axis.spines[side].set_visible(False)
+    # Scale bar inside the axes, bottom right, label to its left (above the ticks).
+    x_low, x_high = axis.get_xlim()
+    bar_x = x_high - 0.04 * (x_high - x_low)
+    y_low = axis.get_ylim()[0]
+    bar_y = y_low + 0.02 * reference_span
+    axis.plot([bar_x, bar_x], [bar_y, bar_y + reference_span], color="black", lw=1.0)
+    axis.text(
+        bar_x - 0.015 * (x_high - x_low), bar_y + reference_span / 2,
+        f"{reference_span:.2g} uA", rotation=90, ha="right", va="center", fontsize=5,
+    )
+    first, last = int(usable[0].get("scan_number", 0)), int(usable[-1].get("scan_number", 0))
+    axis.set_xlabel(f"Voltage (V)  |  scans {first}-{last}")
+    return figure
+
+
+def _paper_composite_figure(
+    figures: List[Optional[plt.Figure]],
+    rows: int,
+    columns: int,
+    *,
+    width: float = 10.0,
+    row_height: float = 2.8,
+    font_size: float = 8.0,
+    restyle: bool = True,
+) -> plt.Figure:
+    """Arrange existing analysis figures into a consistently labelled paper grid.
+
+    Every source is resized to its grid cell before rasterizing, so the same
+    font size prints at the same point size in every panel.
+    """
+    total_height = max(row_height, rows * row_height) + 0.45  # room for the shared legend
+    output = plt.figure(figsize=(width, total_height), facecolor="white")
+    grid = output.add_gridspec(
+        rows, columns, wspace=.16, hspace=.18,
+        top=1 - 0.45 / total_height, bottom=0.04, left=0.04, right=0.99,
+    )
+    cell_w, cell_h = width / columns * 0.92, row_height * 0.92
+    for index in range(rows * columns):
+        axis = output.add_subplot(grid[index // columns, index % columns])
+        axis.set_axis_off()
+        source = figures[index] if index < len(figures) else None
+        if source is None:
+            axis.text(.5, .5, "No data", ha="center", va="center", fontsize=font_size)
+        else:
+            if restyle and not getattr(source, "_paper_prestyled", False):
+                _paper_style_source(source, font_size, cell_w, cell_h)
+            axis.imshow(_paper_figure_image(source))
+            plt.close(source)
+        axis.text(
+            -.02, 1.02, chr(ord("A") + index), transform=axis.transAxes,
+            ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
+        )
+    entries = _PAPER_LEGEND_STORE.get("entries") or {}
+    if entries:
+        # One legend for the whole figure (every panel uses the same colours).
+        output.legend(
+            list(entries.values()), list(entries), loc="upper center",
+            ncol=min(3, len(entries)), frameon=False, fontsize=max(4.5, font_size * .85),
+            bbox_to_anchor=(0.5, 1.0), handlelength=1.8, columnspacing=1.4,
+        )
+    return output
+
+
+def _paper_figure_downloads(figure: plt.Figure, stem: str) -> None:
+    png = io.BytesIO()
+    pdf = io.BytesIO()
+    figure.savefig(png, format="png", dpi=600, bbox_inches="tight", facecolor="white")
+    figure.savefig(pdf, format="pdf", bbox_inches="tight", facecolor="white")
+    st.pyplot(figure, use_container_width=True)
+    left, right = st.columns(2)
+    left.download_button(
+        "Download PNG", png.getvalue(), file_name=f"{stem}.png", mime="image/png",
+        key=f"{stem}_png", use_container_width=True,
+    )
+    right.download_button(
+        "Download PDF", pdf.getvalue(), file_name=f"{stem}.pdf", mime="application/pdf",
+        key=f"{stem}_pdf", use_container_width=True,
+    )
+    plt.close(figure)
 
 # 
 # Page config
@@ -1630,6 +1980,7 @@ def run_batch_dispatch(
     min_peak_prominence_uA,
     input_signature,
     _progress_callback=None,
+    bo_acceptance=None,
 ):
     # The signature is included in the caller's explicit session cache key.
     del input_signature
@@ -1645,7 +1996,7 @@ def run_batch_dispatch(
             scan_range=scan_range,
         )
 
-    return run_batch(
+    batch_results = run_batch(
         folders=list(folders),
         crop_range=crop_range,
         smooth_window=smooth_window,
@@ -1665,6 +2016,9 @@ def run_batch_dispatch(
         parallel_workers=_parallel_workers,
         progress_callback=_progress_callback,
     )
+    if bo_acceptance:
+        _apply_result_constraints(batch_results, dict(bo_acceptance))
+    return batch_results
 
 
 def collect_titration_rows(
@@ -1838,6 +2192,8 @@ def build_export_metadata(
     remove_extreme_titration_outliers: Optional[bool] = None,
     show_titration_uloq: Optional[bool] = None,
     show_titration_lod: Optional[bool] = None,
+    bo_acceptance: Optional[Dict[str, Any]] = None,
+    bo_config_snapshot_path: Optional[str] = None,
 ) -> dict:
     metadata = {
         "analysis_crop_min_V": float(crop_range[0]),
@@ -1901,6 +2257,11 @@ def build_export_metadata(
             analysis_peak_height_source_label=peak_height_source_label or "",
             analysis_compute_wavelet_denoised_trace=bool(compute_wavelet_denoised_trace),
             analysis_use_wavelet_for_correction=bool(use_wavelet_for_correction),
+            analysis_bo_acceptance_windows_applied=bool(bo_acceptance),
+            analysis_bo_acceptance_json=json.dumps(
+                bo_acceptance or {}, sort_keys=True, separators=(",", ":")
+            ),
+            analysis_bo_config_snapshot_path=bo_config_snapshot_path or "",
         )
     else:
         metadata.update(
@@ -3704,11 +4065,103 @@ if not st.session_state.get("_swv_clean_langmuir_plot_defaults_v1", False):
 # 
 # Sidebar
 # 
+def _find_bo_config_snapshot(path_text: str) -> Optional[Path]:
+    """Resolve a bo_config_snapshot.json from a file, session folder or experiment folder."""
+    text = str(path_text or "").strip().strip('"')
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if path.is_file():
+        return path
+    if (path / "bo_config_snapshot.json").is_file():
+        return path / "bo_config_snapshot.json"
+    sessions = path / "bo_sessions" if (path / "bo_sessions").is_dir() else path
+    candidates = [
+        folder / "bo_config_snapshot.json"
+        for folder in sessions.glob("*")
+        if (folder / "bo_config_snapshot.json").is_file()
+    ]
+    if not candidates:
+        return None
+    # An experiment holds short warm-up sessions plus the real one: use the
+    # session with the largest saved state.
+    def state_size(snapshot: Path) -> int:
+        state = snapshot.with_name("bo_state.json")
+        return state.stat().st_size if state.is_file() else 0
+
+    return max(candidates, key=state_size)
+
+
+def _load_bo_analysis_into_sidebar() -> None:
+    """Copy a BO session's analysis block into the SWV sidebar widgets."""
+    snapshot = _find_bo_config_snapshot(st.session_state.get("swv_bo_config_path", ""))
+    if snapshot is None:
+        st.session_state["swv_bo_config_flash"] = (
+            "error", "No bo_config_snapshot.json found at that path."
+        )
+        return
+    try:
+        analysis = dict(json.loads(snapshot.read_text(encoding="utf-8")).get("analysis") or {})
+    except (OSError, ValueError) as exc:
+        st.session_state["swv_bo_config_flash"] = ("error", f"Could not read {snapshot}: {exc}")
+        return
+    state = st.session_state
+
+    def put(key: str, value: Any) -> None:
+        if value is not None:
+            state[key] = value
+
+    put("swv_crop_min", analysis.get("crop_min_v"))
+    put("swv_crop_max", analysis.get("crop_max_v"))
+    put("swv_min_start_voltage", analysis.get("min_start_voltage_v"))
+    window = analysis.get("smooth_window")
+    if window is not None:
+        window = int(window)
+        put("swv_smooth_window", window if window % 2 else window + 1)
+    put("swv_smooth_polyorder", analysis.get("smooth_polyorder"))
+    put("swv_minima_window", analysis.get("minima_search_window_v"))
+    put("swv_double_correction", bool(analysis.get("use_double_correction", False)))
+    min_peak = analysis.get("min_peak_height_ua")
+    state["swv_use_peak_cutoff"] = min_peak not in (None, "", "none")
+    if state["swv_use_peak_cutoff"]:
+        state["swv_min_peak_height"] = float(min_peak)
+    require_minima = bool(analysis.get("require_local_minima_on_both_sides", False))
+    state["swv_use_prominent_minima"] = bool(
+        analysis.get("use_prominent_minima", False) or require_minima
+    )
+    state["swv_compute_skew"] = bool(analysis.get("compute_skew", False))
+    state["swv_compute_wavelet_energy"] = bool(analysis.get("compute_wavelet_energy", False))
+    windows = {
+        "swv_bo_peak_min": "peak_voltage_min_v",
+        "swv_bo_peak_max": "peak_voltage_max_v",
+        "swv_bo_left_min": "left_min_voltage_min_v",
+        "swv_bo_left_max": "left_min_voltage_max_v",
+        "swv_bo_right_min": "right_min_voltage_min_v",
+        "swv_bo_right_max": "right_min_voltage_max_v",
+    }
+    have_windows = False
+    for widget_key, config_key in windows.items():
+        value = analysis.get(config_key)
+        if value not in (None, "", "none"):
+            state[widget_key] = float(value)
+            have_windows = True
+    state["swv_bo_apply_windows"] = have_windows
+    state["swv_bo_require_minima"] = require_minima
+    state["swv_bo_config_loaded_path"] = str(snapshot.resolve())
+    state["swv_bo_config_flash"] = (
+        "success",
+        f"Loaded analysis settings from {snapshot}. Click Run Analysis to apply them.",
+    )
+
+
+_render_workspace_manager()
+
 with st.sidebar:
     analysis_mode = st.radio(
         "Analysis mode",
         ["SWV", "CV", "BO Session"],
         horizontal=True,
+        key="analysis_mode",
         help="Analyze SWV/CV data or inspect a saved Bayesian-optimization session.",
     )
 
@@ -3899,6 +4352,7 @@ with st.sidebar:
 
     minima_search_window = 0.30
     use_prominent_minima = False
+    bo_acceptance: Optional[Dict[str, Any]] = None
     use_double_correction = False
     use_wavelet_for_correction = False
     apply_background_recentering = False
@@ -3909,12 +4363,16 @@ with st.sidebar:
         #  Peak / baseline 
         st.subheader(" Peak / Baseline")
         minima_search_window = st.number_input(
-            "Minima search window (V)", value=0.30, step=0.01, format="%.3f",
+            "Minima search window (V)",
+            value=float(st.session_state.get("swv_minima_window", 0.30)),
+            step=0.01, format="%.3f",
+            key="swv_minima_window",
             help="Voltage window either side of peak when searching for bracketing minima.",
         )
         use_double_correction = st.checkbox(
             "Double baseline correction",
-            value=True,
+            value=bool(st.session_state.get("swv_double_correction", True)),
+            key="swv_double_correction",
             help=(
                 "Optional refinement: after the first baseline rotation, run one more "
                 "bracketing-minima correction on the once-corrected trace so the anchors "
@@ -3926,9 +4384,87 @@ with st.sidebar:
                 "Adds a second correction pass to refine anchors after the first rotation. "
                 "Single-trace inspectors will show an extra second-pass panel."
             )
-        use_peak_cutoff = st.checkbox("Enforce min peak height", value=True)
+        use_peak_cutoff = st.checkbox(
+            "Enforce min peak height",
+            value=bool(st.session_state.get("swv_use_peak_cutoff", True)),
+            key="swv_use_peak_cutoff",
+        )
         if use_peak_cutoff:
-            min_peak_height = st.number_input("Min peak height (uA)", value=0.001, step=0.001, format="%.3f")
+            min_peak_height = st.number_input(
+                "Min peak height (uA)",
+                value=float(st.session_state.get("swv_min_peak_height", 0.001)),
+                step=0.001, format="%.3f",
+                key="swv_min_peak_height",
+            )
+
+        with st.expander("BO analysis match", expanded=False):
+            st.caption(
+                "Reproduce a Bayesian-optimization session's analysis exactly: "
+                "load its saved settings, then optionally reject scans whose "
+                "peak or bracketing minima fall outside the BO acceptance windows."
+            )
+            st.text_input(
+                "BO config path (bo_config_snapshot.json, session or experiment folder)",
+                key="swv_bo_config_path",
+            )
+            st.button(
+                "Load analysis settings from BO config",
+                key="swv_bo_config_load",
+                on_click=_load_bo_analysis_into_sidebar,
+                use_container_width=True,
+            )
+            flash = st.session_state.get("swv_bo_config_flash")
+            if flash:
+                getattr(st, "success" if flash[0] == "success" else "error")(flash[1])
+            apply_bo_windows = st.checkbox(
+                "Apply BO acceptance windows",
+                value=bool(st.session_state.get("swv_bo_apply_windows", False)),
+                key="swv_bo_apply_windows",
+                help=(
+                    "Marks a scan FAILED when its peak voltage or bracketing-minimum "
+                    "voltages fall outside the windows below, as the BO analysis does."
+                ),
+            )
+            bo_window_defaults = {
+                "swv_bo_peak_min": -0.45, "swv_bo_peak_max": -0.10,
+                "swv_bo_left_min": -0.54, "swv_bo_left_max": -0.10,
+                "swv_bo_right_min": -0.45, "swv_bo_right_max": -0.01,
+            }
+            bo_window_inputs = {}
+            window_cols = st.columns(2)
+            for position, (widget_key, label) in enumerate((
+                ("swv_bo_peak_min", "Peak min (V)"),
+                ("swv_bo_peak_max", "Peak max (V)"),
+                ("swv_bo_left_min", "Left minimum min (V)"),
+                ("swv_bo_left_max", "Left minimum max (V)"),
+                ("swv_bo_right_min", "Right minimum min (V)"),
+                ("swv_bo_right_max", "Right minimum max (V)"),
+            )):
+                bo_window_inputs[widget_key] = window_cols[position % 2].number_input(
+                    label,
+                    value=float(st.session_state.get(
+                        widget_key, bo_window_defaults[widget_key]
+                    )),
+                    step=0.01, format="%.3f",
+                    key=widget_key,
+                    disabled=not apply_bo_windows,
+                )
+            bo_require_minima = st.checkbox(
+                "Require prominent local minima on both sides",
+                value=bool(st.session_state.get("swv_bo_require_minima", False)),
+                key="swv_bo_require_minima",
+                disabled=not apply_bo_windows,
+            )
+            if apply_bo_windows:
+                bo_acceptance = {
+                    "peak_voltage_min_v": bo_window_inputs["swv_bo_peak_min"],
+                    "peak_voltage_max_v": bo_window_inputs["swv_bo_peak_max"],
+                    "left_min_voltage_min_v": bo_window_inputs["swv_bo_left_min"],
+                    "left_min_voltage_max_v": bo_window_inputs["swv_bo_left_max"],
+                    "right_min_voltage_min_v": bo_window_inputs["swv_bo_right_min"],
+                    "right_min_voltage_max_v": bo_window_inputs["swv_bo_right_max"],
+                    "require_local_minima_on_both_sides": bool(bo_require_minima),
+                }
     else:
         st.subheader(" CV Peak Detection")
         edge_trim_fraction = st.slider(
@@ -3972,12 +4508,21 @@ with st.sidebar:
                 "memory-conscious default; reduce this if the system becomes unresponsive."
             ),
         ))
-        compute_skew = st.checkbox("Compute skew metric", value=True)
-        compute_wavelet_energy = st.checkbox("Compute wavelet energy", value=True)
+        compute_skew = st.checkbox(
+            "Compute skew metric",
+            value=bool(st.session_state.get("swv_compute_skew", True)),
+            key="swv_compute_skew",
+        )
+        compute_wavelet_energy = st.checkbox(
+            "Compute wavelet energy",
+            value=bool(st.session_state.get("swv_compute_wavelet_energy", True)),
+            key="swv_compute_wavelet_energy",
+        )
         with st.expander("Experimental", expanded=False):
             use_prominent_minima = st.checkbox(
                 "Use prominent local minima for bracketing",
-                value=False,
+                value=bool(st.session_state.get("swv_use_prominent_minima", False)),
+                key="swv_use_prominent_minima",
                 help="Experimental comparison mode: uses peaks of the inverted smoothed signal and takes the most prominent local minimum on each side of the detected peak.",
             )
             compute_wavelet_denoised_trace = st.checkbox(
@@ -4518,6 +5063,7 @@ if run_clicked and folders and not folder_errors:
                 float(edge_trim_fraction),
                 min_peak_prominence,
                 input_signature,
+                tuple(sorted(bo_acceptance.items())) if bo_acceptance else None,
             )
             if (
                 st.session_state.get("analysis_cache_key") == requested_cache_key
@@ -4572,6 +5118,7 @@ if run_clicked and folders and not folder_errors:
                         _progress_callback=(
                             _cached_swv_progress if analysis_mode == "SWV" else None
                         ),
+                        bo_acceptance=bo_acceptance if analysis_mode == "SWV" else None,
                     )
                 st.session_state.analysis_cache_key = requested_cache_key
                 st.session_state.analysis_cache_results = results
@@ -4632,6 +5179,8 @@ if run_clicked and folders and not folder_errors:
                     parallel_workers=swv_parallel_workers,
                     progress_callback=_progress,
                 )
+                if bo_acceptance:
+                    _apply_result_constraints(results, dict(bo_acceptance))
             progress_bar.progress(100)
             progress_text.caption("Analysis complete.")
 
@@ -5848,7 +6397,7 @@ if analysis_mode == "SWV":
 # 
 # Tabs
 # 
-view_options = ["Overlays", "Metrics", "Drift", "Data Table", "Export"]
+view_options = ["Overlays", "Metrics", "Paper Figures", "Drift", "Data Table", "Export"]
 view_options.insert(3, "Failures")
 view = st.radio(
     "View",
@@ -5856,6 +6405,326 @@ view = st.radio(
     horizontal=True,
     key="analysis_view",
 )
+
+
+if view == "Paper Figures":
+    st.subheader("Paper Figure Studio - titration")
+    st.caption(
+        "Types 3 and 4 share every row's physical channel, optimized/manual method, "
+        "measurement interval, and fit selection. Change it once here; both figures update."
+    )
+    if analysis_mode != "SWV" or not titration_ready or not fit_titration_langmuir:
+        st.warning(
+            "Run SWV analysis, enable titration intervals, and enable Langmuir fitting first."
+        )
+    else:
+        control_cols = st.columns(4)
+        paper_rows = int(control_cols[0].number_input(
+            "Comparison rows", 1, 6, value=1, key="paper_titration_rows"
+        ))
+        paper_font = float(control_cols[1].number_input(
+            "Font size (pt)", 5.0, 14.0, value=8.0, step=.5,
+            key="paper_titration_font",
+        ))
+        paper_width = float(control_cols[2].number_input(
+            "Canvas width (in)", 6.0, 16.0, value=10.0, step=.5,
+            key="paper_titration_width",
+        ))
+        paper_trace_stride = int(control_cols[3].number_input(
+            "SWV trace stride", 1, 50, value=5, key="paper_titration_stride",
+            help="1 plots every trace; larger values thin dense overlays without changing fits.",
+        ))
+        display_cols = st.columns(4)
+        paper_swv_display = display_cols[0].radio(
+            "SWV traces", ["Stacked (offset)", "Overlaid"], horizontal=True,
+            key="paper_titration_swv_display",
+        )
+        paper_offset_fraction = float(display_cols[1].slider(
+            "Stack offset (x peak height)", 0.05, 1.5, 0.35, 0.05,
+            key="paper_titration_offset",
+            disabled=paper_swv_display != "Stacked (offset)",
+        ))
+        paper_response_display = display_cols[2].radio(
+            "Optimized vs manual curves", ["Overlaid", "Stacked"], horizontal=True,
+            key="paper_titration_response_display",
+        )
+        paper_extra_columns = display_cols[3].multiselect(
+            "Extra Type 3 columns", ["SNR by concentration", "Predicted vs known"],
+            key="paper_titration_extra_columns",
+            help="Appended after the Langmuir column for every comparison row.",
+        )
+        physical_channels = sorted({
+            row.get("original_channel", row.get("channel")) for row in titration_results
+        }, key=_channel_display_sort_key)
+        comparisons = []
+        for row_index in range(paper_rows):
+            with st.expander(f"Comparison row {row_index + 1}", expanded=True):
+                row_cols = st.columns([1, 2, 2, 1, 1])
+                physical = row_cols[0].selectbox(
+                    "Physical channel", physical_channels,
+                    key=f"paper_titration_physical_{row_index}",
+                )
+                method_options = sorted({
+                    row.get("channel") for row in titration_results
+                    if str(row.get("original_channel", row.get("channel"))) == str(physical)
+                }, key=_channel_display_sort_key)
+                if len(method_options) < 2:
+                    st.warning("This channel needs at least two detected SWV settings.")
+                    continue
+                method_metadata = {}
+                for option in method_options:
+                    first = next(row for row in titration_results if row.get("channel") == option)
+                    direction = str(first.get("swv_optimization_direction") or "manual/unresolved")
+                    method_metadata[option] = f"{_swv_settings_channel_label(option)} | {direction}"
+                optimized_default = next((
+                    index for index, option in enumerate(method_options)
+                    if str(next(
+                        row for row in titration_results if row.get("channel") == option
+                    ).get("swv_optimization_direction") or "").lower() in {"maximize", "minimize"}
+                ), 0)
+                optimized = row_cols[1].selectbox(
+                    "Optimized method", method_options,
+                    index=optimized_default,
+                    key=f"paper_titration_optimized_{row_index}",
+                    format_func=lambda option: method_metadata[option],
+                )
+                manual_candidates = [option for option in method_options if option != optimized]
+                manual_default = next((
+                    index for index, option in enumerate(manual_candidates)
+                    if (
+                        str(next(
+                            row for row in titration_results if row.get("channel") == option
+                        ).get("swv_optimization_direction") or "").lower() not in {"maximize", "minimize"}
+                        and ("200 Hz" in method_metadata[option] or "manual" in method_metadata[option].lower())
+                    )
+                ), 0)
+                manual = row_cols[2].selectbox(
+                    "Manual/reference method", manual_candidates,
+                    index=manual_default,
+                    key=f"paper_titration_manual_{row_index}",
+                    format_func=lambda option: method_metadata[option],
+                )
+                method_rows = [
+                    row for row in titration_results if row.get("channel") in {optimized, manual}
+                ]
+                scans = [float(row.get("scan_number")) for row in method_rows if row.get("scan_number") is not None]
+                scan_min, scan_max = (int(min(scans)), int(max(scans))) if scans else (1, 1)
+                start = int(row_cols[3].number_input(
+                    "Display start", scan_min, scan_max, value=scan_min,
+                    key=f"paper_titration_start_{row_index}",
+                ))
+                end = int(row_cols[4].number_input(
+                    "Display end", scan_min, scan_max, value=scan_max,
+                    key=f"paper_titration_end_{row_index}",
+                ))
+                if end < start:
+                    start, end = end, start
+                comparisons.append((physical, optimized, manual, (start, end)))
+
+        figure_type = st.radio(
+            "Figure type",
+            ["Type 3 - SWV and titration response", "Type 4 - Concentration validation"],
+            horizontal=True,
+            key="paper_titration_type",
+        )
+        if comparisons and st.button("Generate paper figure", type="primary", use_container_width=True):
+            panels: List[Optional[plt.Figure]] = []
+            if figure_type.startswith("Type 3"):
+                for physical, optimized, manual, display_range in comparisons:
+                    row_map = {
+                        method: [
+                            row for row in titration_results
+                            if row.get("channel") == method
+                            and display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1]
+                        ]
+                        for method in (manual, optimized)
+                    }
+                    for method_key, method_label, colormap in (
+                        (manual, "manual/reference", "Oranges"),
+                        (optimized, "optimized", "Blues"),
+                    ):
+                        if paper_swv_display == "Stacked (offset)":
+                            panels.append(_paper_stacked_traces(
+                                row_map[method_key], y_key="smoothed_corrected_current",
+                                title=f"Ch {physical} {method_label} SWVs",
+                                colormap_name=colormap, stride=paper_trace_stride,
+                                offset_fraction=paper_offset_fraction,
+                            ))
+                        else:
+                            panels.append(plot_overlaid_traces(
+                                row_map[method_key], y_key="smoothed_corrected_current",
+                                title=f"Ch {physical} {method_label} SWVs",
+                                colormap_name=colormap, trace_modulo=paper_trace_stride,
+                            ))
+
+                    def response_panel(method_channels, label):
+                        return plot_metric_vs_scan(
+                            titration_results,
+                            metric="peak_current_selected",
+                            channels=method_channels,
+                            title=label,
+                            ylabel="Change in Peak Height (uA)",
+                            vlines=titration_active_vlines,
+                            scan_range=display_range,
+                            xlabel="SWV Measurement Number",
+                            channel_colors=consistent_channel_colors,
+                        )
+
+                    if paper_response_display == "Stacked":
+                        stacked_response = _paper_stack_vertically(
+                            [
+                                response_panel([optimized], f"Ch {physical} optimized response"),
+                                response_panel([manual], f"Ch {physical} manual response"),
+                            ],
+                            paper_font, paper_width / (4 + len(paper_extra_columns)) * 0.92, 2.6 * 0.92,
+                        )
+                        panels.append(stacked_response)
+                    else:
+                        panels.append(response_panel(
+                            [optimized, manual], f"Ch {physical} titration response",
+                        ))
+                    panels.append(plot_titration_langmuir(
+                        titration_results,
+                        metric="peak_current_selected",
+                        vlines=titration_active_vlines,
+                        channels=[optimized, manual],
+                        vlines_by_channel=titration_vlines_by_channel,
+                        title=f"Ch {physical} Langmuir response",
+                        ylabel="Peak Height (uA)",
+                        edge_trim_fraction=titration_edge_trim_fraction,
+                        concentration_unit=titration_concentration_unit,
+                        baseline_mode=titration_baseline_mode,
+                        included_step_labels=titration_included_step_labels,
+                        remove_extreme_outliers=remove_extreme_titration_outliers,
+                        show_lod=show_titration_lod,
+                        show_uloq=show_titration_uloq,
+                        response_directions=consistent_response_directions,
+                        channel_colors=consistent_channel_colors,
+                    ))
+                    # The fit always uses the full titration (all selected doses);
+                    # the display range above only crops the plotted portion.
+                    if paper_extra_columns:
+                        fit_kwargs = dict(
+                            vlines=titration_active_vlines,
+                            vlines_by_channel=titration_vlines_by_channel,
+                            channels=[optimized, manual],
+                            scan_range=None,
+                            edge_trim_fraction=titration_edge_trim_fraction,
+                            concentration_unit=titration_concentration_unit,
+                            baseline_mode=titration_baseline_mode,
+                            included_step_labels=titration_included_step_labels,
+                            remove_extreme_outliers=remove_extreme_titration_outliers,
+                        )
+                    for extra_column in paper_extra_columns:
+                        if extra_column == "SNR by concentration":
+                            step_rows = build_titration_step_table(
+                                titration_results, metric="peak_current_selected", **fit_kwargs,
+                            )
+                            fit_rows = build_titration_langmuir_summary_table(
+                                titration_results, metric="peak_current_selected", **fit_kwargs,
+                            )
+                            panels.append(plot_titration_snr(
+                                step_rows,
+                                title=f"Ch {physical} SNR by concentration",
+                                concentration_unit=titration_concentration_unit,
+                                fit_summary_rows=fit_rows,
+                                show_uloq=show_titration_uloq,
+                                show_lod=show_titration_lod,
+                                response_directions=consistent_response_directions,
+                                channel_colors=consistent_channel_colors,
+                            ))
+                        else:
+                            extra_accuracy = collect_titration_measurement_accuracy_rows(
+                                titration_results,
+                                metric_cfg={"Peak current": ("peak_current_selected", "Peak Height (uA)")},
+                                include_buffer_measurements=True,
+                                **fit_kwargs,
+                            )
+                            panels.append(plot_titration_concentration_accuracy(
+                                extra_accuracy,
+                                title=f"Ch {physical} predicted vs known",
+                                concentration_unit=titration_concentration_unit,
+                                show_lod=show_titration_lod,
+                                show_uloq=show_titration_uloq,
+                                channel_colors=consistent_channel_colors,
+                                response_directions=consistent_response_directions,
+                            ))
+                composite = _paper_composite_figure(
+                    panels, len(comparisons), 4 + len(paper_extra_columns),
+                    width=paper_width, row_height=2.6, font_size=paper_font,
+                )
+                st.session_state["paper_titration_render"] = (
+                    "type3", composite, paper_rows, paper_width, paper_font
+                )
+            else:
+                for physical, optimized, manual, display_range in comparisons:
+                    accuracy_rows = collect_titration_measurement_accuracy_rows(
+                        titration_results,
+                        metric_cfg={"Peak current": ("peak_current_selected", "Peak Height (uA)")},
+                        channels=[optimized, manual],
+                        vlines=titration_active_vlines,
+                        vlines_by_channel=titration_vlines_by_channel,
+                        # Fit on the whole titration; the display range below only crops.
+                        scan_range=None,
+                        edge_trim_fraction=titration_edge_trim_fraction,
+                        concentration_unit=titration_concentration_unit,
+                        baseline_mode=titration_baseline_mode,
+                        included_step_labels=titration_included_step_labels,
+                        remove_extreme_outliers=remove_extreme_titration_outliers,
+                        include_buffer_measurements=True,
+                    )
+                    accuracy_rows = [
+                        row for row in accuracy_rows
+                        if display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1]
+                    ]
+
+                    def concentration_panel(rows, label):
+                        return plot_titration_concentration_vs_measurement(
+                            rows,
+                            title=label,
+                            concentration_unit=titration_concentration_unit,
+                            channel_colors=consistent_channel_colors,
+                            response_directions=consistent_response_directions,
+                            vlines=titration_active_vlines,
+                        )
+
+                    if paper_response_display == "Stacked":
+                        panels.append(_paper_stack_vertically(
+                            [
+                                concentration_panel(
+                                    [row for row in accuracy_rows if row.get("channel") == optimized],
+                                    f"Ch {physical} optimized: concentration by measurement",
+                                ),
+                                concentration_panel(
+                                    [row for row in accuracy_rows if row.get("channel") == manual],
+                                    f"Ch {physical} manual: concentration by measurement",
+                                ),
+                            ],
+                            paper_font, paper_width / 2 * 0.92, 3.1 * 0.92,
+                        ))
+                    else:
+                        panels.append(concentration_panel(
+                            accuracy_rows, f"Ch {physical} concentration by measurement",
+                        ))
+                    panels.append(plot_titration_concentration_accuracy(
+                        accuracy_rows,
+                        title=f"Ch {physical} predicted vs known",
+                        concentration_unit=titration_concentration_unit,
+                        show_lod=show_titration_lod,
+                        show_uloq=show_titration_uloq,
+                        channel_colors=consistent_channel_colors,
+                        response_directions=consistent_response_directions,
+                    ))
+                composite = _paper_composite_figure(
+                    panels, len(comparisons), 2, width=paper_width,
+                    row_height=3.1, font_size=paper_font,
+                )
+                st.session_state["paper_titration_render"] = (
+                    "type4", composite, paper_rows, paper_width, paper_font
+                )
+        rendered = st.session_state.get("paper_titration_render")
+        if rendered:
+            _paper_figure_downloads(rendered[1], f"paper_{rendered[0]}_titration")
 
 
 
@@ -7820,6 +8689,11 @@ if view == "Export":
         ),
         show_titration_lod=(
             show_titration_lod if analysis_mode == "SWV" else None
+        ),
+        bo_acceptance=bo_acceptance if analysis_mode == "SWV" else None,
+        bo_config_snapshot_path=(
+            st.session_state.get("swv_bo_config_loaded_path")
+            if analysis_mode == "SWV" else None
         ),
     )
     export_payload = build_experiment_export_payload(

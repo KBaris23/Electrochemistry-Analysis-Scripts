@@ -6,6 +6,7 @@ import json
 import itertools
 import ast
 import base64
+import contextvars
 import copy
 import hashlib
 import html
@@ -2348,6 +2349,10 @@ def _metric_label(metric: str) -> str:
         "frequency_distance_from_ideal": "Distance from ideal frequency",
         "amplitude_distance_from_ideal": "Distance from ideal amplitude",
         "step_potential_distance_from_ideal": "Distance from ideal step size",
+        "frequency": "Frequency (Hz)",
+        "amplitude": "Amplitude (V)",
+        "step_potential": "Step size (V)",
+        "iteration": "Iteration",
         "mean_peak_current_uA": "Peak height (µA)",
         "median_peak_current_uA": "Peak height (µA)",
         "snr_unadjusted": "Peak prominence",
@@ -9369,6 +9374,7 @@ def _plot_real_data_landscape(
     slice_axis: str | None = None,
     slice_value: float | None = None,
     slice_sweep_values: Sequence[float] | None = None,
+    slice_colors: Sequence[Any] | None = None,
     tensor_interpolation_source: pd.DataFrame | None = None,
     show_measured_points: bool = False,
     value_colorscale: str = "Viridis",
@@ -9540,6 +9546,7 @@ def _plot_real_data_landscape(
             slice_axis=slice_axis,
             slice_value=slice_value,
             slice_sweep_values=slice_sweep_values,
+            slice_colors=slice_colors,
             axis_ranges=axis_ranges,
         )
         if draw_full_cube_edges:
@@ -9699,6 +9706,7 @@ def _plot_real_data_landscape(
             slice_axis=slice_axis,
             slice_value=slice_value,
             slice_sweep_values=slice_sweep_values,
+            slice_colors=slice_colors,
             axis_ranges=axis_ranges,
         )
         if draw_full_cube_edges:
@@ -20574,15 +20582,23 @@ def _chronological_swv_stack_steps(
     current_values = np.concatenate([row["current"] for row in loaded])
     voltage_range = float(np.nanmax(voltage_values) - np.nanmin(voltage_values))
     current_range = float(np.nanmax(current_values) - np.nanmin(current_values))
+    # With many traces a fixed per-trace offset spreads the stack over many
+    # plot widths and every curve shrinks to a speck. Cap the whole stack at
+    # about 2 voltage ranges wide and 3 current ranges tall (peaks stay tall
+    # relative to the offsets); stacks of up to ~30 traces keep the original
+    # offsets.
+    trace_count = max(1, len(loaded))
     x_step = (
         float(x_offset_per_iteration)
         if x_offset_per_iteration is not None
-        else voltage_range * 0.035 if voltage_range > 0 else 0.01
+        else min(voltage_range * 0.035, voltage_range * 2.0 / trace_count)
+        if voltage_range > 0 else 0.01
     )
     y_step = (
         float(y_offset_per_iteration)
         if y_offset_per_iteration is not None
-        else current_range * 0.10 if current_range > 0 else 0.08
+        else min(current_range * 0.10, current_range * 3.0 / trace_count)
+        if current_range > 0 else 0.08
     )
     return x_step, y_step
 
@@ -26933,13 +26949,16 @@ def _plotly_png_bytes(
     height: int | None = None,
     scale: float = 2,
     text_size: float | None = None,
+    mark_scale: float | None = None,
 ) -> bytes:
     export_fig = go.Figure(fig)
     _apply_global_plot_style(export_fig)
     if text_size is not None:
-        _composer_apply_plotly_text_size(export_fig, text_size)
+        _composer_apply_plotly_text_size(export_fig, text_size, width)
     _apply_plotly_3d_turntable_dragmode(export_fig)
     _prepare_plotly_static_export(export_fig)
+    if mark_scale is not None:
+        _composer_scale_plotly_marks(export_fig, mark_scale)
     try:
         return export_fig.to_image(
             format="png",
@@ -28070,7 +28089,10 @@ def _queue_plot_for_composer(
     registry = st.session_state.get(registry_key)
     if not isinstance(registry, dict):
         registry = {}
+    capture_counter = int(st.session_state.get("bo_composer_capture_counter", 0) or 0) + 1
+    st.session_state["bo_composer_capture_counter"] = capture_counter
     registry[capture_id] = {
+        "seq": capture_counter,
         "label": str(label or file_stem or "Captured plot"),
         "file_stem": str(file_stem or "captured_plot"),
         "png_bytes": captured_png,
@@ -30593,6 +30615,8 @@ def _render_app_scrollbar_style() -> None:
 
 
 _COMPOSER_STATE_EXCLUSIONS = (
+    "bo_composer_capture_counter",
+    "bo_composer_consumed_seq",
     "bo_composer_render_",
     "bo_composer_exports_",
     "bo_composer_preset_",
@@ -30741,6 +30765,54 @@ def _composer_apply_config(config: Mapping[str, Any]) -> None:
             and not any(key.startswith(prefix) for prefix in _COMPOSER_STATE_EXCLUSIONS)
         ):
             st.session_state[key] = copy.deepcopy(value)
+    # Presets with "Captured plot" panels carry no capture ids: assign the most
+    # recent captures to those panels in the order they were captured.
+    registry = st.session_state.get("bo_composer_captured_plots")
+    try:
+        saved_count = int(saved_state.get("bo_composer_count", 0))
+    except (TypeError, ValueError):
+        saved_count = 0
+    if isinstance(registry, Mapping) and registry and saved_count > 0:
+        open_panels = [
+            index for index in range(saved_count)
+            if saved_state.get(f"bo_composer_kind_{index}") == "Captured plot"
+            and not saved_state.get(f"bo_composer_capture_id_{index}")
+        ]
+        explicit_ids = {
+            str(saved_state.get(f"bo_composer_capture_id_{index}"))
+            for index in range(saved_count)
+            if saved_state.get(f"bo_composer_capture_id_{index}")
+        }
+        unused_ids = [cid for cid in registry if str(cid) not in explicit_ids]
+
+        def capture_seq(capture_id: Any) -> int:
+            entry = registry.get(capture_id)
+            try:
+                return int(entry.get("seq", 0) or 0) if isinstance(entry, Mapping) else 0
+            except (TypeError, ValueError):
+                return 0
+
+        consumed_seq = int(st.session_state.get("bo_composer_consumed_seq", 0) or 0)
+        fresh_ids = [cid for cid in unused_ids if capture_seq(cid) > consumed_seq]
+        if fresh_ids:
+            # Captures made since the last preset load, in capture order.
+            chosen_ids = fresh_ids[:len(open_panels)]
+        else:
+            # Re-loading a preset (or legacy captures): reuse the latest ones.
+            chosen_ids = unused_ids[-len(open_panels):] if open_panels else []
+        for index, capture_id in zip(open_panels, chosen_ids):
+            st.session_state[f"bo_composer_capture_id_{index}"] = str(capture_id)
+        if chosen_ids and fresh_ids:
+            st.session_state["bo_composer_consumed_seq"] = max(
+                capture_seq(cid) for cid in chosen_ids
+            )
+        # A template made only of captured plots shrinks to the plots you captured.
+        if (
+            chosen_ids
+            and len(open_panels) == saved_count
+            and len(chosen_ids) < saved_count
+        ):
+            st.session_state["bo_composer_count"] = len(chosen_ids)
 
 
 def _composer_apply_pending_captures() -> tuple[int, int]:
@@ -31092,6 +31164,321 @@ def _composer_hyperparameter_sweep_preset(
     }
 
 
+_PUBLICATION_STYLE = {
+    "bo_composer_font": "Arial",
+    # True print sizes on the ACS two-column canvas (7.0 in wide).
+    "bo_composer_font_size": 7,
+    "bo_composer_label_size": 9,
+    "bo_composer_dpi": 600,
+    "bo_composer_panel_border": False,
+    "bo_composer_journal_style": True,
+}
+_PUBLICATION_CANVAS = "ACS 2-col (7.0 x 5.25 in)"
+
+
+def _composer_builtin_preset(
+    name: str,
+    *,
+    layout: str,
+    kinds: Sequence[str],
+    rects: Sequence[tuple[float, float, float, float]] = (),
+    aspect: str = _PUBLICATION_CANVAS,
+    extra_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a journal preset: 7.0 in canvas, Arial 7 pt, 9 pt letters, 600 DPI."""
+    state: dict[str, Any] = {
+        **_PUBLICATION_STYLE,
+        "bo_composer_aspect": aspect,
+        "bo_composer_count": len(kinds),
+        "bo_composer_layout": layout,
+        "bo_composer_title": "",
+    }
+    for index, kind in enumerate(kinds):
+        state[f"bo_composer_kind_{index}"] = kind
+        state[f"bo_composer_label_{index}"] = chr(ord("A") + index)
+        if rects and index < len(rects):
+            for field, value in zip(("left", "bottom", "width", "height"), rects[index]):
+                state[f"bo_composer_{field}_{index}"] = value
+    state.update(extra_state or {})
+    return {
+        "schema": COMPOSER_METADATA_SCHEMA,
+        "created_utc": "built-in",
+        "name": name,
+        "source": {"data_path": "", "session_id": "", "group_id": None},
+        "config": {"state": state, "panels": []},
+    }
+
+
+def _composer_bo_optimization_preset() -> dict[str, Any]:
+    """BO result figure: Q_run, buffer/target, SWV stack, parallel coordinates, 3D tensor."""
+    rects = [
+        (.09, .77, .36, .17),    # A global trend (Q_run)
+        (.09, .52, .36, .15),    # B buffer/target peak height
+        (.05, .05, .44, .37),    # C chronological SWV stack
+        (.56, .58, .41, .37),    # D measured parallel coordinates
+        (.56, .07, .41, .44),    # E measured 3D tensor
+    ]
+    extra = {
+        "bo_composer_direction": "maximize",
+        "bo_composer_global_metric_0": "Q_run",
+        "bo_composer_paired_metric_1": "Peak height (µA)",
+        "bo_composer_measured_metric_3": "Paired Q",
+        "bo_composer_measured_metric_4": "Paired Q",
+        "bo_composer_measured_x_4": "amplitude",
+        "bo_composer_measured_y_4": "frequency",
+        "bo_composer_measured_z_4": "step_potential",
+        "bo_composer_measured_colorscale_4": "Viridis",
+        "bo_composer_measured_dot_size_4": 7,
+        # Lighter, thinner parallel-coordinate lines read better than the
+        # default opaque spaghetti.
+        "bo_composer_measured_parallel_opacity_3": 0.45,
+        "bo_composer_measured_parallel_line_3": 1.2,
+        # A few extreme SNR spikes otherwise dominate the axis / colour range.
+        "bo_composer_clip_extremes_1": True,
+        "bo_composer_clip_extremes_3": True,
+        "bo_composer_clip_extremes_4": True,
+    }
+    return _composer_builtin_preset(
+        "BO optimization (main)",
+        layout="Manual",
+        kinds=(
+            "Global trend",
+            "Buffer/target trend",
+            "Chronological SWV stack",
+            "Measured parallel coordinates",
+            "Measured 3D tensor",
+        ),
+        rects=rects,
+        extra_state=extra,
+    )
+
+
+def _composer_bo_compact_preset() -> dict[str, Any]:
+    """Compact 2x2 BO summary for supplementary datasets."""
+    return _composer_builtin_preset(
+        "BO compact (SI 2x2)",
+        layout="Grid",
+        kinds=(
+            "Global trend",
+            "Buffer/target trend",
+            "Measured parallel coordinates",
+            "Chronological SWV stack",
+        ),
+        extra_state={
+            "bo_composer_direction": "maximize",
+            "bo_composer_global_metric_0": "Q_run",
+            "bo_composer_paired_metric_1": "Peak height (µA)",
+            "bo_composer_measured_metric_2": "Paired Q",
+            "bo_composer_measured_parallel_opacity_2": 0.45,
+            "bo_composer_measured_parallel_line_2": 1.2,
+            "bo_composer_clip_extremes_1": True,
+            "bo_composer_clip_extremes_2": True,
+        },
+    )
+
+
+def _composer_titration_main_preset() -> dict[str, Any]:
+    """Seven captured titration plots: wide trace on top, two rows of three below.
+
+    Workflow: click "Add to Composer" on the plots in the order you want them
+    (first capture -> panel A ... seventh -> panel G), then load this preset; it
+    assigns the most recent captures to the panels in that order.
+    """
+    # Panel A keeps the method legend; the colours repeat in B-G, so their own
+    # (long, overflowing) legends are switched off.
+    rects = [
+        (.09, .69, .87, .28),                                    # A wide trace
+        (.09, .42, .28, .22), (.39, .42, .28, .22), (.69, .42, .28, .22),   # B-D
+        (.09, .14, .28, .22), (.39, .14, .28, .22), (.69, .14, .28, .22),   # E-G
+    ]
+    extra = {f"bo_composer_capture_legend_{index}": False for index in range(1, 7)}
+    return _composer_builtin_preset(
+        "Titration main (7 panels)",
+        layout="Manual",
+        kinds=("Captured plot",) * 7,
+        rects=rects,
+        aspect="ACS 2-col tall (7.0 x 8.5 in)",
+        extra_state=extra,
+    )
+
+
+def _composer_titration_si_preset() -> dict[str, Any]:
+    """3 x 3 grid of captured per-channel titration plots for the SI."""
+    return _composer_builtin_preset(
+        "Titration SI grid (9 panels)",
+        layout="Grid",
+        kinds=("Captured plot",) * 9,
+        aspect="ACS 2-col tall (7.0 x 8.5 in)",
+    )
+
+
+def _composer_landscape_preset(
+    observations: Sequence[dict] = (),
+    real_channels: Sequence[str] = (),
+    trace_channels: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Landscape figure: two 3D tensors, best/worst voltammograms, six 2D slices."""
+    preset = _composer_hyperparameter_sweep_preset(
+        observations, real_channels, trace_channels
+    )
+    preset["name"] = "Landscape (3D + traces + 2D slices)"
+    state = preset["config"]["state"]
+    state.update(_PUBLICATION_STYLE)
+    # Tall journal canvas: two 3D tensors on top, the two voltammograms in the
+    # middle, then the six 2D slice maps in a 2 x 3 grid (each large enough to
+    # carry its own axes and colour bar).
+    state["bo_composer_aspect"] = "ACS 2-col tall (7.0 x 8.5 in)"
+    rects = [
+        (.07, .67, .40, .30), (.55, .67, .40, .30),   # A, B: 3D tensors
+        (.09, .42, .38, .18), (.58, .42, .38, .18),   # C, D: voltammograms
+        (.10, .22, .24, .13), (.41, .22, .24, .13), (.72, .22, .24, .13),   # E-G
+        (.10, .03, .24, .13), (.41, .03, .24, .13), (.72, .03, .24, .13),   # H-J
+    ]
+    for index, rect in enumerate(rects):
+        for field, value in zip(("left", "bottom", "width", "height"), rect):
+            state[f"bo_composer_{field}_{index}"] = value
+    # One extreme SNR value otherwise sets the whole colour range of the maps.
+    for index in (0, 1, 4, 5, 6, 7, 8, 9):
+        state[f"bo_composer_clip_extremes_{index}"] = True
+    state["bo_composer_title"] = ""
+    return preset
+
+
+def _paper_parameter_sweep_preset(
+    observations: Sequence[dict] = (),
+    real_channels: Sequence[str] = (),
+    trace_channels: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Linked eight-panel sweep figure requested for the paper workflow."""
+    channels = list(map(str, real_channels))
+    trace_channels = list(map(str, trace_channels))
+    # The SWV panels need stored traces, so the channel is chosen among those.
+    channel = trace_channels[0] if trace_channels else (channels[0] if channels else "1")
+    iteration_values = sorted({
+        int(obs.get("iteration")) for obs in observations if obs.get("iteration") is not None
+    })
+    selected_iterations = (
+        [iteration_values[0], iteration_values[-1]] if len(iteration_values) > 1
+        else iteration_values * 2
+    )
+    step_values = sorted({
+        float((obs.get("params") or {}).get("step_potential"))
+        for obs in observations
+        if _finite_float((obs.get("params") or {}).get("step_potential")) is not None
+    })
+    if step_values:
+        indices = np.linspace(0, len(step_values) - 1, min(4, len(step_values))).round().astype(int)
+        slices = list(dict.fromkeys(step_values[index] for index in indices))
+    else:
+        slices = [0.001, 0.004, 0.007, 0.010]
+    # Colours that link every cube marker/plane to its panel's border.
+    slice_border_colors = [
+        to_hex(_slice_highlight_color(index, max(1, len(slices)))[0])
+        for index in range(len(slices))
+    ]
+    while len(slices) < 4:
+        slices.append(slices[-1])
+        slice_border_colors.append(slice_border_colors[-1])
+    # Four equal quarters of a square canvas: cube | two stacked SWVs on top,
+    # cube with slice planes | 2 x 2 slice maps below.
+    rects = [
+        (.04, .52, .46, .45), (.57, .75, .40, .21), (.57, .52, .40, .21),
+        (.04, .04, .46, .45),
+        (.56, .27, .20, .21), (.78, .27, .20, .21),
+        (.56, .04, .20, .21), (.78, .04, .20, .21),
+    ]
+    kinds = (
+        "Measured 3D tensor", "SWV trace overlay", "SWV trace overlay",
+        "Measured 3D tensor", *("Measured 2D map",) * 4,
+    )
+    extra: dict[str, Any] = {}
+    for index in (0, 3):
+        extra.update({
+            f"bo_composer_measured_metric_{index}": "Paired Q",
+            f"bo_composer_measured_phase_{index}": "target",
+            f"bo_composer_measured_channels_{index}": [channel],
+            f"bo_composer_measured_x_{index}": "step_potential",
+            f"bo_composer_measured_y_{index}": "amplitude",
+            f"bo_composer_measured_z_{index}": "frequency",
+            f"bo_composer_measured_dot_size_{index}": 9,
+            f"bo_composer_measured_dot_opacity_{index}": .72,
+            f"bo_composer_measured_iteration_path_{index}": False,
+            f"bo_composer_measured_cube_edges_{index}": True,
+        })
+    extra["bo_composer_real_highlight_iterations_0"] = selected_iterations
+    extra["bo_composer_real_slice_values_3"] = slices[:4]
+    # The composer exposes one shared control strip for this preset so changing
+    # a highlighted scan or a step plane keeps every linked panel in sync.
+    extra["bo_composer_type1_linked_controls"] = True
+    extra["bo_composer_type1_channel"] = channel
+    extra["bo_composer_type1_iterations"] = list(dict.fromkeys(selected_iterations))
+    extra["bo_composer_type1_slice_values"] = list(dict.fromkeys(slices[:4]))
+    highlight_colors = ["#d62728", "#17becf"]
+    for offset, iteration in enumerate(selected_iterations[:2], start=1):
+        extra[f"bo_composer_trace_iteration_{offset}"] = iteration
+        extra[f"bo_composer_trace_channels_{offset}"] = [channel]
+        extra[f"bo_composer_trace_corrected_{offset}"] = True
+        extra[f"bo_composer_trace_key_{offset}"] = "smoothed_corrected_current"
+        extra[f"bo_composer_border_on_{offset}"] = True
+        extra[f"bo_composer_border_color_{offset}"] = highlight_colors[offset - 1]
+    for map_index, slice_value in zip(range(4, 8), slices[:4]):
+        extra[f"bo_composer_border_on_{map_index}"] = True
+        extra[f"bo_composer_border_color_{map_index}"] = slice_border_colors[map_index - 4]
+        extra.update({
+            f"bo_composer_real_metric_{map_index}": "Paired Q",
+            f"bo_composer_real_phase_{map_index}": "target",
+            f"bo_composer_real_channels_{map_index}": [channel],
+            f"bo_composer_real_x_{map_index}": "amplitude",
+            f"bo_composer_real_y_{map_index}": "frequency",
+            f"bo_composer_real_slice_axis_{map_index}": "step_potential",
+            f"bo_composer_real_slice_value_{map_index}": slice_value,
+            f"bo_composer_real_show_points_{map_index}": True,
+        })
+    return _composer_builtin_preset(
+        "Type 1 - Parameter sweep",
+        layout="Manual",
+        kinds=kinds,
+        rects=rects,
+        aspect="ACS 2-col square (7.0 x 7.0 in)",
+        extra_state=extra,
+    )
+
+
+def _paper_bo_validation_preset() -> dict[str, Any]:
+    """Five-panel BO validation/progression figure with linked optimizer data."""
+    rects = [
+        (.04, .52, .46, .45), (.58, .76, .39, .20), (.58, .52, .39, .20),
+        (.04, .04, .46, .42), (.57, .04, .40, .42),
+    ]
+    return _composer_builtin_preset(
+        "Type 2 - BO validation",
+        layout="Manual",
+        kinds=(
+            "Measured 3D tensor", "Global trend", "Buffer/target trend",
+            "Chronological SWV stack", "Measured parallel coordinates",
+        ),
+        rects=rects,
+        aspect="ACS 2-col square (7.0 x 7.0 in)",
+        extra_state={
+            "bo_composer_direction": "maximize",
+            "bo_composer_measured_metric_0": "Paired Q",
+            "bo_composer_measured_x_0": "amplitude",
+            "bo_composer_measured_y_0": "step_potential",
+            "bo_composer_measured_z_0": "frequency",
+            "bo_composer_measured_iteration_path_0": True,
+            "bo_composer_measured_dot_size_0": 8,
+            "bo_composer_global_metric_1": "Q_run",
+            "bo_composer_global_running_mean_1": 5,
+            "bo_composer_paired_metric_2": "Peak prominence",
+            "bo_composer_measured_metric_4": "Paired Q",
+            # "Iteration" is always the plot's first axis.
+            "bo_composer_measured_parallel_params_4": [
+                "frequency", "amplitude", "step_potential"
+            ],
+        },
+    )
+
+
 def _composer_channel_options_by_kind(
     real_channels: Sequence[str],
     trace_channels: Sequence[str],
@@ -31345,12 +31732,29 @@ def _composer_metric_series(history: pd.DataFrame, column: str) -> tuple[pd.Seri
     return x[valid], y[valid]
 
 
-def _composer_draw_global(ax, history: pd.DataFrame, metric: str, font_size: int) -> None:
+def _composer_draw_global(
+    ax,
+    history: pd.DataFrame,
+    metric: str,
+    font_size: int,
+    running_mean_window: int = 0,
+) -> None:
     x, y = _composer_metric_series(history, metric)
     line_color = _plot_line_color_override() or "#155e63"
     ax.plot(x, y, marker="o", linewidth=1.5, color=line_color, label=metric)
+    if int(running_mean_window or 0) > 1 and len(y):
+        mean = y.rolling(int(running_mean_window), min_periods=1).mean()
+        ax.plot(
+            x,
+            mean,
+            linestyle="--",
+            linewidth=1.5,
+            color="#555555",
+            label=f"{int(running_mean_window)}-point running mean",
+        )
     if metric == "Q_run" and len(y):
         ax.plot(x, y.cummax(), linewidth=1.4, color="#d67b32", label="Best so far")
+    if len(ax.lines) > 1:
         ax.legend(fontsize=max(6, font_size - 2))
     ax.set(xlabel="BO iteration", ylabel=_metric_label(metric), title=_metric_label(metric))
     ax.grid(alpha=.25)
@@ -31771,7 +32175,72 @@ def _composer_panel_pixel_size(
     )
 
 
-def _composer_apply_plotly_text_size(fig: go.Figure, size: float) -> go.Figure:
+_PLOTLY_3D_TICK_SCALE = 0.65
+_PLOTLY_3D_REFERENCE_WIDTH_PX = 968.0
+# Measured on rendered panels: Plotly text exported at "N pt in pixels" prints
+# about 1.25x larger than Matplotlib text of N pt, so shrink it to match.
+_PLOTLY_TEXT_CALIBRATION = 0.8
+_PARCOORDS_SHORT_LABELS = {
+    "Frequency (Hz)": "Freq. (Hz)",
+    "Amplitude (V)": "Amp. (V)",
+    "Step size (V)": "Step (V)",
+}
+# Marker sizes and line widths in the source plots are designed for a plot
+# roughly this many pixels wide; panels are rendered much wider at print DPI.
+_PLOTLY_MARK_DESIGN_WIDTH_PX = 800.0
+
+
+def _composer_scale_plotly_marks(fig: go.Figure, factor: float) -> None:
+    """Scale marker sizes and line widths so dots/lines keep their proportions."""
+    factor = max(1.0, float(factor))
+    # Dots grow a bit slower than the canvas and lines slower still, so wide
+    # print panels do not end up with blobs and heavy strokes.
+    marker_factor = 1.0 + (factor - 1.0) * 0.75
+    line_factor = factor ** 0.6
+
+    def scaled(value: Any, amount: float) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return float(value) * amount
+        try:
+            return (np.asarray(value, dtype=float) * amount).tolist()
+        except (TypeError, ValueError):
+            return value
+
+    helper_roles = {
+        "cube_edges",
+        "highlighted_slice_outline",
+        "static_export_line_fill",
+    }
+    for trace in fig.data:
+        # Cube edges and slice outlines are already sized for static export.
+        if _plotly_trace_role(trace) in helper_roles:
+            continue
+        marker = getattr(trace, "marker", None)
+        if marker is not None:
+            size = getattr(marker, "size", None)
+            if size is not None:
+                # 3D markers are drawn smaller than 2D ones at the same size.
+                is_3d = str(getattr(trace, "type", "")).lower().endswith("3d")
+                marker.size = scaled(size, marker_factor * (1.8 if is_3d else 1.0))
+            marker_line = getattr(marker, "line", None)
+            marker_line_width = getattr(marker_line, "width", None) if marker_line is not None else None
+            if marker_line_width is not None:
+                marker.line.width = scaled(marker_line_width, line_factor)
+        if str(getattr(trace, "type", "")).lower() == "parcoords":
+            continue
+        line = getattr(trace, "line", None)
+        width = getattr(line, "width", None) if line is not None else None
+        if width is not None:
+            line.width = scaled(width, line_factor)
+
+
+def _composer_apply_plotly_text_size(
+    fig: go.Figure,
+    size: float,
+    canvas_width_px: float | None = None,
+) -> go.Figure:
     """Apply one panel-local text size after global export styling."""
     text_size = max(4.0, float(size))
     tick_size = max(4.0, text_size * .88)
@@ -31786,8 +32255,30 @@ def _composer_apply_plotly_text_size(fig: go.Figure, size: float) -> go.Figure:
             updates[str(key)] = axis_update
         elif re.fullmatch(r"scene\d*", str(key)):
             scene_payload = value if isinstance(value, Mapping) else {}
+            # Plotly's 3D renderer does not scale scene tick labels with the
+            # canvas the way it scales axis titles. Measured on rendered
+            # panels: ticks match the titles at 0.6x the usual tick size on a
+            # 968 px canvas (220 DPI panel) and at about 0.36x on a 2640 px
+            # canvas (600 DPI), i.e. a 0.6 * sqrt(968 / width) factor.
+            width_ratio = (
+                _PLOTLY_3D_REFERENCE_WIDTH_PX / float(canvas_width_px)
+                if canvas_width_px else 1.0
+            )
+            scene_axis_update = {
+                # Measured: 3D axis titles print ~1.3x larger than the same
+                # nominal size on 2D axes.
+                "title": {"font": {"size": max(1.0, text_size * 0.77)}},
+                "tickfont": {
+                    "size": max(
+                        1.0,
+                        tick_size
+                        * _PLOTLY_3D_TICK_SCALE
+                        * min(1.0, width_ratio) ** 0.5,
+                    ),
+                },
+            }
             updates[str(key)] = {
-                axis: axis_update
+                axis: scene_axis_update
                 for axis in ("xaxis", "yaxis", "zaxis")
                 if axis in scene_payload
             }
@@ -31798,8 +32289,72 @@ def _composer_apply_plotly_text_size(fig: go.Figure, size: float) -> go.Figure:
             "font": {"size": text_size * .9},
             "title": {"font": {"size": text_size}},
         },
+        # Leave room for the (larger) title so it is not clipped at the top.
+        margin=(
+            {"t": int(text_size * 3.4)}
+            if getattr(fig.layout.title, "text", None)
+            and not _COMPOSER_JOURNAL_STYLE.get()
+            else {}
+        ),
         **updates,
     )
+    if _COMPOSER_JOURNAL_STYLE.get():
+        # Journal panels carry no in-plot title (the caption describes them),
+        # keep a small margin all round, and pull 3D scenes back a little so
+        # tick and axis labels are not clipped by the panel edge.
+        has_scene = any(
+            re.fullmatch(r"scene\d*", str(key)) for key in fig.layout.to_plotly_json()
+        )
+        side = int(text_size * (2.6 if has_scene else 1.6))
+        # 2D axes need room for rotated tick labels and axis titles.
+        label_room = int(text_size * (2.6 if has_scene else 3.4))
+        fig.update_layout(
+            title_text="",
+            margin={
+                "t": int(text_size * 1.2), "l": label_room, "r": side,
+                "b": label_room,
+            },
+        )
+        legend_traces = [
+            trace for trace in fig.data
+            if getattr(trace, "showlegend", None) is not False
+            and getattr(trace, "name", None)
+        ]
+        if len(legend_traces) <= 1 or has_scene:
+            # A one-entry legend ("Channel average") only repeats the title; in
+            # 3D panels the highlighted points are identified by the colours of
+            # the linked panels, not by a boxed legend.
+            fig.update_layout(showlegend=False)
+        for trace in fig.data:
+            if str(getattr(trace, "type", "")).lower() == "parcoords":
+                # Four axes in a narrow panel: shorten the axis titles so they
+                # do not collide, and size them like the other panels' labels.
+                for dimension in trace.dimensions or ():
+                    dimension.label = _PARCOORDS_SHORT_LABELS.get(
+                        dimension.label, dimension.label,
+                    )
+                trace.labelfont = {"size": text_size * 0.95}
+                trace.tickfont = {"size": text_size * 0.85}
+                trace.rangefont = {"size": text_size * 0.85}
+        for key in fig.layout.to_plotly_json():
+            if re.fullmatch(r"scene\d*", str(key)):
+                scene = getattr(fig.layout, str(key))
+                for axis_name in ("xaxis", "yaxis", "zaxis"):
+                    axis_title = getattr(getattr(scene, axis_name).title, "text", None)
+                    if axis_title in {"frequency", "amplitude", "step_potential"}:
+                        getattr(scene, axis_name).title.text = _metric_label(axis_title)
+                eye = getattr(getattr(scene, "camera", None), "eye", None)
+                base = (
+                    (eye.x, eye.y, eye.z)
+                    if eye is not None and eye.x is not None
+                    else (1.5, 1.5, 1.1)
+                )
+                # Pull back far enough that the cube's left-hand axis title
+                # (frequency, z) is not clipped by the panel edge.
+                scene.camera = {
+                    "eye": {"x": base[0] * 1.28, "y": base[1] * 1.28, "z": base[2] * 1.28}
+                }
+                scene.domain = {"x": [0.10, 0.94], "y": [0.02, 0.98]}
     for annotation in fig.layout.annotations or ():
         annotation.font = {
             **(annotation.font.to_plotly_json() if annotation.font else {}),
@@ -31820,10 +32375,48 @@ def _composer_apply_plotly_text_size(fig: go.Figure, size: float) -> go.Figure:
 
 
 def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
-    """Scale all text in one embedded Matplotlib panel independently."""
-    scale = max(4.0, float(size)) / 10.0
-    for text_artist in fig.findobj(match=Text):
-        text_artist.set_fontsize(max(1.0, text_artist.get_fontsize() * scale))
+    """Give one embedded Matplotlib panel absolute, role-based point sizes.
+
+    The same "Plot text" value therefore yields the same printed sizes on
+    every panel (titles 1.1x, labels 1.0x, ticks 0.9x, legends and
+    annotations 0.85x), regardless of how the source plot was styled.
+    """
+    size = max(4.0, float(size))
+    title_size, label_size = size * 1.1, size
+    tick_size, note_size = size * 0.9, size * 0.85
+    for axis in fig.axes:
+        axis.title.set_fontsize(title_size)
+        axis.xaxis.label.set_fontsize(label_size)
+        axis.yaxis.label.set_fontsize(label_size)
+        if hasattr(axis, "zaxis"):
+            axis.zaxis.label.set_fontsize(label_size)
+        axis.tick_params(labelsize=tick_size)
+        legend = axis.get_legend()
+        if legend is not None:
+            for legend_text in legend.get_texts():
+                legend_text.set_fontsize(note_size)
+            legend.get_title().set_fontsize(note_size)
+        for annotation in axis.texts:
+            if getattr(annotation, "_swv_preserve_fontsize", False):
+                annotation.set_fontsize(max(1.0, annotation.get_fontsize() * size / 10.0))
+            else:
+                annotation.set_fontsize(note_size)
+    for figure_text in fig.texts:
+        figure_text.set_fontsize(note_size)
+    suptitle = getattr(fig, "_suptitle", None)
+    if suptitle is not None:
+        suptitle.set_fontsize(title_size)
+    if _COMPOSER_JOURNAL_STYLE.get():
+        for axis in fig.axes:
+            if not _is_matplotlib_colorbar_axis(axis):
+                _composer_journal_axes(axis)
+            else:
+                # A rotated colour-bar title longer than the bar gets cut off.
+                label = axis.get_ylabel()
+                if len(label) > 14:
+                    axis.set_ylabel(
+                        label.replace("SWV Measurement Number", "Measurement no.")
+                    )
 
 
 def _composer_draw_embedded_figure(
@@ -31838,16 +32431,38 @@ def _composer_draw_embedded_figure(
 
     width_px, height_px = _composer_panel_pixel_size(target_fig, rect, render_dpi)
     try:
+        if _COMPOSER_CLIP_EXTREMES.get():
+            if isinstance(panel_figure, go.Figure):
+                panel_figure = _composer_clip_plotly_figure(panel_figure)
+            else:
+                for axis in panel_figure.axes:
+                    if not _is_matplotlib_colorbar_axis(axis):
+                        _composer_clip_axes_y(axis)
         if isinstance(panel_figure, go.Figure):
+            # Plotly sizes text in pixels of the panel image, which is rendered
+            # at the figure DPI: convert the point size so a "Plot text" of N
+            # prints at N pt, matching the Matplotlib panels.
             png = _plotly_png_bytes(
                 panel_figure,
                 width=width_px,
                 height=height_px,
                 scale=1.5,
-                text_size=text_size,
+                text_size=(
+                    None if text_size is None
+                    else float(text_size) * float(render_dpi) / 72.0
+                    * _PLOTLY_TEXT_CALIBRATION
+                ),
+                mark_scale=float(width_px) / _PLOTLY_MARK_DESIGN_WIDTH_PX,
             )
             buffer = BytesIO(png)
         else:
+            if _COMPOSER_JOURNAL_STYLE.get():
+                # Marks were sized for the source figure; keep their
+                # proportions when the panel is smaller than the source.
+                source_width = max(1.0, float(panel_figure.get_size_inches()[0]))
+                mark_scale = min(1.0, (width_px / float(render_dpi)) / source_width)
+                for axis in panel_figure.axes:
+                    _composer_scale_axes_marks(axis, mark_scale, mark_scale ** 1.5)
             if text_size is not None:
                 _composer_apply_matplotlib_text_size(panel_figure, text_size)
             panel_figure.set_size_inches(
@@ -31903,8 +32518,19 @@ def _composer_capture_format_defaults(
         "zlabel": "",
         "show_legend": True,
         "show_grid": True,
+        "xlim": None,
+        "ylim": None,
     }
     if isinstance(source, go.Figure):
+        for axis_name, layout_axis in (
+            ("xlim", source.layout.xaxis),
+            ("ylim", source.layout.yaxis),
+        ):
+            axis_range = getattr(layout_axis, "range", None)
+            if axis_range is not None and len(axis_range) == 2:
+                low, high = _finite_float(axis_range[0]), _finite_float(axis_range[1])
+                if low is not None and high is not None:
+                    defaults[axis_name] = (low, high)
         defaults.update({
             "title": _plain_plotly_text(
                 getattr(source.layout.title, "text", "")
@@ -31942,6 +32568,9 @@ def _composer_capture_format_defaults(
         )
         if primary_axis is not None:
             legend = primary_axis.get_legend()
+            if not hasattr(primary_axis, "get_zlim"):
+                defaults["xlim"] = tuple(float(v) for v in primary_axis.get_xlim())
+                defaults["ylim"] = tuple(float(v) for v in primary_axis.get_ylim())
             defaults.update({
                 "title": str(primary_axis.get_title() or defaults["title"]),
                 "xlabel": str(primary_axis.get_xlabel() or ""),
@@ -31965,6 +32594,16 @@ def _composer_capture_format_defaults(
     return defaults
 
 
+def _composer_valid_limits(value: Any) -> tuple[float, float] | None:
+    """Return (low, high) for a usable axis-limit pair, otherwise None."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    low, high = _finite_float(value[0]), _finite_float(value[1])
+    if low is None or high is None or low == high:
+        return None
+    return float(low), float(high)
+
+
 def _composer_formatted_capture_figure(
     capture: Mapping[str, Any],
     spec: Mapping[str, Any],
@@ -31978,11 +32617,17 @@ def _composer_formatted_capture_figure(
     xlabel = str(spec.get("capture_xlabel") or "")
     ylabel = str(spec.get("capture_ylabel") or "")
     zlabel = str(spec.get("capture_zlabel") or "")
+    xlim = _composer_valid_limits(spec.get("capture_xlim"))
+    ylim = _composer_valid_limits(spec.get("capture_ylim"))
     if isinstance(source, go.Figure):
         figure = go.Figure(source)
         figure.update_layout(showlegend=show_legend, title_text=title)
         figure.update_xaxes(title_text=xlabel, showgrid=show_grid)
         figure.update_yaxes(title_text=ylabel, showgrid=show_grid)
+        if xlim is not None:
+            figure.update_xaxes(range=list(xlim))
+        if ylim is not None:
+            figure.update_yaxes(range=list(ylim))
         scene_updates = {
             str(key): {
                 "xaxis": {"showgrid": show_grid, "title": {"text": xlabel}},
@@ -32016,6 +32661,10 @@ def _composer_formatted_capture_figure(
             if hasattr(primary_axis, "set_zlabel"):
                 primary_axis.set_zlabel(zlabel)
             primary_axis.grid(show_grid)
+            if xlim is not None:
+                primary_axis.set_xlim(*xlim)
+            if ylim is not None:
+                primary_axis.set_ylim(*ylim)
             legend = primary_axis.get_legend()
             if legend is not None:
                 legend.set_visible(show_legend)
@@ -32087,6 +32736,25 @@ def _composer_real_points(spec: dict, observations: list[dict]) -> pd.DataFrame:
     )
 
 
+def _composer_iteration_path_frame(points: pd.DataFrame) -> pd.DataFrame | None:
+    """One chronological path per optimizer group, from the plotted points.
+
+    Each iteration contributes a single vertex (the mean of its plotted rows),
+    so buffer/target duplicates or averaged channels do not zig-zag the line.
+    """
+    if points.empty or "iteration" not in points.columns:
+        return None
+    frame = points.copy()
+    frame["iteration"] = pd.to_numeric(frame["iteration"], errors="coerce")
+    frame = frame.dropna(subset=["iteration"])
+    parameters = [name for name in PARAMETERS if name in frame.columns]
+    if frame.empty or not parameters:
+        return None
+    if "group_id" not in frame.columns:
+        frame["group_id"] = 1
+    return frame.groupby(["group_id", "iteration"], as_index=False)[parameters].mean()
+
+
 def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.Figure:
     points = _composer_real_points(spec, observations)
     view = COMPOSER_MEASURED_LANDSCAPE_VIEWS[spec["kind"]]
@@ -32108,11 +32776,25 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
         dot_size=spec.get("dot_size", 6),
         dot_opacity=spec.get("dot_opacity", .65),
         log_frequency=spec.get("log_frequency", False),
+        iteration_path=(
+            _composer_iteration_path_frame(points)
+            if view == "3D tensor" and spec.get("show_iteration_path", True)
+            else None
+        ),
         show_iteration_path=spec.get("show_iteration_path", True),
         value_colorscale=spec.get("colorscale", "Viridis"),
         draw_full_cube_edges=spec.get("draw_cube_edges", False),
-        slice_axis=spec.get("slice_axis"),
+        # The sweep planes are constant-step planes unless told otherwise.
+        slice_axis=spec.get("slice_axis") or (
+            "step_potential"
+            if view == "3D tensor"
+            and spec.get("slice_sweep_values")
+            and "step_potential" in {spec.get("x"), spec.get("y"), spec.get("z")}
+            else None
+        ),
         slice_value=spec.get("slice_value"),
+        slice_sweep_values=spec.get("slice_sweep_values"),
+        slice_colors=spec.get("slice_colors"),
         tensor_interpolation_source=(
             points if view == "2D map" and spec.get("slice_axis") else None
         ),
@@ -32125,19 +32807,44 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
             trace.marker.size = spec.get("dot_size", 6)
             trace.marker.opacity = spec.get("dot_opacity", .45)
     if view == "3D tensor":
+        highlight_iterations = [
+            int(value) for value in spec.get("highlight_iterations", [])
+            if _finite_float(value) is not None
+        ]
+        highlight_colors = list(spec.get("highlight_colors", ["#d62728", "#17becf"]))
+        for highlight_index, iteration in enumerate(highlight_iterations):
+            selected = points.loc[
+                pd.to_numeric(points.get("iteration"), errors="coerce") == iteration
+            ]
+            if selected.empty:
+                continue
+            figure.add_trace(go.Scatter3d(
+                x=selected[spec["x"]],
+                y=selected[spec["y"]],
+                z=selected[spec["z"]],
+                mode="markers",
+                marker={
+                    "size": max(10, int(spec.get("dot_size", 6)) + 5),
+                    "color": highlight_colors[highlight_index % len(highlight_colors)],
+                    "line": {"color": "white", "width": 2},
+                },
+                name=f"Selected iteration {iteration}",
+                hovertemplate=f"Selected iteration {iteration}<extra></extra>",
+            ))
         _apply_plotly_camera(figure, _stored_plotly_camera(None))
     return figure
 
 
 def _composer_build_real_parallel(spec: dict, observations: list[dict]) -> go.Figure:
     points = _composer_real_points(spec, observations)
-    if not spec.get("parameters"):
+    parameters = [name for name in spec.get("parameters", []) if name != "iteration"]
+    if not parameters:
         return _composer_plotly_message("Choose at least one parameter axis.")
     return _plot_real_data_parallel_coordinates(
         points,
         metric_label=spec["metric"],
         phase=spec["phase"],
-        parameter_columns=spec["parameters"],
+        parameter_columns=parameters,
         line_width=spec.get("line_width", 2.0),
         line_opacity=spec.get("line_opacity", .76),
         log_frequency=spec.get("log_frequency", False),
@@ -32251,6 +32958,37 @@ def _composer_build_paired_plot(
     )
 
 
+def _composer_thin_trace_entries(
+    entries: Sequence[tuple[dict, dict]],
+    selected_channels: Sequence[str],
+    max_traces: int,
+) -> list[tuple[dict, dict]]:
+    """Keep at most ``max_traces`` selected traces, spread evenly per phase.
+
+    A chronological stack of hundreds of traces is unreadable; sampling each
+    phase evenly keeps buffer/target pairs together and preserves the trend.
+    """
+    chosen = [
+        pair for pair in entries
+        if _trace_channel_key(pair[1]) in set(map(str, selected_channels))
+    ]
+    if max_traces <= 0 or len(chosen) <= max_traces:
+        return list(entries)
+    by_phase: dict[str, list[tuple[dict, dict]]] = {}
+    for pair in chosen:
+        by_phase.setdefault(str(pair[1].get("phase", "")).lower(), []).append(pair)
+    per_phase = max(1, max_traces // max(1, len(by_phase)))
+    kept_ids: set[int] = set()
+    for pairs in by_phase.values():
+        if len(pairs) <= per_phase:
+            kept_ids.update(id(pair) for pair in pairs)
+            continue
+        positions = np.linspace(0, len(pairs) - 1, per_phase).round().astype(int)
+        kept_ids.update(id(pairs[position]) for position in positions)
+    others = [pair for pair in entries if id(pair) not in {id(c) for c in chosen}]
+    return others + [pair for pair in chosen if id(pair) in kept_ids]
+
+
 def _composer_build_chronological_swv(
     spec: dict,
     session: dict,
@@ -32262,6 +33000,11 @@ def _composer_build_chronological_swv(
         fig, ax = plt.subplots(figsize=(8, 4.8))
         _composer_error_panel(ax, "Choose at least one channel.")
         return fig
+    entries = _composer_thin_trace_entries(
+        entries,
+        spec["channels"],
+        int(spec.get("max_traces", 120) or 0),
+    )
     figure, errors = _plot_chronological_swv_stack(
         entries,
         spec["corrected"],
@@ -32269,7 +33012,7 @@ def _composer_build_chronological_swv(
         trace_analysis,
         session["config"],
         "corrected" if spec["corrected"] else "raw",
-        "Figure Composer",
+        "Channel " + ", ".join(str(channel) for channel in spec["channels"]),
         spec.get("normalize_to_peak", False),
         spec.get("corrected_trace_key", "smoothed_corrected_current"),
         spec.get("offset_to_baseline", False),
@@ -32278,6 +33021,18 @@ def _composer_build_chronological_swv(
     )
     if errors:
         figure.text(.02, .01, " | ".join(errors[:3]), fontsize=6)
+    if _COMPOSER_JOURNAL_STYLE.get() and figure.axes:
+        axis = figure.axes[0]
+        legend = axis.get_legend()
+        if legend is not None:
+            # Two compact columns above the stack, clear of the traces.
+            handles = list(getattr(legend, "legend_handles", getattr(legend, "legendHandles", [])))
+            labels = [text.get_text() for text in legend.get_texts()]
+            axis.legend(
+                handles, labels, loc="upper left", ncol=2, frameon=False,
+                fontsize=6, handlelength=1.6, columnspacing=1.0,
+                bbox_to_anchor=(0.0, 1.12),
+            )
     return figure
 
 
@@ -32319,6 +33074,162 @@ def _composer_build_hyperparameter_plot(
     )
 
 
+COMPOSER_CANVAS_SIZES = {
+    # Presentation canvases (large; text is scaled down when placed in a paper).
+    "4:3": (12, 9),
+    "16:9": (12.8, 7.2),
+    "1:1": (9, 9),
+    "Letter": (8.5, 11),
+    # Journal canvases at true print size: 8 pt text here prints at 8 pt.
+    "ACS 2-col (7.0 x 5.25 in)": (7.0, 5.25),
+    "ACS 2-col tall (7.0 x 8.5 in)": (7.0, 8.5),
+    "ACS 2-col square (7.0 x 7.0 in)": (7.0, 7.0),
+    "ACS 1-col (3.3 x 3.0 in)": (3.3, 3.0),
+}
+
+_COMPOSER_JOURNAL_STYLE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "composer_journal_style", default=False
+)
+
+
+def _composer_journal_axes(ax) -> None:
+    """Publication look for one Matplotlib axes: open frame, thin lines, no title."""
+    if not ax.axison:
+        return
+    ax.set_title("")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_linewidth(0.6)
+    ax.grid(False)
+    ax.tick_params(width=0.6, length=2.5, direction="out", pad=2)
+    legend = ax.get_legend()
+    if legend is not None:
+        texts = [text.get_text() for text in legend.get_texts()]
+        handles = list(getattr(legend, "legend_handles", getattr(legend, "legendHandles", [])))
+        size = legend.get_texts()[0].get_fontsize() if texts else 6
+        if texts and len(texts) <= 3 and len(handles) == len(texts):
+            # A short legend sits above the axes, clear of the data.
+            ax.legend(
+                handles, texts, loc="lower center", bbox_to_anchor=(0.5, 1.0),
+                ncol=len(texts), frameon=False, fontsize=size, handlelength=1.6,
+                columnspacing=1.2, borderaxespad=0.2,
+            )
+        else:
+            legend.set_frame_on(False)
+
+
+_COMPOSER_CLIP_EXTREMES: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "composer_clip_extremes", default=False
+)
+COMPOSER_CLIP_KINDS = {
+    "Global trend", "Channel trend", "Buffer/target trend",
+    "Chronological buffer/target trend", "Measured parallel coordinates",
+    "Measured 3D tensor", "Measured 2D map", "Measured 1D slice",
+    "Channel x iteration heatmap",
+}
+
+
+def _composer_percentile_limits(
+    values: Any,
+    low: float = 1.0,
+    high: float = 99.0,
+    pad: float = 0.08,
+) -> tuple[float, float] | None:
+    """Percentile window of the finite values, padded; None if unusable."""
+    array = np.asarray(values, dtype=float).ravel()
+    array = array[np.isfinite(array)]
+    if array.size < 5:
+        return None
+    lower, upper = np.percentile(array, [low, high])
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower == upper:
+        return None
+    margin = (upper - lower) * pad
+    return float(lower - margin), float(upper + margin)
+
+
+def _composer_clip_axes_y(ax, low: float = 1.0, high: float = 99.0) -> None:
+    """Limit the y-axis to the percentile window of the plotted line data."""
+    y_values = [
+        np.asarray(line.get_ydata(), dtype=float).ravel() for line in ax.lines
+    ]
+    if not y_values:
+        return
+    limits = _composer_percentile_limits(np.concatenate(y_values), low, high)
+    if limits is not None:
+        ax.set_ylim(*limits)
+
+
+def _composer_clip_plotly_figure(fig: go.Figure, low: float = 2.0, high: float = 98.0) -> go.Figure:
+    """Clip colour ranges (and 2D y-ranges) of a Plotly panel to percentiles."""
+    figure = go.Figure(fig)
+    y_samples: list[np.ndarray] = []
+    flat_2d = True
+    for trace in figure.data:
+        trace_type = str(getattr(trace, "type", "")).lower()
+        if trace_type == "parcoords":
+            colors = getattr(trace.line, "color", None)
+            limits = _composer_percentile_limits(colors, low, high, pad=0.0) if colors is not None else None
+            if limits is not None:
+                trace.line.cmin, trace.line.cmax = limits
+            flat_2d = False
+        elif trace_type in {"heatmap", "contour"}:
+            limits = _composer_percentile_limits(getattr(trace, "z", None), low, high, pad=0.0)
+            if limits is not None:
+                trace.zmin, trace.zmax = limits
+            flat_2d = False
+        else:
+            marker = getattr(trace, "marker", None)
+            colors = getattr(marker, "color", None) if marker is not None else None
+            if colors is not None and not isinstance(colors, str):
+                limits = _composer_percentile_limits(colors, low, high, pad=0.0)
+                if limits is not None:
+                    marker.cmin, marker.cmax = limits
+            if trace_type.endswith("3d"):
+                flat_2d = False
+            elif getattr(trace, "y", None) is not None:
+                y_samples.append(np.asarray(getattr(trace, "y"), dtype=float).ravel())
+    if flat_2d and y_samples:
+        limits = _composer_percentile_limits(np.concatenate(y_samples), 1.0, 99.0)
+        if limits is not None:
+            figure.update_yaxes(range=list(limits))
+    return figure
+
+
+def _composer_scale_axes_marks(
+    ax,
+    scale: float,
+    marker_scale: float | None = None,
+) -> None:
+    """Shrink line widths (``scale``) and marker sizes (``marker_scale``) of one axes.
+
+    Markers shrink faster than lines: a dot is an area mark, so halving the
+    canvas should roughly quarter its diameter-times-weight in the plot.
+    """
+    scale = float(scale)
+    marker_scale = scale if marker_scale is None else float(marker_scale)
+    if not 0.0 < scale < 1.0 and not 0.0 < marker_scale < 1.0:
+        return
+    scale = min(1.0, scale)
+    marker_scale = min(1.0, marker_scale)
+    for line in ax.lines:
+        line.set_linewidth(max(0.3, line.get_linewidth() * scale))
+        if line.get_marker() not in (None, "", "None", "none", " "):
+            line.set_markersize(max(1.0, line.get_markersize() * marker_scale))
+            line.set_markeredgewidth(max(0.2, line.get_markeredgewidth() * scale))
+    for collection in ax.collections:
+        # Only scatter-type collections have sizes (LineCollection, e.g.
+        # error bars and fill outlines, does not).
+        if hasattr(collection, "get_sizes") and hasattr(collection, "set_sizes"):
+            sizes = collection.get_sizes()
+            if len(sizes):
+                collection.set_sizes(sizes * marker_scale * marker_scale)
+        if hasattr(collection, "get_linewidths") and hasattr(collection, "set_linewidths"):
+            widths = collection.get_linewidths()
+            if len(widths):
+                collection.set_linewidths([max(0.2, float(w) * scale) for w in widths])
+
+
 def _build_composer_figure(
     session: dict,
     history: pd.DataFrame,
@@ -32336,14 +33247,41 @@ def _build_composer_figure(
     panel_border: bool = False,
     panel_border_color: str = "#222222",
     panel_border_width: float = .8,
+    journal_style: bool = False,
 ) -> plt.Figure:
-    aspect_map = {
-        "4:3": (12, 9),
-        "16:9": (12.8, 7.2),
-        "1:1": (9, 9),
-        "Letter": (8.5, 11),
-    }
-    width, height = aspect_map.get(aspect, (12, 9))
+    width, height = COMPOSER_CANVAS_SIZES.get(aspect, (12, 9))
+    journal_token = _COMPOSER_JOURNAL_STYLE.set(bool(journal_style))
+    try:
+        return _build_composer_figure_inner(
+            session, history, observations, observation, trace_analysis,
+            paired_objective, specs, (width, height), font_family, font_size,
+            label_size, title, render_dpi, panel_border, panel_border_color,
+            panel_border_width, bool(journal_style),
+        )
+    finally:
+        _COMPOSER_JOURNAL_STYLE.reset(journal_token)
+
+
+def _build_composer_figure_inner(
+    session: dict,
+    history: pd.DataFrame,
+    observations: list[dict],
+    observation: dict,
+    trace_analysis: dict,
+    paired_objective: bool,
+    specs: list[dict],
+    canvas_size: tuple[float, float],
+    font_family: str,
+    font_size: int,
+    label_size: int,
+    title: str,
+    render_dpi: int,
+    panel_border: bool,
+    panel_border_color: str,
+    panel_border_width: float,
+    journal_style: bool,
+) -> plt.Figure:
+    width, height = canvas_size
     with plt.rc_context({"font.family": font_family, "font.size": font_size}):
         fig = plt.figure(figsize=(width, height), facecolor="white")
         if title:
@@ -32356,8 +33294,15 @@ def _build_composer_figure(
         for index, spec in enumerate(specs):
             ax = fig.add_axes(spec["rect"])
             kind = spec["kind"]
+            _COMPOSER_CLIP_EXTREMES.set(bool(spec.get("clip_extremes")))
             if kind == "Global trend":
-                _composer_draw_global(ax, history, spec["metric"], font_size)
+                _composer_draw_global(
+                    ax,
+                    history,
+                    spec["metric"],
+                    font_size,
+                    int(spec.get("running_mean_window", 0) or 0),
+                )
             elif kind == "Channel trend":
                 _composer_draw_channel(ax, history, channel_metrics, spec["metric"], spec["channels"], font_size)
             elif kind == "Buffer/target trend":
@@ -32374,7 +33319,15 @@ def _build_composer_figure(
             elif kind == "Surrogate 2D map":
                 _composer_draw_surrogate_map(fig, ax, session, observation, spec["artifact_iteration"], spec["value"], spec["x"], spec["y"])
             elif kind == "SWV trace overlay":
-                _composer_draw_trace(ax, session, observation, spec["corrected"], spec["channels"], trace_analysis, spec["corrected_trace_key"], spec["normalize_to_peak"])
+                trace_observation = next(
+                    (
+                        item for item in observations
+                        if int(item.get("iteration", -1))
+                        == int(spec.get("observation_iteration", observation.get("iteration", -1)))
+                    ),
+                    observation,
+                )
+                _composer_draw_trace(ax, session, trace_observation, spec["corrected"], spec["channels"], trace_analysis, spec["corrected_trace_key"], spec["normalize_to_peak"])
             elif kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS:
                 _composer_draw_embedded_figure(
                     fig,
@@ -32456,6 +33409,20 @@ def _build_composer_figure(
             else:
                 ax.text(.5, .5, "Select a figure", ha="center", va="center")
                 ax.set_axis_off()
+            if journal_style and kind in {
+                "Global trend", "Channel trend", "Buffer/target trend",
+                "SWV trace overlay", "Surrogate 2D map",
+            }:
+                # These panels draw directly on the canvas with marks sized
+                # for the 12 in presentation canvas: lines scale with the
+                # canvas, dots shrink faster so they stay light.
+                _composer_scale_axes_marks(
+                    ax, width / 12.0, (width / 12.0) ** 1.7,
+                )
+            if spec.get("clip_extremes") and kind in {
+                "Global trend", "Channel trend", "Buffer/target trend",
+            }:
+                _composer_clip_axes_y(ax)
             panel_text_size = max(4.0, float(spec.get("text_size", font_size)))
             ax.title.set_fontsize(panel_text_size * 1.2)
             ax.xaxis.label.set_fontsize(panel_text_size)
@@ -32477,16 +33444,37 @@ def _build_composer_figure(
                     linewidth=panel_border_width,
                     zorder=20,
                 ))
-            ax.text(
-                spec.get("label_x", -.08),
-                spec.get("label_y", 1.06),
-                spec.get("label") or chr(ord("A") + index),
-                transform=ax.transAxes,
-                fontsize=label_size,
-                weight="bold",
-                va="top",
-                ha="left",
-            )
+            if spec.get("border_color"):
+                # Frame the drawn image itself (not the empty rest of its slot).
+                ax.apply_aspect()
+                box = ax.get_position()
+                fig.add_artist(Rectangle(
+                    (box.x0, box.y0), box.width, box.height,
+                    transform=fig.transFigure, fill=False,
+                    edgecolor=spec["border_color"], linewidth=2.0, zorder=21,
+                ))
+            panel_label = spec.get("label") or chr(ord("A") + index)
+            if journal_style:
+                _composer_journal_axes(ax)
+                # Bold letter just outside the panel's top-left corner, clear
+                # of axis labels, positioned in figure coordinates.
+                letter_x = max(0.004, spec["rect"][0] - 0.03)
+                letter_y = min(0.996, spec["rect"][1] + spec["rect"][3] + 0.004)
+                fig.text(
+                    letter_x, letter_y, panel_label,
+                    fontsize=label_size, weight="bold", va="bottom", ha="left",
+                )
+            else:
+                ax.text(
+                    spec.get("label_x", -.08),
+                    spec.get("label_y", 1.06),
+                    panel_label,
+                    transform=ax.transAxes,
+                    fontsize=label_size,
+                    weight="bold",
+                    va="top",
+                    ha="left",
+                )
         for spec in specs:
             source_index = spec.get("zoom_from")
             if not isinstance(source_index, int) or not 0 <= source_index < len(specs):
@@ -32553,6 +33541,7 @@ def _build_composer_figure(
                     zorder=24,
                     clip_on=False,
                 ))
+    _COMPOSER_CLIP_EXTREMES.set(False)
     return fig
 
 
@@ -32586,6 +33575,46 @@ def _composer_portable_zip(
     return output.getvalue()
 
 
+def _composer_filter_optimizer(
+    session: dict,
+    observations: list[dict],
+    history: pd.DataFrame,
+    *,
+    selected: str | None = None,
+) -> tuple[list[dict], pd.DataFrame]:
+    """Restrict the Composer data to one optimizer direction (or keep both).
+
+    ``selected`` is read from the "Optimizer shown" selector when None (and
+    the selector is only drawn when more than one direction is present).
+    """
+    def direction_of(observation: dict) -> str:
+        return str(_saved_observation_optimization_direction(session, observation) or "")
+
+    directions = sorted({direction_of(obs) for obs in observations} - {""})
+    if selected is None:
+        selected = "Both"
+        if len(directions) > 1:
+            options = ["Both", *directions]
+            _preserve_valid_widget_value("bo_composer_direction", options, "Both")
+            selected = st.selectbox(
+                "Optimizer shown in BO panels",
+                options,
+                key="bo_composer_direction",
+                help=(
+                    "A channel group can hold a maximize and a minimize "
+                    "optimizer. Pick one so each panel shows a single series."
+                ),
+            )
+    if selected in (None, "", "Both") or selected not in directions:
+        return observations, history
+    kept = [obs for obs in observations if direction_of(obs) == selected]
+    if "optimization_direction" in history.columns:
+        history = history[
+            history["optimization_direction"].astype(str) == selected
+        ].reset_index(drop=True)
+    return kept, history
+
+
 def _render_figure_composer(
     session: dict,
     history: pd.DataFrame,
@@ -32598,6 +33627,11 @@ def _render_figure_composer(
     deleted_panels = _composer_apply_pending_panel_deletions()
     auto_render_requested = bool(
         st.session_state.pop("bo_composer_auto_render", False)
+    )
+    # A channel group can hold a maximize and a minimize optimizer; mixing their
+    # observations interleaves two series (a zig-zag Q trace, doubled legends).
+    observations, history = _composer_filter_optimizer(
+        session, observations, history,
     )
     composer_heading, composer_help = st.columns([8, 1])
     composer_heading.subheader("Figure Composer")
@@ -32727,14 +33761,18 @@ def _render_figure_composer(
             available_fields.update(map(str, artifact_columns))
         except Exception:
             pass
-    saved_presets = {
-        "Hyperparameter Sweep": _composer_hyperparameter_sweep_preset(
-            observations,
-            real_channels,
-            current_trace_channels,
-        ),
-        **_composer_load_presets(),
-    }
+    is_survey_session = any(
+        str(item.get("optimization_direction") or "").lower() == "survey"
+        for item in observations
+    )
+    saved_presets = {}
+    if is_survey_session:
+        saved_presets["Type 1 - Parameter sweep"] = _paper_parameter_sweep_preset(
+            observations, real_channels, current_trace_channels,
+        )
+    else:
+        saved_presets["Type 2 - BO validation"] = _paper_bo_validation_preset()
+    saved_presets.update(_composer_load_presets())
     with st.expander("Load a preset or saved figure", expanded=False):
         preset_cols = st.columns([2.2, 1])
         selected_preset_name = preset_cols[0].selectbox(
@@ -32846,20 +33884,99 @@ def _render_figure_composer(
 
     st.session_state.setdefault("bo_composer_layout", "Manual")
     c1, c2, c3, c4 = st.columns(4)
-    aspect = c1.selectbox("Canvas", ["4:3", "16:9", "1:1", "Letter"], key="bo_composer_aspect")
+    aspect = c1.selectbox(
+        "Canvas",
+        list(COMPOSER_CANVAS_SIZES),
+        key="bo_composer_aspect",
+        help=(
+            "The ACS canvases are true print size (7.0 in = two columns, "
+            "3.3 in = one column): text sizes below are printed sizes there. "
+            "The presentation canvases are larger and get scaled down in a paper."
+        ),
+    )
     panel_count = int(c2.number_input("Panels", min_value=1, max_value=12, value=4, step=1, key="bo_composer_count"))
     preset = c3.selectbox("Layout", ["Manual", "Grid", "Main left + stack", "Top wide + grid"], key="bo_composer_layout")
     dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25, key="bo_composer_dpi"))
     c5, c6, c7 = st.columns(3)
     font_family = c5.selectbox("Font", ["Arial", "DejaVu Sans", "Times New Roman", "Calibri"], key="bo_composer_font")
-    font_size = int(c6.slider("Plot font", 6, 18, 9, key="bo_composer_font_size"))
+    font_size = int(c6.slider("Plot font", 5, 18, 9, key="bo_composer_font_size"))
     label_size = int(c7.slider("Panel label", 8, 30, 16, key="bo_composer_label_size"))
+    journal_style = st.checkbox(
+        "Journal style (open axes, thin lines, no panel titles, frameless legends, "
+        "panel letters outside the axes)",
+        key="bo_composer_journal_style",
+    )
     border_cols = st.columns([.9, 1.1, 1.0, 2.0])
     panel_border = border_cols[0].checkbox("Panel border", value=False, key="bo_composer_panel_border")
     panel_border_color = border_cols[1].color_picker("Border color", value="#222222", key="bo_composer_panel_border_color")
     panel_border_width = float(border_cols[2].number_input("Border width", min_value=0.1, max_value=8.0, value=0.8, step=0.1, format="%.1f", key="bo_composer_panel_border_width"))
     border_cols[3].caption("Plotly-based panels are embedded into the final export at the selected PNG DPI.")
     title = st.text_input("Figure title", value="", key="bo_composer_title")
+
+    # Type 1 is intentionally a linked figure: each trace frame must identify
+    # the same sampled point highlighted in the first cube, and each slice-map
+    # frame must identify the matching plane in the second cube.  Synchronise
+    # these widget values before the per-panel controls are constructed.
+    if (
+        st.session_state.get("bo_composer_type1_linked_controls")
+        and panel_count == 8
+    ):
+        iteration_options = sorted({
+            int(item.get("iteration")) for item in observations
+            if item.get("iteration") is not None
+        })
+        step_options = sorted({
+            float((item.get("params") or {}).get("step_potential"))
+            for item in observations
+            if _finite_float((item.get("params") or {}).get("step_potential")) is not None
+        })
+        st.caption(
+            "Type 1 linked controls: changing these updates the highlighted cube points, "
+            "the two SWV panels, the step planes, and their matching slice maps."
+        )
+        link_cols = st.columns(3)
+        linked_channel = link_cols[0].selectbox(
+            "Shared channel",
+            current_trace_channels or real_channels,
+            key="bo_composer_type1_channel",
+        )
+        linked_iterations = link_cols[1].multiselect(
+            "Highlighted iterations",
+            iteration_options,
+            max_selections=2,
+            key="bo_composer_type1_iterations",
+        ) if iteration_options else []
+        linked_slices = link_cols[2].multiselect(
+            "Step-size planes",
+            step_options,
+            max_selections=4,
+            key="bo_composer_type1_slice_values",
+        ) if step_options else []
+        if not linked_iterations and iteration_options:
+            linked_iterations = iteration_options[:1]
+        if not linked_slices and step_options:
+            linked_slices = step_options[:min(4, len(step_options))]
+        trace_iterations = (
+            list(linked_iterations) + [linked_iterations[-1]] * 2
+            if linked_iterations else []
+        )[:2]
+        map_slices = (
+            list(linked_slices) + [linked_slices[-1]] * 4
+            if linked_slices else []
+        )[:4]
+        st.session_state["bo_composer_real_highlight_iterations_0"] = list(linked_iterations)
+        st.session_state["bo_composer_real_slice_values_3"] = list(map_slices)
+        for index in (0, 3):
+            st.session_state[f"bo_composer_measured_channels_{index}"] = [linked_channel]
+        for index, iteration in zip((1, 2), trace_iterations):
+            st.session_state[f"bo_composer_trace_iteration_{index}"] = iteration
+            st.session_state[f"bo_composer_trace_channels_{index}"] = [linked_channel]
+        for offset, (index, slice_value) in enumerate(zip(range(4, 8), map_slices)):
+            st.session_state[f"bo_composer_real_channels_{index}"] = [linked_channel]
+            st.session_state[f"bo_composer_real_slice_value_{index}"] = slice_value
+            st.session_state[f"bo_composer_border_color_{index}"] = to_hex(
+                _slice_highlight_color(offset, max(1, len(map_slices)))[0]
+            )
 
     if preset == "Manual":
         manual_rects = _composer_manual_rects(panel_count)
@@ -32959,16 +34076,57 @@ def _render_figure_composer(
                 "text_size": panel_text_size,
                 "rect": rect,
             }
+            if st.checkbox(
+                "Coloured panel border",
+                value=False,
+                key=f"bo_composer_border_on_{index}",
+                help="Frames this panel in a colour, e.g. to link it to a highlighted point or slice plane.",
+            ):
+                spec["border_color"] = st.color_picker(
+                    "Border colour", value="#d62728",
+                    key=f"bo_composer_border_color_{index}",
+                )
+            if kind in COMPOSER_CLIP_KINDS:
+                spec["clip_extremes"] = st.checkbox(
+                    "Clip extreme values",
+                    value=False,
+                    key=f"bo_composer_clip_extremes_{index}",
+                    help=(
+                        "Limit the y-axis (trends) or colour range (parallel "
+                        "coordinates, 3D/2D maps, heatmaps) to the 1st-99th "
+                        "percentile so a few extreme points do not dominate. "
+                        "Points are not deleted, only the view is clipped."
+                    ),
+                )
             if kind == "Global trend":
                 options = global_metrics or _numeric_columns(history)
                 spec["metric"] = st.selectbox("Metric", options, index=options.index("Q_run") if "Q_run" in options else 0, key=f"bo_composer_global_metric_{index}")
+                spec["running_mean_window"] = int(st.number_input(
+                    "Running mean window (0 disables)",
+                    min_value=0,
+                    max_value=50,
+                    value=0,
+                    step=1,
+                    key=f"bo_composer_global_running_mean_{index}",
+                    help="Adds a trailing dashed mean without replacing the measured Q values.",
+                ))
             elif kind == "Channel trend":
                 metric = st.selectbox("Metric", list(channel_metrics), key=f"bo_composer_channel_metric_{index}")
                 available = sorted(channel_metrics.get(metric, {}), key=_channel_sort_key)
                 spec["metric"] = metric
                 spec["channels"] = st.multiselect("Channels", available, default=available[:8], key=f"bo_composer_channel_channels_{index}")
             elif kind == "Buffer/target trend":
-                metrics = _q_relevant_metrics(PAIRED_TREND_METRICS, session["config"], True) or list(PAIRED_TREND_METRICS)
+                # Objective-relevant metrics come first, but every metric stays
+                # selectable so an explicit choice (e.g. Peak prominence) is
+                # never silently replaced by another metric.
+                relevant_metrics = _q_relevant_metrics(PAIRED_TREND_METRICS, session["config"], True)
+                metrics = [
+                    *relevant_metrics,
+                    *[name for name in PAIRED_TREND_METRICS if name not in relevant_metrics],
+                ]
+                _preserve_valid_widget_value(
+                    f"bo_composer_paired_metric_{index}", list(metrics), list(metrics)[0],
+                )
                 metric = st.selectbox("Metric", metrics, key=f"bo_composer_paired_metric_{index}")
                 spec["metric"] = metric
                 spec["channels"] = st.multiselect("Channels", real_channels, default=real_channels[:8], key=f"bo_composer_paired_channels_{index}")
@@ -33057,6 +34215,11 @@ def _render_figure_composer(
                     paired_objective,
                     phase=phase,
                 ) or list(REAL_DATA_METRICS)
+                _preserve_valid_widget_value(
+                    f"bo_composer_measured_metric_{index}",
+                    list(metric_options),
+                    list(metric_options)[0],
+                )
                 metric = st.selectbox("Metric", metric_options, key=f"bo_composer_measured_metric_{index}")
                 channels = st.multiselect(
                     "Channels",
@@ -33087,14 +34250,16 @@ def _render_figure_composer(
                 if not dimensions:
                     dimensions = _composer_parameter_dimensions_from_observations(observations)
                 if kind == "Measured parallel coordinates":
+                    # The plot always draws "iteration" as its first axis.
+                    parallel_dimensions = [name for name in dimensions if name != "iteration"]
                     preferred = [
                         name for name in ("frequency", "amplitude", "step_potential")
-                        if name in dimensions
+                        if name in parallel_dimensions
                     ]
                     spec["parameters"] = st.multiselect(
                         "Parameters",
-                        dimensions,
-                        default=preferred or dimensions[:min(4, len(dimensions))],
+                        parallel_dimensions,
+                        default=preferred or parallel_dimensions[:min(4, len(parallel_dimensions))],
                         key=f"bo_composer_measured_parallel_params_{index}",
                     )
                     spec["line_width"] = float(st.slider("Line width", 0.5, 5.0, 2.0, 0.1, key=f"bo_composer_measured_parallel_line_{index}"))
@@ -33139,6 +34304,26 @@ def _render_figure_composer(
                             value=True,
                             key=f"bo_composer_measured_cube_edges_{index}",
                         )
+                        iteration_options = sorted({
+                            int(value) for value in pd.to_numeric(
+                                points.get("iteration", pd.Series(dtype=float)), errors="coerce"
+                            ).dropna().tolist()
+                        })
+                        spec["highlight_iterations"] = st.multiselect(
+                            "Highlight sampled iterations",
+                            iteration_options,
+                            max_selections=2,
+                            key=f"bo_composer_real_highlight_iterations_{index}",
+                            help="Adds large linked markers for the two SWV observation panels.",
+                        )
+                        step_slice_values = _numeric_slice_values(points, "step_potential")
+                        spec["slice_sweep_values"] = st.multiselect(
+                            "Step-size slice planes",
+                            step_slice_values,
+                            max_selections=4,
+                            key=f"bo_composer_real_slice_values_{index}",
+                            help="Draws up to four constant-step planes through the cube.",
+                        ) if step_slice_values else []
                 if kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS or kind in {
                     "Measured parallel coordinates",
                     "Channel x iteration heatmap",
@@ -33252,7 +34437,22 @@ def _render_figure_composer(
                             key=f"bo_composer_surrogate_cube_edges_{index}",
                         )
             elif kind == "SWV trace overlay":
-                trace_items = _trace_paths(session, observation)
+                observation_iterations = sorted({
+                    int(item.get("iteration")) for item in observations
+                    if item.get("iteration") is not None
+                })
+                selected_trace_iteration = st.selectbox(
+                    "Observation iteration",
+                    observation_iterations,
+                    index=max(0, len(observation_iterations) - 1),
+                    key=f"bo_composer_trace_iteration_{index}",
+                ) if observation_iterations else int(observation.get("iteration", 0))
+                spec["observation_iteration"] = int(selected_trace_iteration)
+                trace_observation = next(
+                    (item for item in observations if int(item.get("iteration", -1)) == int(selected_trace_iteration)),
+                    observation,
+                )
+                trace_items = _trace_paths(session, trace_observation)
                 available = sorted({_trace_channel_key(item) for item in trace_items}, key=_channel_sort_key)
                 spec["channels"] = st.multiselect("Channels", available, default=available[:8], key=f"bo_composer_trace_channels_{index}")
                 spec["corrected"] = st.checkbox("Corrected", value=True, key=f"bo_composer_trace_corrected_{index}")
@@ -33273,8 +34473,13 @@ def _render_figure_composer(
                 spec["channels"] = st.multiselect(
                     "Channels",
                     available,
-                    default=available[:min(4, len(available))],
+                    default=available[:min(1, len(available))],
                     key=f"bo_composer_stack_channels_{index}",
+                    help=(
+                        "One channel keeps the stack readable. Scope the BO "
+                        "session to one channel group first (sidebar) when "
+                        "several groups share a channel."
+                    ),
                 )
                 spec["phases"] = st.multiselect(
                     "Phases",
@@ -33496,6 +34701,39 @@ def _render_figure_composer(
                         key=f"bo_composer_capture_zlabel_{index}",
                         disabled=not source_is_editable,
                     )
+                    limit_cols = st.columns(6)
+                    for axis_name, offset in (("x", 0), ("y", 3)):
+                        default_limits = format_defaults.get(f"{axis_name}lim")
+                        limits_available = source_is_editable and default_limits is not None
+                        limit_enabled = limit_cols[offset].checkbox(
+                            f"Limit {axis_name.upper()} range",
+                            value=False,
+                            key=f"bo_composer_capture_{axis_name}lim_on_{index}",
+                            disabled=not limits_available,
+                            help=(
+                                "Show only this window of the plot, e.g. a subset of "
+                                "measurements or a zoomed response range."
+                            ),
+                        )
+                        limit_low = limit_cols[offset + 1].number_input(
+                            f"{axis_name.upper()} min",
+                            value=float(default_limits[0]) if default_limits else 0.0,
+                            format="%.4g",
+                            key=f"bo_composer_capture_{axis_name}lim_min_{index}",
+                            disabled=not (limits_available and limit_enabled),
+                        )
+                        limit_high = limit_cols[offset + 2].number_input(
+                            f"{axis_name.upper()} max",
+                            value=float(default_limits[1]) if default_limits else 1.0,
+                            format="%.4g",
+                            key=f"bo_composer_capture_{axis_name}lim_max_{index}",
+                            disabled=not (limits_available and limit_enabled),
+                        )
+                        spec[f"capture_{axis_name}lim"] = (
+                            [float(limit_low), float(limit_high)]
+                            if limits_available and limit_enabled
+                            else None
+                        )
                     st.image(
                         capture["png_bytes"],
                         caption=(
@@ -33650,6 +34888,7 @@ def _render_figure_composer(
                 panel_border,
                 panel_border_color,
                 panel_border_width,
+                journal_style=journal_style,
             )
             png_bytes = _composer_figure_bytes(
                 figure,

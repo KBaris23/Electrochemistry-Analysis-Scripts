@@ -39,6 +39,14 @@ _mat_csv/
 bo_sessions/
 simulation_artifacts/
 analysis_outputs/
+analysis_sessions/
 .figure_composer_presets.json
 bo_figure_set_g7_i47_refined/
 mini_bo_g7_i47
+
+# Locally rendered manuscript exports (source notes/configuration in paper/ stay tracked)
+paper/generated/
+paper/outputs/
+
+# Local storage/research audit reports
+audit/

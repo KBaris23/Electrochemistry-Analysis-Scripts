@@ -1,0 +1,4 @@
+BO session bo_111904_a0d8ad (group all): exceptions []
+  after loading 'Landscape (3D + traces + 2D slices)': layout=Manual, count=10
+  Landscape (3D + traces + 2D slices): errors=[] exceptions=[]
+  wrote C:\TEMP\BO\analysis_plan\examples\landscape.png

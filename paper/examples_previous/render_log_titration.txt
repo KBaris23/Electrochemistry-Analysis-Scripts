@@ -1,0 +1,11 @@
+SWV ready, exceptions: []
+  showing channels 5; exceptions []
+  channels-to-combine options (first 6): ['Channel 5 · method 1 | 500 Hz; amplitude 0.04 V; step 0.002 V', 'Channel 5 · method 2 | 138 Hz; amplitude 0.09 V; step 0.003 V', 'Channel 5 · method 3 | 200 Hz; amplitude 0.036 V; step 0.002 V']
+  selected for channel 5: ['Channel 5 · method 1 | 500 Hz; amplitude 0.04 V; step 0.002 V', 'Channel 5 · method 2 | 138 Hz; amplitude 0.09 V; step 0.003 V', 'Channel 5 · method 3 | 200 Hz; amplitude 0.036 V; step 0.002 V']
+  non-titration Add buttons in Metrics view: ['metric_combined_peak_current_selected_all_normalization_buffer_offset_']
+  triggered ['A trace', 'B Langmuir', 'C SNR', 'D predicted vs known']; registry (seq,label): [(1, 'Peak current (corrected + smoothed)'), (2, 'Channel 5 | Langmuir Fit'), (3, 'Peak current (corrected + smoothed) | Channel 5 | SNR by concentration'), (4, 'Predicted vs. Known')]
+  triggered ['E overlay ON', 'F overlay OFF', 'G overlay manual']; registry (seq,label): [(5, 'SWV Method 1 | Channel 5'), (6, 'SWV Method 2 | Channel 5'), (7, 'SWV Method 3 | Channel 5')]
+BO session bo_113013_8dd581 (group 5): exceptions []
+  after loading 'Titration main (7 panels)': layout=Manual, count=7
+  Titration main (7 panels): errors=[] exceptions=[]
+  wrote C:\TEMP\BO\analysis_plan\examples\titration_main.png
