@@ -4,6 +4,17 @@ Updated 8 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage
 
 ## 0. Start here: BO first
 
+### Paper figure scope
+
+| Dataset | BO validation | BO sweep | Titration response / concentration validation |
+|---|---:|---:|---:|
+| Planar kana, setup 5 | Yes | Yes | Yes |
+| Amp0 | Yes | No | Yes |
+| Vanco | Yes | No | Yes |
+| Kana station 2 | Yes (replicate/SI) | No | No |
+
+In other words: make the parameter-sweep figure only for planar kana; make titration Figures C/D for planar kana, amp0, and vanco; and make a BO-validation figure for every dataset, including kana station 2.
+
 ### 0.1 Launch
 
 1. In PowerShell, run exactly:
