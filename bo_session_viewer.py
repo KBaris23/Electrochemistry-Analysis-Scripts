@@ -55054,14 +55054,24 @@ def render_bo_session_app() -> None:
 
         _render_simulation_tab()
     with figure_composer:
-        _render_figure_composer(
-            session,
-            history,
-            observations,
-            observation,
-            trace_analysis,
-            paired_objective,
-        )
+        # Preset selection and panel editing should not re-execute the other
+        # BO tabs.  On a large survey those tabs can inspect thousands of
+        # observations, which made even choosing a Composer preset feel like
+        # it was rendering a figure.  A fragment keeps these interactions
+        # local while still receiving fresh session data whenever an outside
+        # group/iteration selector changes.
+        @st.fragment
+        def _render_figure_composer_fragment() -> None:
+            _render_figure_composer(
+                session,
+                history,
+                observations,
+                observation,
+                trace_analysis,
+                paired_objective,
+            )
+
+        _render_figure_composer_fragment()
 
     with pdf_export:
         st.subheader("Exhaustive BO session report")
