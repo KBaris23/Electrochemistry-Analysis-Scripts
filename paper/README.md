@@ -130,9 +130,11 @@ The app deliberately has two figure tools:
 
 | Template | Where to open it | Use it for |
 |---|---|---|
-| Type 1 – Parameter sweep | BO Session, **survey** session only | setup-5 kanamycin landscape. The station-2 sweep can be supplementary, not a required main figure. |
+| Type 1 – Parameter sweep | BO Session, **survey** session only | Standalone eight-panel setup-5 kanamycin landscape. The station-2 sweep can be supplementary, not a required main figure. |
+| Type 1A / 1B – Sweep comparison | BO Session, **survey** session only | Compact mirrored one-column halves for a planar/nanoporous side-by-side comparison: cube-left (1A) and support-left (1B). Select real signal-on/off observations and two measured step planes with the linked controls. |
 | Type 2 – BO validation | BO Session, BO experiment session | setup-5 kana, amp0, vanco, and optionally station-2 kana. |
 | Type 3 – SWV and titration response | SWV → Paper Figures | each selected physical channel: manual/reference vs one optimized method, traces + time course + Langmuir response. |
+| Type 3B – Signal-on/off shared Langmuir | SWV → Paper Figures | One physical channel with fixed ON/manual and OFF/manual rows; one optimized-ON/OFF-only Langmuir panel spans the fourth column. |
 | Type 4 – Concentration validation | SWV → Paper Figures | the same selected channel/method pair: concentration-by-measurement and predicted-vs-known. |
 
 ### Recommended first-pass figure set
@@ -147,7 +149,7 @@ The app deliberately has two figure tools:
 
 ### Formatting defaults
 
-- Types 1 and 2 load as 7 × 7 in ACS two-column square figures, Arial 7 pt, 9 pt panel letters, journal styling, and 600 DPI. Leave those settings unchanged for the first render. Use **Edit panel** to change a single panel; use **Expand all panel settings** only for a final audit.
+- Types 1 and 2 load as 7 × 7 in ACS two-column square figures, Arial 7 pt, 9 pt panel letters, journal styling, and 600 DPI. Type 1A/1B load as 3.3 × 7.0 in ACS one-column tall halves. Leave those settings unchanged for the first render. Use **Edit panel** to change a single panel; use **Expand all panel settings** only for a final audit.
 - For Type 1, use the shared controls, not per-panel overrides: choose one channel, two highlighted iterations, and up to four real step-size planes. The colour frames are intended to identify these links.
 - For Type 2, retain the 5-point Q_run running mean; choose a channel-specific group and correct direction before rendering. If peak prominence has extreme values, inspect them rather than clipping them away.
 - For Type 3, start with one comparison row, 7.0 in width, 7–8 pt font, 300 DPI, and no optional columns. Use stacked traces only when temporal progression matters; otherwise use overlays. Add SNR or predicted-vs-known only in the SI.
