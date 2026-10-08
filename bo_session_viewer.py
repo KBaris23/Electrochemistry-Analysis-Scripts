@@ -32580,6 +32580,43 @@ def _composer_trace_entries(
     ]
 
 
+def _composer_trace_observations_for_channels(
+    observations: Sequence[dict],
+    channels: Sequence[str],
+    *,
+    maximum: int = 48,
+) -> list[dict]:
+    """Select representative observations before resolving their trace files.
+
+    Resolving an archived trace means opening its analysis JSON and result CSV.
+    A survey can contain thousands of observations, so doing that merely to
+    populate a Composer dropdown made preset selection take minutes.  A stack
+    needs representative selected-channel traces rather than every archive.
+    """
+    selected = {str(channel) for channel in channels}
+    candidates = []
+    for observation in observations:
+        observation_channels = {
+            str(channel)
+            for channel in (
+                observation.get("analysis_channels")
+                or observation.get("channels")
+                or []
+            )
+        }
+        if not observation_channels:
+            observation_channels = {
+                str(channel)
+                for channel in (observation.get("channel_metrics") or {})
+            }
+        if not selected or selected & observation_channels:
+            candidates.append(observation)
+    if len(candidates) <= maximum:
+        return candidates
+    positions = np.linspace(0, len(candidates) - 1, maximum).round().astype(int)
+    return [candidates[index] for index in dict.fromkeys(positions)]
+
+
 def _composer_trace_channels(trace_entries: Sequence[tuple[dict, dict]]) -> list[str]:
     return sorted(
         {_trace_channel_key(trace) for _observation, trace in trace_entries},
@@ -32671,10 +32708,12 @@ def _composer_available_sources(
                 sources.append("Surrogate chronological 2D stack")
         if len(surrogate_dimensions) >= 3 and has_surrogate_values:
             sources.append("Surrogate 3D tensor")
-    trace_entries = _composer_trace_entries(session, observations)
+    # Do not resolve every archived trace simply to decide whether a menu item
+    # should exist.  That can require thousands of tiny JSON/CSV reads in a
+    # parameter survey.  The chronological builder resolves only a bounded,
+    # representative selection after the user actually renders that panel.
     sources.append("SWV trace overlay")
-    if trace_entries:
-        sources.append("Chronological SWV stack")
+    sources.append("Chronological SWV stack")
     if _composer_has_hyperparameter_response(history):
         hyper_columns = _hyperparameter_response_columns(history)
         sources.append("Hyperparameter 2D heatmap")
@@ -33541,11 +33580,19 @@ def _composer_build_chronological_swv(
     observations: list[dict],
     trace_analysis: dict,
 ):
-    entries = _composer_trace_entries(session, observations)
     if not spec.get("channels"):
         fig, ax = plt.subplots(figsize=(8, 4.8))
         _composer_error_panel(ax, "Choose at least one channel.")
         return fig
+    representative_observations = _composer_trace_observations_for_channels(
+        observations,
+        spec["channels"],
+        # Each paired observation usually contributes several replicates. This
+        # bounded sample is enough for a readable stack before the final trace
+        # thinning below, and avoids resolving thousands of archive records.
+        maximum=max(24, min(72, int(spec.get("max_traces", 120) or 120) // 2)),
+    )
+    entries = _composer_trace_entries(session, representative_observations)
     entries = _composer_thin_trace_entries(
         entries,
         spec["channels"],
@@ -34281,9 +34328,10 @@ def _render_figure_composer(
     current_trace_channels = sorted({
         _trace_channel_key(item) for item in _trace_paths(session, observation)
     }, key=_channel_sort_key)
-    chronological_trace_channels = _composer_trace_channels(
-        _composer_trace_entries(session, observations)
-    )
+    # Full trace discovery is deliberately deferred until a chronological
+    # panel is rendered; survey sessions may contain thousands of archived
+    # trace records.  Measured-data channels are a fast, reliable channel menu.
+    chronological_trace_channels = real_channels or current_trace_channels
     channel_options_by_kind = _composer_channel_options_by_kind(
         real_channels,
         current_trace_channels,
@@ -35112,13 +35160,11 @@ def _render_figure_composer(
                 )
                 spec["normalize_to_peak"] = st.checkbox("Normalize to peak", value=False, key=f"bo_composer_trace_norm_{index}")
             elif kind == "Chronological SWV stack":
-                trace_entries = _composer_trace_entries(session, observations)
-                available = _composer_trace_channels(trace_entries)
-                phases = sorted({
-                    str(trace.get("phase", "")).lower()
-                    for _observation, trace in trace_entries
-                    if str(trace.get("phase", "")).strip()
-                })
+                # Opening all archived analysis records merely to populate these
+                # controls makes a 2,000-point survey appear frozen.  The
+                # renderer resolves a bounded representative sample instead.
+                available = chronological_trace_channels or real_channels
+                phases = ["buffer", "target"] if paired_objective else ["measurement"]
                 spec["channels"] = st.multiselect(
                     "Channels",
                     available,

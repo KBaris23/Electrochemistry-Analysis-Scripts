@@ -465,6 +465,35 @@ def test_chronological_stack_offsets_are_capped_for_many_traces():
     assert viewer._chronological_swv_stack_steps(rows(400), 0.02, 0.5) == (0.02, 0.5)
 
 
+def test_composer_source_menu_does_not_eagerly_open_every_archived_trace(monkeypatch):
+    import pandas as pd
+
+    def should_not_run(*_args, **_kwargs):
+        raise AssertionError("Trace discovery must be deferred until the panel renders")
+
+    monkeypatch.setattr(viewer, "_composer_trace_entries", should_not_run)
+    monkeypatch.setattr(viewer, "_composer_surrogate_files", lambda *_args, **_kwargs: {})
+    sources = viewer._composer_available_sources(
+        {"config": {}}, pd.DataFrame(), [], {}, False, {},
+    )
+    assert "SWV trace overlay" in sources
+    assert "Chronological SWV stack" in sources
+
+
+def test_chronological_trace_selection_is_bounded_and_channel_specific():
+    observations = [
+        {"iteration": index, "channels": [1 if index % 2 else 2]}
+        for index in range(1, 201)
+    ]
+    selected = viewer._composer_trace_observations_for_channels(
+        observations, ["1"], maximum=24,
+    )
+    assert len(selected) == 24
+    assert all(item["channels"] == [1] for item in selected)
+    assert selected[0]["iteration"] == 1
+    assert selected[-1]["iteration"] == 199
+
+
 def test_paper_figure_types_have_requested_linked_layouts():
     observations = [
         {"iteration": 1, "params": {"step_potential": 0.001}},
