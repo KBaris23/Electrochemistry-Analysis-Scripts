@@ -1,6 +1,59 @@
 # BO paper: working guide
 
-Updated 7 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage/data-audit instructions. Raw data remain in `C:\TEMP\BO`. Start with section 1; the remaining sections explain the assessment and later work.
+Updated 8 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage/data-audit instructions. Raw data remain in `C:\TEMP\BO`. Start with the exact runbook below; the remaining sections explain the assessment and later work.
+
+## 0. Exact runbook: launch, analyze, click, export
+
+### 0.1 Launch and save a recoverable app session
+
+1. In PowerShell, run exactly:
+
+   ```powershell
+   cd "C:\Users\Asus\OneDrive\Desktop\Jun-Chau Lab\Chien Lab Scripts\Analysis Scripts\swv_app"
+   .\Open_SWV_App.cmd
+   ```
+
+   Alternatively, double-click `Open_SWV_App.cmd`. Wait for the browser tab at `http://localhost:8501`.
+2. In the sidebar open **Saved analysis sessions**, type a useful **Save as** name (for example `kana_try_ch5_titration_20261008`), optionally tick **Include derived analysis cache for fast reopen**, then click **Save**. The small recipe records the settings and the folder paths exactly as entered; raw CSVs are never copied. Reopen it later from the same expander: choose **Saved session** and click **Open**. Recipes are saved in `swv_app\analysis_sessions\`; an automatic lightweight recovery recipe is also refreshed on ordinary app reruns.
+
+### 0.2 Do the SWV analysis once per titration dataset
+
+For every row below, first choose **Analysis mode -> SWV**, select the exact **SWV folder**, then choose **Group plotted traces by -> SWV settings**. In **Peak / Baseline -> BO analysis match**, paste the exact **BO snapshot** and click **Load analysis settings from BO config**. This is the required way to populate all crop/acceptance widgets; do not carry settings forward from another dataset.
+
+| Dataset | SWV folder to select | Snapshot to paste | Check after loading |
+|---|---|---|---|
+| Kana setup 5 | `C:\TEMP\BO\titration_only\kana_try` | `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\planar_BO_kana_20260918_112056\bo_sessions\bo_113013_8dd581\bo_config_snapshot.json` | Crop **-0.55 to 0.00 V**; smoothing **15 / 2**; minima window **0.30 V**; min start **-0.60 V**; double correction, prominent minima, local minima, and BO acceptance windows **on**. Peak **-0.45 to -0.10 V**; left min **-0.54 to -0.10 V**; right min **-0.45 to -0.01 V**. |
+| Kana station 2 | `C:\TEMP\BO\titration_only\kana_st2` | `C:\TEMP\BO\500um_planar_kana_20260917_170330\500um_planar_kana_20260917_170349\bo_sessions\bo_171120_dc5dbc\bo_config_snapshot.json` | Crop **-0.45 to 0.10 V**; smoothing **15 / 2**; minima window **0.30 V**; min start **-0.50 V**; double correction, prominent minima, local minima, and BO acceptance windows **on**. Peak **-0.35 to 0.00 V**; left min **-0.44 to 0.00 V**; right min **-0.35 to 0.09 V**. |
+| Amp0 | `C:\TEMP\BO\titration_only\amp0` | `C:\TEMP\BO\100um_amp0_high_conc_20260915_130213\amp0_100um_20260915_130234\bo_sessions\bo_145633_9f5760\bo_config_snapshot.json` | Same crop/windows as setup 5; prominent and local minima **on**. |
+| Vanco | `C:\TEMP\BO\titration_only\vanco` | `C:\TEMP\BO\vanco_first_try_20260826_132944\vanco_try_1_20260826_132945\bo_sessions\bo_142117_84662a\bo_config_snapshot.json` | Same crop/windows as setup 5, but prominent minima and local minima **off**. |
+
+For all four rows, also verify **minimum peak = 0.001 uA**, **wavelet correction = off**, and **background recentering = off**, then click **Run Analysis**. In the titration controls: enable **Treat vline intervals as titration steps**, enable **Fit Langmuir-style curve to step plateaus**, select **Immediately preceding buffer**, select **uM**, and click **Apply Display Controls**. For kana, exclude only the first duplicate `20 uM_1` step if that is the documented equilibration block; leave the second 20 uM and its preceding buffer. Before leaving the run, open **Export** and save a new result bundle plus its processing inputs.
+
+### 0.3 Make the BO figures (Types 1 and 2)
+
+1. Choose **Analysis mode -> BO Session**. Paste a session folder below, wait for the session to load, then open **Figure Composer**.
+2. Open **Load a preset or saved figure**, choose the named preset, and click **Load preset**. Keep initial publication defaults unless a panel needs a deliberate edit: Arial, journal style, 7 pt plot font, 9 pt panel letters, 600 DPI. **Edit panel** changes the selected panel's source/data/axes/colours/text; the layout canvas only changes its rectangle.
+
+| Figure | Session folder to paste | Preset and required choices |
+|---|---|---|
+| Kana setup-5 Type 2 | `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\planar_BO_kana_20260918_112056\bo_sessions\bo_113013_8dd581` | **Type 2 - BO validation**. Select the group containing channel **5** and **maximize**. Keep the dashed 5-point running mean in Q_run vs iteration. |
+| Amp0 Type 2 | `C:\TEMP\BO\100um_amp0_high_conc_20260915_130213\amp0_100um_20260915_130234\bo_sessions\bo_145633_9f5760` | **Type 2 - BO validation**. Select the group containing channel **10** and **minimize**. |
+| Vanco Type 2 | `C:\TEMP\BO\vanco_first_try_20260826_132944\vanco_try_1_20260826_132945\bo_sessions\bo_142117_84662a` | **Type 2 - BO validation**. Select channel **6**'s group and **minimize**; channel 2 or 10 is an SI alternative only if documented. |
+| Kana station-2 Type 2 | `C:\TEMP\BO\500um_planar_kana_20260917_170330\500um_planar_kana_20260917_170349\bo_sessions\bo_171120_dc5dbc` | **Type 2 - BO validation**. Select the group containing channel **10** and **maximize**. |
+| Setup-5 sweep, normal half | `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\parameter_sweep_20260921_110003\bo_sessions\bo_111904_a0d8ad` | **Type 1A - Sweep comparison (cube left)**. Under **Compact Type 1 linked controls**, select the physical channel and then the actual signal-on and signal-off observation numbers; choose two measured step-size planes. |
+| Matching comparison half | The other survey session/data set to compare | **Type 1B - Sweep comparison (support left)**. Make the same scientific selections. This mirrors the supporting SWV/maps inward when the Type 1A and Type 1B one-column PDFs are placed side by side. |
+
+The original square **Type 1 - Parameter sweep** remains available for a standalone, eight-panel landscape. Use it only when four slice planes and the larger two-column square are actually wanted. The compact Type 1A/1B templates intentionally have only two planes/maps and explicit signal-on/off trace selectors; a survey observation has no safe automatic biological direction.
+
+### 0.4 Make titration figures (Types 3, 3B, and 4)
+
+After completing the matching SWV analysis in 0.2, choose **Paper Figures** in the top view selector.
+
+1. For the new fixed comparison choose **Figure type -> Type 3B - Signal-on/off shared Langmuir**. Select one **Physical channel**, then select three distinct settings: **Optimized signal-on**, **Optimized signal-off**, and **Manual/reference**. Use one common display start/end range. The generated grid is: manual SWVs / optimized-on SWVs / on-vs-manual response in row 1; manual SWVs / optimized-off SWVs / off-vs-manual response in row 2; one optimized-on/off-only Langmuir plot spans column 4. Set **Stacked (offset)** only when scan chronology is important; otherwise use **Overlaid**. Click **Generate paper figure**, inspect it, then download both PNG and PDF.
+2. For the original flexible Type 3 choose **Type 3 - SWV and titration response**, set **Comparison rows**, and select physical channel, one optimized method, one manual method, and display range for each row. It remains useful for a one-direction main figure or multiple SI rows.
+3. For Type 4 choose **Type 4 - Concentration validation** and use exactly the same physical channel/method pair and display range as the Type 3 figure. This creates concentration-by-measurement and predicted-vs-known panels. It is calibration self-consistency, not an independent validation set.
+
+Use these starting selections: setup-5 kana **channel 5** (ON **500 Hz / 40 mV / 2 mV**, OFF **138 Hz / 90 mV / 3 mV**, manual **200 Hz / 36 mV / 2 mV**); amp0 **channel 10** (minimize versus its 200 Hz manual); vanco **channel 6** (minimize versus its manual). Keep failures in amp0 exports. Do not claim a vanco lower-bound Kd is resolved saturation.
 
 ## 1. Do this now: verify one channel and save the results
 

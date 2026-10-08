@@ -232,6 +232,10 @@ st.session_state["marker_coloraxis"] = figure.data[0].marker.coloraxis
 
 def test_selected_runs_settings_have_their_own_fragment():
     from streamlit.testing.v1 import AppTest
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+    if not hasattr(get_script_run_ctx(), "current_fragment_id"):
+        pytest.skip("Installed Streamlit version does not expose fragment ids to AppTest.")
 
     plt.switch_backend("Agg")
     app = AppTest.from_string("""

@@ -487,6 +487,35 @@ def test_paper_figure_types_have_requested_linked_layouts():
     assert validation["bo_composer_paired_metric_2"] == "Peak prominence"
 
 
+def test_compact_sweep_comparison_presets_are_mirrored_and_directional():
+    observations = [
+        {"iteration": 1, "params": {"step_potential": 0.001}},
+        {"iteration": 2, "params": {"step_potential": 0.004}},
+        {"iteration": 3, "params": {"step_potential": 0.010}},
+    ]
+    normal = viewer._paper_parameter_sweep_comparison_preset(
+        observations, ["5"], ["5"], mirrored=False,
+    )["config"]["state"]
+    mirrored = viewer._paper_parameter_sweep_comparison_preset(
+        observations, ["5"], ["5"], mirrored=True,
+    )["config"]["state"]
+    assert normal["bo_composer_count"] == 6
+    assert normal["bo_composer_aspect"] == "ACS 1-col tall (3.3 x 7.0 in)"
+    assert viewer.COMPOSER_CANVAS_SIZES[normal["bo_composer_aspect"]] == (3.3, 7.0)
+    assert normal["bo_composer_type1_compact_linked_controls"] is True
+    assert normal["bo_composer_type1_compact_signal_on_iteration"] == 1
+    assert normal["bo_composer_type1_compact_signal_off_iteration"] == 3
+    assert normal["bo_composer_real_slice_values_3"] == [0.001, 0.01]
+    assert normal["bo_composer_kind_1"] == "SWV trace overlay"
+    assert normal["bo_composer_kind_2"] == "SWV trace overlay"
+    assert normal["bo_composer_border_color_1"] == "#d62728"
+    assert normal["bo_composer_border_color_2"] == "#17becf"
+    # Cubes and supporting panels swap sides, but their row geometry remains identical.
+    assert normal["bo_composer_left_0"] < normal["bo_composer_left_1"]
+    assert mirrored["bo_composer_left_0"] > mirrored["bo_composer_left_1"]
+    assert normal["bo_composer_bottom_0"] == mirrored["bo_composer_bottom_0"]
+
+
 def test_composer_global_trend_can_add_dashed_running_mean():
     import pandas as pd
     from matplotlib.figure import Figure

@@ -1976,6 +1976,57 @@ def _paper_composite_figure(
     return output
 
 
+def _paper_directional_titration_figure(
+    row_figures: List[List[Optional[plt.Figure]]],
+    shared_langmuir: Optional[plt.Figure],
+    *,
+    width: float = 10.0,
+    row_height: float = 2.6,
+    font_size: float = 8.0,
+    raster_dpi: int = 300,
+) -> plt.Figure:
+    """Two directional Type-3 rows plus one Langmuir panel spanning both rows."""
+    total_height = max(row_height * 2, 4.8) + .45
+    output = plt.figure(figsize=(width, total_height), facecolor="white")
+    grid = output.add_gridspec(
+        2, 4, width_ratios=(1, 1, 1, 1), wspace=.16, hspace=.18,
+        top=1 - .45 / total_height, bottom=.04, left=.04, right=.99,
+    )
+    targets = [
+        grid[0, 0], grid[0, 1], grid[0, 2], grid[1, 0], grid[1, 1], grid[1, 2],
+        grid[:, 3],
+    ]
+    sources = [
+        *(row_figures[0] if row_figures else [None, None, None]),
+        *(row_figures[1] if len(row_figures) > 1 else [None, None, None]),
+        shared_langmuir,
+    ]
+    cell_w, cell_h = width / 4 * .92, row_height * .92
+    for index, (slot, source) in enumerate(zip(targets, sources)):
+        axis = output.add_subplot(slot)
+        axis.set_axis_off()
+        if source is None:
+            axis.text(.5, .5, "No data", ha="center", va="center", fontsize=font_size)
+        else:
+            if not getattr(source, "_paper_prestyled", False):
+                source_height = cell_h * (2.0 if index == 6 else 1.0)
+                _paper_style_source(source, font_size, cell_w, source_height)
+            axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
+            plt.close(source)
+        axis.text(
+            -.02, 1.02, chr(ord("A") + index), transform=axis.transAxes,
+            ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
+        )
+    entries = _PAPER_LEGEND_STORE.get("entries") or {}
+    if entries:
+        output.legend(
+            list(entries.values()), list(entries), loc="upper center",
+            ncol=min(3, len(entries)), frameon=False, fontsize=max(4.5, font_size * .85),
+            bbox_to_anchor=(.5, 1.0), handlelength=1.8, columnspacing=1.4,
+        )
+    return output
+
+
 def _paper_figure_downloads(figure: plt.Figure, stem: str) -> None:
     png = io.BytesIO()
     pdf = io.BytesIO()
@@ -6522,24 +6573,36 @@ if view == "Paper Figures":
             "Run SWV analysis, enable titration intervals, and enable Langmuir fitting first."
         )
     else:
-        control_cols = st.columns(5)
-        paper_rows = int(control_cols[0].number_input(
-            "Comparison rows", 1, 6, value=1, key="paper_titration_rows"
-        ))
-        paper_font = float(control_cols[1].number_input(
+        figure_type = st.radio(
+            "Figure type",
+            [
+                "Type 3 - SWV and titration response",
+                "Type 3B - Signal-on/off shared Langmuir",
+                "Type 4 - Concentration validation",
+            ],
+            horizontal=True,
+            key="paper_titration_type",
+            help=(
+                "Type 3B creates two fixed rows (signal-on and signal-off) and one "
+                "shared optimized-only Langmuir panel spanning the fourth column."
+            ),
+        )
+        is_directional_type3 = figure_type.startswith("Type 3B")
+        control_cols = st.columns(4)
+        paper_font = float(control_cols[0].number_input(
             "Font size (pt)", 5.0, 14.0, value=8.0, step=.5,
             key="paper_titration_font",
         ))
-        paper_width = float(control_cols[2].number_input(
+        paper_width = float(control_cols[1].number_input(
             "Canvas width (in)", 6.0, 16.0, value=10.0, step=.5,
             key="paper_titration_width",
         ))
-        paper_raster_dpi = int(control_cols[3].number_input(
+        paper_raster_dpi = int(control_cols[2].number_input(
             "Panel raster DPI", 150, 600, value=300, step=50,
             key="paper_titration_raster_dpi",
             help="Resolution used inside the composite. Higher settings create larger exports.",
         ))
-        paper_trace_stride = int(control_cols[4].number_input(
+        paper_trace_stride = int(control_cols[3].number_input(
             "SWV trace stride", 1, 50, value=5, key="paper_titration_stride",
             help="1 plots every trace; larger values thin dense overlays without changing fits.",
         ))
@@ -6561,84 +6624,213 @@ if view == "Paper Figures":
             "Extra Type 3 columns", ["SNR by concentration", "Predicted vs known"],
             key="paper_titration_extra_columns",
             help="Appended after the Langmuir column for every comparison row.",
+            disabled=is_directional_type3,
         )
         physical_channels = sorted({
             row.get("original_channel", row.get("channel")) for row in titration_results
         }, key=_channel_display_sort_key)
         comparisons = []
-        for row_index in range(paper_rows):
-            with st.expander(f"Comparison row {row_index + 1}", expanded=True):
-                row_cols = st.columns([1, 2, 2, 1, 1])
-                physical = row_cols[0].selectbox(
-                    "Physical channel", physical_channels,
-                    key=f"paper_titration_physical_{row_index}",
+        paper_rows = 1
+        directional_selection = None
+        if is_directional_type3:
+            st.info(
+                "This layout always has two rows: manual vs optimized signal-on, then "
+                "manual vs optimized signal-off. The fourth column is one shared fit of "
+                "the two optimized methods only."
+            )
+            direction_cols = st.columns([1.2, 2.2, 2.2, 2.2])
+            physical = direction_cols[0].selectbox(
+                "Physical channel", physical_channels, key="paper_titration_directional_physical",
+            )
+            method_options = sorted({
+                row.get("channel") for row in titration_results
+                if str(row.get("original_channel", row.get("channel"))) == str(physical)
+            }, key=_channel_display_sort_key)
+            method_metadata = {}
+            directions = {}
+            for option in method_options:
+                first = next(row for row in titration_results if row.get("channel") == option)
+                directions[option] = str(first.get("swv_optimization_direction") or "manual/unresolved").lower()
+                method_metadata[option] = (
+                    f"{_swv_settings_channel_label(option)} | {directions[option]}"
                 )
-                method_options = sorted({
-                    row.get("channel") for row in titration_results
-                    if str(row.get("original_channel", row.get("channel"))) == str(physical)
-                }, key=_channel_display_sort_key)
-                if len(method_options) < 2:
-                    st.warning("This channel needs at least two detected SWV settings.")
-                    continue
-                method_metadata = {}
-                for option in method_options:
-                    first = next(row for row in titration_results if row.get("channel") == option)
-                    direction = str(first.get("swv_optimization_direction") or "manual/unresolved")
-                    method_metadata[option] = f"{_swv_settings_channel_label(option)} | {direction}"
-                optimized_default = next((
-                    index for index, option in enumerate(method_options)
-                    if str(next(
-                        row for row in titration_results if row.get("channel") == option
-                    ).get("swv_optimization_direction") or "").lower() in {"maximize", "minimize"}
-                ), 0)
-                optimized = row_cols[1].selectbox(
-                    "Optimized method", method_options,
-                    index=optimized_default,
-                    key=f"paper_titration_optimized_{row_index}",
-                    format_func=lambda option: method_metadata[option],
-                )
-                manual_candidates = [option for option in method_options if option != optimized]
-                manual_default = next((
-                    index for index, option in enumerate(manual_candidates)
-                    if (
-                        str(next(
-                            row for row in titration_results if row.get("channel") == option
-                        ).get("swv_optimization_direction") or "").lower() not in {"maximize", "minimize"}
-                        and ("200 Hz" in method_metadata[option] or "manual" in method_metadata[option].lower())
-                    )
-                ), 0)
-                manual = row_cols[2].selectbox(
-                    "Manual/reference method", manual_candidates,
-                    index=manual_default,
-                    key=f"paper_titration_manual_{row_index}",
-                    format_func=lambda option: method_metadata[option],
-                )
-                method_rows = [
-                    row for row in titration_results if row.get("channel") in {optimized, manual}
-                ]
-                scans = [float(row.get("scan_number")) for row in method_rows if row.get("scan_number") is not None]
-                scan_min, scan_max = (int(min(scans)), int(max(scans))) if scans else (1, 1)
-                start = int(row_cols[3].number_input(
+            on_default = next((i for i, item in enumerate(method_options) if directions[item] == "maximize"), 0)
+            signal_on = direction_cols[1].selectbox(
+                "Optimized signal-on method", method_options, index=on_default,
+                key="paper_titration_directional_on", format_func=lambda item: method_metadata[item],
+            )
+            off_candidates = [item for item in method_options if item != signal_on]
+            off_default = next((i for i, item in enumerate(off_candidates) if directions[item] == "minimize"), 0)
+            signal_off = direction_cols[2].selectbox(
+                "Optimized signal-off method", off_candidates, index=off_default,
+                key="paper_titration_directional_off", format_func=lambda item: method_metadata[item],
+            ) if off_candidates else None
+            manual_candidates = [item for item in off_candidates if item != signal_off]
+            manual_default = next((
+                i for i, item in enumerate(manual_candidates)
+                if directions[item] not in {"maximize", "minimize"}
+                and ("200 Hz" in method_metadata[item] or "manual" in method_metadata[item].lower())
+            ), 0)
+            manual = direction_cols[3].selectbox(
+                "Manual/reference method", manual_candidates, index=manual_default,
+                key="paper_titration_directional_manual", format_func=lambda item: method_metadata[item],
+            ) if manual_candidates else None
+            method_rows = [
+                row for row in titration_results if row.get("channel") in {signal_on, signal_off, manual}
+            ]
+            scans = [float(row.get("scan_number")) for row in method_rows if row.get("scan_number") is not None]
+            if signal_off is None or manual is None or not scans:
+                st.warning("Choose one distinct signal-on, signal-off, and manual method for this channel.")
+            else:
+                scan_min, scan_max = int(min(scans)), int(max(scans))
+                range_cols = st.columns(2)
+                start = int(range_cols[0].number_input(
                     "Display start", scan_min, scan_max, value=scan_min,
-                    key=f"paper_titration_start_{row_index}",
+                    key="paper_titration_directional_start",
                 ))
-                end = int(row_cols[4].number_input(
+                end = int(range_cols[1].number_input(
                     "Display end", scan_min, scan_max, value=scan_max,
-                    key=f"paper_titration_end_{row_index}",
+                    key="paper_titration_directional_end",
                 ))
-                if end < start:
-                    start, end = end, start
-                comparisons.append((physical, optimized, manual, (start, end)))
-
-        figure_type = st.radio(
-            "Figure type",
-            ["Type 3 - SWV and titration response", "Type 4 - Concentration validation"],
-            horizontal=True,
-            key="paper_titration_type",
-        )
-        if comparisons and st.button("Generate paper figure", type="primary", use_container_width=True):
+                directional_selection = (physical, signal_on, signal_off, manual, (min(start, end), max(start, end)))
+        else:
+            paper_rows = int(st.number_input(
+                "Comparison rows", 1, 6, value=1, key="paper_titration_rows"
+            ))
+            for row_index in range(paper_rows):
+                with st.expander(f"Comparison row {row_index + 1}", expanded=True):
+                    row_cols = st.columns([1, 2, 2, 1, 1])
+                    physical = row_cols[0].selectbox(
+                        "Physical channel", physical_channels,
+                        key=f"paper_titration_physical_{row_index}",
+                    )
+                    method_options = sorted({
+                        row.get("channel") for row in titration_results
+                        if str(row.get("original_channel", row.get("channel"))) == str(physical)
+                    }, key=_channel_display_sort_key)
+                    if len(method_options) < 2:
+                        st.warning("This channel needs at least two detected SWV settings.")
+                        continue
+                    method_metadata = {}
+                    for option in method_options:
+                        first = next(row for row in titration_results if row.get("channel") == option)
+                        direction = str(first.get("swv_optimization_direction") or "manual/unresolved")
+                        method_metadata[option] = f"{_swv_settings_channel_label(option)} | {direction}"
+                    optimized_default = next((
+                        index for index, option in enumerate(method_options)
+                        if str(next(row for row in titration_results if row.get("channel") == option).get(
+                            "swv_optimization_direction") or "").lower() in {"maximize", "minimize"}
+                    ), 0)
+                    optimized = row_cols[1].selectbox(
+                        "Optimized method", method_options, index=optimized_default,
+                        key=f"paper_titration_optimized_{row_index}",
+                        format_func=lambda option: method_metadata[option],
+                    )
+                    manual_candidates = [option for option in method_options if option != optimized]
+                    manual_default = next((
+                        index for index, option in enumerate(manual_candidates)
+                        if str(next(row for row in titration_results if row.get("channel") == option).get(
+                            "swv_optimization_direction") or "").lower() not in {"maximize", "minimize"}
+                        and ("200 Hz" in method_metadata[option] or "manual" in method_metadata[option].lower())
+                    ), 0)
+                    manual = row_cols[2].selectbox(
+                        "Manual/reference method", manual_candidates, index=manual_default,
+                        key=f"paper_titration_manual_{row_index}",
+                        format_func=lambda option: method_metadata[option],
+                    )
+                    method_rows = [row for row in titration_results if row.get("channel") in {optimized, manual}]
+                    scans = [float(row.get("scan_number")) for row in method_rows if row.get("scan_number") is not None]
+                    scan_min, scan_max = (int(min(scans)), int(max(scans))) if scans else (1, 1)
+                    start = int(row_cols[3].number_input(
+                        "Display start", scan_min, scan_max, value=scan_min,
+                        key=f"paper_titration_start_{row_index}",
+                    ))
+                    end = int(row_cols[4].number_input(
+                        "Display end", scan_min, scan_max, value=scan_max,
+                        key=f"paper_titration_end_{row_index}",
+                    ))
+                    comparisons.append((physical, optimized, manual, (min(start, end), max(start, end))))
+        can_generate = bool(directional_selection) if is_directional_type3 else bool(comparisons)
+        if can_generate and st.button("Generate paper figure", type="primary", use_container_width=True):
+            _PAPER_LEGEND_STORE.clear()
             panels: List[Optional[plt.Figure]] = []
-            if figure_type.startswith("Type 3"):
+            if is_directional_type3:
+                physical, signal_on, signal_off, manual, display_range = directional_selection
+                directional_colors = {
+                    manual: "#666666",
+                    signal_on: "#1f77b4",
+                    signal_off: "#d62728",
+                }
+
+                def directional_trace(method, direction_label, colormap):
+                    rows = [
+                        row for row in titration_results
+                        if row.get("channel") == method
+                        and display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1]
+                    ]
+                    title = f"Ch {physical} {direction_label} SWVs"
+                    if paper_swv_display == "Stacked (offset)":
+                        return _paper_stacked_traces(
+                            rows, y_key="smoothed_corrected_current", title=title,
+                            colormap_name=colormap, stride=paper_trace_stride,
+                            offset_fraction=paper_offset_fraction,
+                        )
+                    return plot_overlaid_traces(
+                        rows, y_key="smoothed_corrected_current", title=title,
+                        colormap_name=colormap, trace_modulo=paper_trace_stride,
+                    )
+
+                def directional_response(method, direction_label):
+                    return plot_metric_vs_scan(
+                        titration_results,
+                        metric="peak_current_selected",
+                        channels=[manual, method],
+                        title=f"Ch {physical} {direction_label} vs manual response",
+                        ylabel="Change in Peak Height (uA)",
+                        vlines=titration_active_vlines,
+                        scan_range=display_range,
+                        xlabel="SWV Measurement Number",
+                        channel_colors=directional_colors,
+                    )
+
+                row_figures = [
+                    [
+                        directional_trace(manual, "manual/reference", "Greys"),
+                        directional_trace(signal_on, "optimized signal-on", "Blues"),
+                        directional_response(signal_on, "signal-on"),
+                    ],
+                    [
+                        directional_trace(manual, "manual/reference", "Greys"),
+                        directional_trace(signal_off, "optimized signal-off", "Reds"),
+                        directional_response(signal_off, "signal-off"),
+                    ],
+                ]
+                shared_langmuir = plot_titration_langmuir(
+                    titration_results,
+                    metric="peak_current_selected",
+                    vlines=titration_active_vlines,
+                    channels=[signal_on, signal_off],
+                    vlines_by_channel=titration_vlines_by_channel,
+                    title=f"Ch {physical} optimized signal-on/off Langmuir response",
+                    ylabel="Peak Height (uA)",
+                    edge_trim_fraction=titration_edge_trim_fraction,
+                    concentration_unit=titration_concentration_unit,
+                    baseline_mode=titration_baseline_mode,
+                    included_step_labels=titration_included_step_labels,
+                    remove_extreme_outliers=remove_extreme_titration_outliers,
+                    show_lod=show_titration_lod,
+                    show_uloq=show_titration_uloq,
+                    response_directions=consistent_response_directions,
+                    channel_colors=directional_colors,
+                )
+                composite = _paper_directional_titration_figure(
+                    row_figures, shared_langmuir, width=paper_width,
+                    row_height=2.6, font_size=paper_font, raster_dpi=paper_raster_dpi,
+                )
+                st.session_state["paper_titration_render"] = (
+                    "type3_signal_on_off", composite, 2, paper_width, paper_font
+                )
+            elif figure_type.startswith("Type 3"):
                 for physical, optimized, manual, display_range in comparisons:
                     row_map = {
                         method: [

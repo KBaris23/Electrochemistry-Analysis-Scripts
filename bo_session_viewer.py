@@ -31850,6 +31850,122 @@ def _paper_parameter_sweep_preset(
     )
 
 
+def _paper_parameter_sweep_comparison_preset(
+    observations: Sequence[dict] = (),
+    real_channels: Sequence[str] = (),
+    trace_channels: Sequence[str] = (),
+    *,
+    mirrored: bool = False,
+) -> dict[str, Any]:
+    """Compact, half-page Type 1 for planar/nanoporous side-by-side figures.
+
+    The two traces are explicitly labelled signal-on and signal-off.  They are
+    still selected by observation number because a survey session does not
+    reliably encode a direction for every stored trace; the linked controls
+    make that scientific choice visible and keep the cube highlights in sync.
+    """
+    channels = list(map(str, real_channels))
+    trace_channels = list(map(str, trace_channels))
+    channel = trace_channels[0] if trace_channels else (channels[0] if channels else "1")
+    iteration_values = sorted({
+        int(obs.get("iteration")) for obs in observations if obs.get("iteration") is not None
+    })
+    on_iteration = iteration_values[0] if iteration_values else 1
+    off_iteration = iteration_values[-1] if iteration_values else on_iteration
+    step_values = sorted({
+        float((obs.get("params") or {}).get("step_potential"))
+        for obs in observations
+        if _finite_float((obs.get("params") or {}).get("step_potential")) is not None
+    })
+    if step_values:
+        indexes = np.linspace(0, len(step_values) - 1, min(2, len(step_values))).round().astype(int)
+        slices = list(dict.fromkeys(step_values[index] for index in indexes))
+    else:
+        slices = [0.001, 0.010]
+    while len(slices) < 2:
+        slices.append(slices[-1])
+
+    # Each half is a one-column, tall canvas.  The cube gets two thirds of the
+    # width and the two supporting panels share the remaining third.
+    if mirrored:
+        rects = [
+            (.35, .52, .61, .44), (.04, .75, .27, .21), (.04, .52, .27, .21),
+            (.35, .04, .61, .43), (.04, .27, .27, .20), (.04, .04, .27, .20),
+        ]
+    else:
+        rects = [
+            (.04, .52, .61, .44), (.69, .75, .27, .21), (.69, .52, .27, .21),
+            (.04, .04, .61, .43), (.69, .27, .27, .20), (.69, .04, .27, .20),
+        ]
+    kinds = (
+        "Measured 3D tensor", "SWV trace overlay", "SWV trace overlay",
+        "Measured 3D tensor", "Measured 2D map", "Measured 2D map",
+    )
+    extra: dict[str, Any] = {
+        "bo_composer_type1_compact_linked_controls": True,
+        "bo_composer_type1_compact_channel": channel,
+        "bo_composer_type1_compact_signal_on_iteration": on_iteration,
+        "bo_composer_type1_compact_signal_off_iteration": off_iteration,
+        "bo_composer_type1_compact_slice_values": list(dict.fromkeys(slices[:2])),
+        "bo_composer_real_highlight_iterations_0": [on_iteration, off_iteration],
+        "bo_composer_real_slice_values_3": slices[:2],
+    }
+    for index in (0, 3):
+        extra.update({
+            f"bo_composer_measured_metric_{index}": "Paired Q",
+            f"bo_composer_measured_phase_{index}": "target",
+            f"bo_composer_measured_channels_{index}": [channel],
+            f"bo_composer_measured_x_{index}": "step_potential",
+            f"bo_composer_measured_y_{index}": "amplitude",
+            f"bo_composer_measured_z_{index}": "frequency",
+            f"bo_composer_measured_dot_size_{index}": 9,
+            f"bo_composer_measured_dot_opacity_{index}": .72,
+            f"bo_composer_measured_iteration_path_{index}": False,
+            f"bo_composer_measured_cube_edges_{index}": True,
+        })
+    extra.update({
+        "bo_composer_trace_iteration_1": on_iteration,
+        "bo_composer_trace_iteration_2": off_iteration,
+        "bo_composer_trace_channels_1": [channel],
+        "bo_composer_trace_channels_2": [channel],
+        "bo_composer_trace_corrected_1": True,
+        "bo_composer_trace_corrected_2": True,
+        "bo_composer_trace_key_1": "smoothed_corrected_current",
+        "bo_composer_trace_key_2": "smoothed_corrected_current",
+        "bo_composer_border_on_1": True,
+        "bo_composer_border_on_2": True,
+        "bo_composer_border_color_1": "#d62728",
+        "bo_composer_border_color_2": "#17becf",
+    })
+    for offset, (map_index, slice_value) in enumerate(zip((4, 5), slices[:2])):
+        extra.update({
+            f"bo_composer_border_on_{map_index}": True,
+            f"bo_composer_border_color_{map_index}": to_hex(
+                _slice_highlight_color(offset, max(1, len(slices)))[0]
+            ),
+            f"bo_composer_real_metric_{map_index}": "Paired Q",
+            f"bo_composer_real_phase_{map_index}": "target",
+            f"bo_composer_real_channels_{map_index}": [channel],
+            f"bo_composer_real_x_{map_index}": "amplitude",
+            f"bo_composer_real_y_{map_index}": "frequency",
+            f"bo_composer_real_slice_axis_{map_index}": "step_potential",
+            f"bo_composer_real_slice_value_{map_index}": slice_value,
+            f"bo_composer_real_show_points_{map_index}": True,
+        })
+    name = (
+        "Type 1B - Sweep comparison (support left)"
+        if mirrored else "Type 1A - Sweep comparison (cube left)"
+    )
+    return _composer_builtin_preset(
+        name,
+        layout="Manual",
+        kinds=kinds,
+        rects=rects,
+        aspect="ACS 1-col tall (3.3 x 7.0 in)",
+        extra_state=extra,
+    )
+
+
 def _paper_bo_validation_preset() -> dict[str, Any]:
     """Five-panel BO validation/progression figure with linked optimizer data."""
     rects = [
@@ -33491,6 +33607,7 @@ COMPOSER_CANVAS_SIZES = {
     "ACS 2-col tall (7.0 x 8.5 in)": (7.0, 8.5),
     "ACS 2-col square (7.0 x 7.0 in)": (7.0, 7.0),
     "ACS 1-col (3.3 x 3.0 in)": (3.3, 3.0),
+    "ACS 1-col tall (3.3 x 7.0 in)": (3.3, 7.0),
 }
 
 _COMPOSER_JOURNAL_STYLE: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -34176,6 +34293,16 @@ def _render_figure_composer(
         saved_presets["Type 1 - Parameter sweep"] = _paper_parameter_sweep_preset(
             observations, real_channels, current_trace_channels,
         )
+        saved_presets["Type 1A - Sweep comparison (cube left)"] = (
+            _paper_parameter_sweep_comparison_preset(
+                observations, real_channels, current_trace_channels,
+            )
+        )
+        saved_presets["Type 1B - Sweep comparison (support left)"] = (
+            _paper_parameter_sweep_comparison_preset(
+                observations, real_channels, current_trace_channels, mirrored=True,
+            )
+        )
     else:
         saved_presets["Type 2 - BO validation"] = _paper_bo_validation_preset()
     saved_presets.update(_composer_load_presets())
@@ -34384,6 +34511,65 @@ def _render_figure_composer(
                 _slice_highlight_color(offset, max(1, len(map_slices)))[0]
             )
 
+    # The compact Type 1 variants use the same measured points and maps, but
+    # require explicit signal-on/signal-off trace choices and only two planes.
+    # This makes each one-column half independently usable in a side-by-side
+    # planar/nanoporous comparison while retaining provenance links.
+    if (
+        st.session_state.get("bo_composer_type1_compact_linked_controls")
+        and panel_count == 6
+    ):
+        iteration_options = sorted({
+            int(item.get("iteration")) for item in observations
+            if item.get("iteration") is not None
+        })
+        step_options = sorted({
+            float((item.get("params") or {}).get("step_potential"))
+            for item in observations
+            if _finite_float((item.get("params") or {}).get("step_potential")) is not None
+        })
+        st.caption(
+            "Compact Type 1 linked controls: choose the real signal-on and signal-off "
+            "observations. Their cube markers and framed SWVs stay synchronized; the "
+            "two selected step-size planes drive the matching maps."
+        )
+        link_cols = st.columns(4)
+        linked_channel = link_cols[0].selectbox(
+            "Shared channel",
+            current_trace_channels or real_channels,
+            key="bo_composer_type1_compact_channel",
+        )
+        on_iteration = link_cols[1].selectbox(
+            "Signal-on observation", iteration_options,
+            key="bo_composer_type1_compact_signal_on_iteration",
+        ) if iteration_options else None
+        off_iteration = link_cols[2].selectbox(
+            "Signal-off observation", iteration_options,
+            key="bo_composer_type1_compact_signal_off_iteration",
+        ) if iteration_options else None
+        linked_slices = link_cols[3].multiselect(
+            "Step-size planes", step_options, max_selections=2,
+            key="bo_composer_type1_compact_slice_values",
+        ) if step_options else []
+        if not linked_slices and step_options:
+            linked_slices = [step_options[0], step_options[-1]]
+        map_slices = (list(linked_slices) + [linked_slices[-1]] * 2)[:2] if linked_slices else []
+        highlighted = [value for value in (on_iteration, off_iteration) if value is not None]
+        st.session_state["bo_composer_real_highlight_iterations_0"] = highlighted
+        st.session_state["bo_composer_real_slice_values_3"] = map_slices
+        for index in (0, 3):
+            st.session_state[f"bo_composer_measured_channels_{index}"] = [linked_channel]
+        for index, iteration in zip((1, 2), (on_iteration, off_iteration)):
+            if iteration is not None:
+                st.session_state[f"bo_composer_trace_iteration_{index}"] = iteration
+            st.session_state[f"bo_composer_trace_channels_{index}"] = [linked_channel]
+        for offset, (index, slice_value) in enumerate(zip((4, 5), map_slices)):
+            st.session_state[f"bo_composer_real_channels_{index}"] = [linked_channel]
+            st.session_state[f"bo_composer_real_slice_value_{index}"] = slice_value
+            st.session_state[f"bo_composer_border_color_{index}"] = to_hex(
+                _slice_highlight_color(offset, max(1, len(map_slices)))[0]
+            )
+
     if preset == "Manual":
         manual_rects = _composer_manual_rects(panel_count)
         editor_result = _figure_layout_editor(
@@ -34441,7 +34627,7 @@ def _render_figure_composer(
         ):
             order_cols = st.columns([1, 1, 4])
             order_cols[0].button(
-                "← Earlier",
+                "<- Earlier",
                 key=f"bo_composer_move_earlier_{index}",
                 disabled=index == 0,
                 on_click=_composer_swap_panels,
@@ -34450,7 +34636,7 @@ def _render_figure_composer(
                 help="Move this panel one letter earlier.",
             )
             order_cols[1].button(
-                "Later →",
+                "Later ->",
                 key=f"bo_composer_move_later_{index}",
                 disabled=index >= panel_count - 1,
                 on_click=_composer_swap_panels,
