@@ -68,8 +68,40 @@ Other dataset claims (amp0 detectability rescue, vanco response strength, statio
 
 ## 4. Assemble figures only after section 1 passes
 
+### Current figure templates and the right workflow
+
+The app deliberately has two figure tools:
+
+- **BO Session → Figure Composer** builds Types 1 and 2. It has an **Edit panel** selector: choose A/B/C… to open that panel's plot type, data source, axes, colours, text, and layout settings. The layout canvas is for moving/resizing panels. It does not currently open a settings pane merely by clicking the rendered preview. Type 1 has intentionally linked channel/iteration/slice controls, so its highlighted cube points, SWV traces, planes, and maps cannot disagree.
+- **SWV → Paper Figures** builds Types 3 and 4 from a selected physical channel and two methods. It is a guided, reproducible template rather than a fully free-form panel editor: the row, methods, scan range, stack/overlay choice, font, width, and raster resolution are adjustable, but individual generated subpanels are not yet independently restyled. For fully individual titration panels, create/capture the underlying plots and use the Figure Composer.
+
+| Template | Where to open it | Use it for |
+|---|---|---|
+| Type 1 – Parameter sweep | BO Session, **survey** session only | setup-5 kanamycin landscape. The station-2 sweep can be supplementary, not a required main figure. |
+| Type 2 – BO validation | BO Session, BO experiment session | setup-5 kana, amp0, vanco, and optionally station-2 kana. |
+| Type 3 – SWV and titration response | SWV → Paper Figures | each selected physical channel: manual/reference vs one optimized method, traces + time course + Langmuir response. |
+| Type 4 – Concentration validation | SWV → Paper Figures | the same selected channel/method pair: concentration-by-measurement and predicted-vs-known. |
+
+### Recommended first-pass figure set
+
+1. **Kana setup 5 (main paper):** make all four types.
+   - **Type 1:** open the setup-5 survey session below. Use shared channel **5** for the main figure; make a second version with channel **3** only if it adds useful SI evidence. Keep four well-spaced, actually measured step-size planes (the default 1/4/7/10 mV-style choice is appropriate when present). Pick two real sampled iterations—one low-quality and one high-quality—and verify the displayed traces match the highlighted markers.
+   - **Type 2:** open the setup-5 BO session, select the group whose channel list contains **5**, and select **maximize**. Keep Q_run plus its 5-point dashed running mean and use the honest displayed metric label in the buffer/target panel. Do not enable display clipping for the first export.
+   - **Types 3 and 4:** analyze `titration_only\kana_try`; use physical channel **5**. Select optimized-ON (500 Hz, 40 mV, 2 mV) against the 200 Hz/36 mV/2 mV manual method. Make a separate optimized-OFF-versus-manual version only if it strengthens the SI story.
+2. **Amp0 (SI):** make Types 2–4, not Type 1. For Type 2 choose the group containing channel **10** and **minimize**. For Types 3/4 analyze `titration_only\amp0`, select physical channel **10**, then select the method labelled **minimize** and the 200 Hz manual/reference method. Preserve failed scans: the point is detectability rescue, not a falsely clean calibration.
+3. **Vancomycin (SI):** make Types 2–4, not Type 1. For Type 2 choose the group containing channel **6** and **minimize** (channel 2 or 10 can be a documented alternative). For Types 3/4 analyze `titration_only\vanco`, use that same physical channel, the method labelled **minimize**, and its manual/reference method. Treat a lower-bound Kd or weak saturation as an uncertainty, not a fitted result to optimize visually.
+4. **Kana station 2 (replicate/SI):** Type 2 is useful; Types 3/4 are optional after the main set. Choose the group containing channel **10**, **maximize**, and then channel 10 in `titration_only\kana_st2`. Do not reuse setup-5 crop or acceptance settings.
+
+### Formatting defaults
+
+- Types 1 and 2 load as 7 × 7 in ACS two-column square figures, Arial 7 pt, 9 pt panel letters, journal styling, and 600 DPI. Leave those settings unchanged for the first render. Use **Edit panel** to change a single panel; use **Expand all panel settings** only for a final audit.
+- For Type 1, use the shared controls, not per-panel overrides: choose one channel, two highlighted iterations, and up to four real step-size planes. The colour frames are intended to identify these links.
+- For Type 2, retain the 5-point Q_run running mean; choose a channel-specific group and correct direction before rendering. If peak prominence has extreme values, inspect them rather than clipping them away.
+- For Type 3, start with one comparison row, 7.0 in width, 7–8 pt font, 300 DPI, and no optional columns. Use stacked traces only when temporal progression matters; otherwise use overlays. Add SNR or predicted-vs-known only in the SI.
+- For Type 4, use the same row/method choice as Type 3, 7.0 in width, 8 pt font, and 300 DPI. The predicted-versus-known diagnostic uses data also used to fit the calibration, so it is descriptive rather than external validation.
+
 1. **Main titration figure:** start with four panels: full-width channel-5 time course; three-method Langmuir response; optimized-ON SWV overlay; manual SWV overlay. Put OFF overlays, SNR, inverse-calibration diagnostics, and the all-channel table in SI. Keep the low-dose time course visible; omit equilibration only from the stated fit/statistics selection. A shared overlay colorbar requires the same limits and coordinate definition; otherwise keep clearly labeled separate bars.
-2. **Composer workaround:** save the two Metrics plots first, then capture them. Visit Overlays, save/capture the ON and manual overlays. Switch to BO Session and use a manual four-panel layout, assigning each captured plot by its label. Avoid relying on the seven-panel preset's capture order. Verify all four sources and render at final size. Save PNG/PDF plus the available metadata/portable export. A PNG or JSON config alone does not guarantee restoration of in-memory editable captures in a fresh browser session.
+2. **Composer workflow:** use the guided Type 3 template for a reproducible two-method comparison, or capture individual Metrics/Overlays plots and use a manual Composer layout when every titration subpanel needs independent styling. Verify all sources and render at final size. Save PNG/PDF plus the available metadata/portable export. A PNG or JSON config alone does not guarantee restoration of in-memory editable captures in a fresh browser session.
 3. **Main BO figure:** open setup-5 session below; select Group 5 and maximize. Start with Q_run/best-so-far, phase metric with its honest label, and selected buffer/target traces. Add either parameter parallel coordinates or a 3D view only if informative. Set clipping off. Export minimize separately if showing the signal-off optimization. Verify any claimed optimum within the exact group/direction; do not substitute another group's global maximum.
 4. **Landscape:** open setup-5 sweep below. Explicitly choose channels 3 and 5 in each panel. Use paired Q if available and appropriate, and confirm colorbar labels. Set step slices explicitly to **0.001, 0.004, 0.007 V**, documenting slice tolerance/interpolation and showing sampled points. Use common color limits for directly comparable maps. Identify best/worst observations from the selected channel's history and verify the trace filename, iteration, phase, and waveform. Normalizing the same trace is not a best/worst comparison. Interpolated smooth maps are not additional measured data.
 5. **Other datasets:** repeat section 1 with each exact snapshot, saving separate bundles. Use kana station 2 as a replicate with its different crop; amp0 and vanco as secondary results. Use minimize for the proposed amp0/vanco signal-off BO panels. Report unsuccessful channels and uncertain/nonsaturating fits alongside selected illustrations.

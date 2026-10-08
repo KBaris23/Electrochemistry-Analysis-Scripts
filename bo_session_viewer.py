@@ -33999,10 +33999,40 @@ def _render_figure_composer(
         rects = manual_rects
     else:
         rects = _composer_layout_rects(panel_count, preset)
+    # Keep complex multi-panel presets manageable: all controls remain
+    # available, but normal use focuses on one clearly named panel at a time.
+    panel_indices = list(range(panel_count))
+    active_panel_key = "bo_composer_active_panel"
+    if st.session_state.get(active_panel_key) not in panel_indices:
+        st.session_state[active_panel_key] = 0
+    panel_nav, panel_nav_help = st.columns([2.4, 3.6])
+    active_panel = int(panel_nav.selectbox(
+        "Edit panel",
+        panel_indices,
+        format_func=lambda index: f"Panel {chr(ord('A') + index)}",
+        key=active_panel_key,
+        help=(
+            "Choose the subpanel whose data and formatting you want to edit. "
+            "The selected panel opens below; use Expand all only for bulk review."
+        ),
+    ))
+    expand_all_panels = panel_nav_help.checkbox(
+        "Expand all panel settings",
+        value=False,
+        key="bo_composer_expand_all_panels",
+        help="Useful for a final audit; leave off while editing one panel at a time.",
+    )
+    panel_nav_help.caption(
+        "The layout canvas changes panel position and size. Use Edit panel to change "
+        "that panel's plot type, source data, axes, colours, and display options."
+    )
     specs = []
     for index in range(panel_count):
         default_rect = rects[index] if rects else (.07, .10, .40, .35)
-        with st.expander(f"Panel {chr(ord('A') + index)}", expanded=index < 4):
+        with st.expander(
+            f"Panel {chr(ord('A') + index)}",
+            expanded=bool(expand_all_panels or index == active_panel),
+        ):
             order_cols = st.columns([1, 1, 4])
             order_cols[0].button(
                 "← Earlier",
