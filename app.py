@@ -1777,7 +1777,7 @@ def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cel
         pass
 
 
-def _paper_figure_image(source: plt.Figure, dpi: int = 220) -> np.ndarray:
+def _paper_figure_image(source: plt.Figure, dpi: int = 300) -> np.ndarray:
     buffer = io.BytesIO()
     source.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
     buffer.seek(0)
@@ -1789,6 +1789,7 @@ def _paper_stack_vertically(
     font_size: float,
     cell_w: float,
     cell_h: float,
+    raster_dpi: int = 300,
 ) -> Optional[plt.Figure]:
     """Two or more figures sharing one grid cell, stacked top to bottom."""
     usable = [figure for figure in figures if figure is not None]
@@ -1797,7 +1798,7 @@ def _paper_stack_vertically(
     images = []
     for figure in usable:
         _paper_style_source(figure, font_size, cell_w, cell_h / len(usable))
-        images.append(_paper_figure_image(figure))
+        images.append(_paper_figure_image(figure, dpi=raster_dpi))
         plt.close(figure)
     width = max(image.shape[1] for image in images)
     padded = []
@@ -1807,7 +1808,9 @@ def _paper_stack_vertically(
             image, ((0, 0), (pad // 2, pad - pad // 2), (0, 0)), constant_values=1.0,
         ))
     stacked = np.vstack(padded)
-    output = plt.figure(figsize=(stacked.shape[1] / 220.0, stacked.shape[0] / 220.0))
+    output = plt.figure(
+        figsize=(stacked.shape[1] / raster_dpi, stacked.shape[0] / raster_dpi)
+    )
     axis = output.add_axes([0, 0, 1, 1])
     axis.imshow(stacked)
     axis.set_axis_off()
@@ -1878,6 +1881,7 @@ def _paper_composite_figure(
     row_height: float = 2.8,
     font_size: float = 8.0,
     restyle: bool = True,
+    raster_dpi: int = 300,
 ) -> plt.Figure:
     """Arrange existing analysis figures into a consistently labelled paper grid.
 
@@ -1900,7 +1904,7 @@ def _paper_composite_figure(
         else:
             if restyle and not getattr(source, "_paper_prestyled", False):
                 _paper_style_source(source, font_size, cell_w, cell_h)
-            axis.imshow(_paper_figure_image(source))
+            axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
             plt.close(source)
         axis.text(
             -.02, 1.02, chr(ord("A") + index), transform=axis.transAxes,
@@ -6418,7 +6422,7 @@ if view == "Paper Figures":
             "Run SWV analysis, enable titration intervals, and enable Langmuir fitting first."
         )
     else:
-        control_cols = st.columns(4)
+        control_cols = st.columns(5)
         paper_rows = int(control_cols[0].number_input(
             "Comparison rows", 1, 6, value=1, key="paper_titration_rows"
         ))
@@ -6430,7 +6434,12 @@ if view == "Paper Figures":
             "Canvas width (in)", 6.0, 16.0, value=10.0, step=.5,
             key="paper_titration_width",
         ))
-        paper_trace_stride = int(control_cols[3].number_input(
+        paper_raster_dpi = int(control_cols[3].number_input(
+            "Panel raster DPI", 150, 600, value=300, step=50,
+            key="paper_titration_raster_dpi",
+            help="Resolution used inside the composite. Higher settings create larger exports.",
+        ))
+        paper_trace_stride = int(control_cols[4].number_input(
             "SWV trace stride", 1, 50, value=5, key="paper_titration_stride",
             help="1 plots every trace; larger values thin dense overlays without changing fits.",
         ))
@@ -6577,6 +6586,7 @@ if view == "Paper Figures":
                                 response_panel([manual], f"Ch {physical} manual response"),
                             ],
                             paper_font, paper_width / (4 + len(paper_extra_columns)) * 0.92, 2.6 * 0.92,
+                            raster_dpi=paper_raster_dpi,
                         )
                         panels.append(stacked_response)
                     else:
@@ -6652,6 +6662,7 @@ if view == "Paper Figures":
                 composite = _paper_composite_figure(
                     panels, len(comparisons), 4 + len(paper_extra_columns),
                     width=paper_width, row_height=2.6, font_size=paper_font,
+                    raster_dpi=paper_raster_dpi,
                 )
                 st.session_state["paper_titration_render"] = (
                     "type3", composite, paper_rows, paper_width, paper_font
@@ -6701,6 +6712,7 @@ if view == "Paper Figures":
                                 ),
                             ],
                             paper_font, paper_width / 2 * 0.92, 3.1 * 0.92,
+                            raster_dpi=paper_raster_dpi,
                         ))
                     else:
                         panels.append(concentration_panel(
@@ -6718,6 +6730,7 @@ if view == "Paper Figures":
                 composite = _paper_composite_figure(
                     panels, len(comparisons), 2, width=paper_width,
                     row_height=3.1, font_size=paper_font,
+                    raster_dpi=paper_raster_dpi,
                 )
                 st.session_state["paper_titration_render"] = (
                     "type4", composite, paper_rows, paper_width, paper_font
