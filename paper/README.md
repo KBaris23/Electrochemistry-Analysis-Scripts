@@ -2,7 +2,7 @@
 
 Updated 8 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage/data-audit instructions. Raw data remain in `C:\TEMP\BO`. Start with the exact runbook below; the remaining sections explain the assessment and later work.
 
-## 0. Start here: BO first
+## 0. Start here: planar-kana sweep first
 
 ### Paper figure scope
 
@@ -27,9 +27,34 @@ In other words: make the parameter-sweep figure only for planar kana; make titra
    Alternatively, double-click `Open_SWV_App.cmd`. Wait for the browser tab at `http://localhost:8501`.
 2. To save work later, open **Saved analysis sessions** in the sidebar, enter **Save as**, optionally include the derived cache, and click **Save**. Raw CSVs are not copied; reopen through the same expander with **Saved session -> Open**.
 
-### 0.2 Figure A — BO validation (Type 2 or Type 2A)
+### 0.2 Figure A — Parameter-sweep landscape or comparison (Type 1, 1A, or 1B)
 
-Use this figure to show that BO explored parameter space and improved/selected waveform quality. It is the first figure to make because it uses the saved BO session directly—**no snapshot is needed**.
+Use this only for a **survey/parameter-sweep** session, not an optimization session.
+
+1. Choose **Analysis mode -> BO Session** and paste:
+   `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\parameter_sweep_20260921_110003\bo_sessions\bo_111904_a0d8ad`
+2. Open **Figure Composer -> Load a preset or saved figure**.
+3. Pick one template:
+   - **Type 1:** full 8-panel, 7 × 7 in standalone landscape.
+   - **Type 1A:** 3.3 × 7 in comparison half with the cube on the left.
+   - **Type 1B:** mirrored Type 1A with support panels on the left.
+4. For Type 1A/1B, use **Compact Type 1 linked controls**: choose one channel, then choose the real signal-on and signal-off observations and two measured step-size planes. The highlights, framed SWVs, planes, and maps stay linked.
+5. Use Type 1A plus Type 1B only when you have two genuinely comparable sweep datasets (for example planar and nanoporous). Do not label arbitrary survey observations as signal-on/off without checking their files/settings.
+
+```text
+Type 1A                         Type 1B
+┌──────────────┬────┐           ┌────┬──────────────┐
+│ A cube       │ B ON│           │B ON│       A cube │
+│              ├────┤           ├────┤              │
+│              │ C OFF│          │C OFF│             │
+├──────────────┼────┤           ├────┼──────────────┤
+│ D cube/slices│ E/F│           │ E/F│D cube/slices │
+└──────────────┴────┘           └────┴──────────────┘
+```
+
+### 0.3 Figure B — BO validation (Type 2 or Type 2A)
+
+Use this figure to show that BO explored parameter space and improved/selected waveform quality. It uses the saved BO session directly—**no snapshot is needed**.
 
 1. Choose **Analysis mode -> BO Session** and paste the appropriate session path below.
 2. Choose the listed channel group and optimization direction.
@@ -53,31 +78,6 @@ Type 2                         Type 2A (focused)
 ├─────────┼───────┤            └──────────────┴───────┘
 │ D stack │ E ||| │
 └─────────┴───────┘
-```
-
-### 0.3 Figure B — Parameter-sweep landscape or comparison (Type 1, 1A, or 1B)
-
-Use this only for a **survey/parameter-sweep** session, not an optimization session.
-
-1. Choose **Analysis mode -> BO Session** and paste:
-   `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\parameter_sweep_20260921_110003\bo_sessions\bo_111904_a0d8ad`
-2. Open **Figure Composer -> Load a preset or saved figure**.
-3. Pick one template:
-   - **Type 1:** full 8-panel, 7 × 7 in standalone landscape.
-   - **Type 1A:** 3.3 × 7 in comparison half with the cube on the left.
-   - **Type 1B:** mirrored Type 1A with support panels on the left.
-4. For Type 1A/1B, use **Compact Type 1 linked controls**: choose one channel, then choose the real signal-on and signal-off observations and two measured step-size planes. The highlights, framed SWVs, planes, and maps stay linked.
-5. Use Type 1A plus Type 1B only when you have two genuinely comparable sweep datasets (for example planar and nanoporous). Do not label arbitrary survey observations as signal-on/off without checking their files/settings.
-
-```text
-Type 1A                         Type 1B
-┌──────────────┬────┐           ┌────┬──────────────┐
-│ A cube       │ B ON│           │B ON│       A cube │
-│              ├────┤           ├────┤              │
-│              │ C OFF│          │C OFF│             │
-├──────────────┼────┤           ├────┼──────────────┤
-│ D cube/slices│ E/F│           │ E/F│D cube/slices │
-└──────────────┴────┘           └────┴──────────────┘
 ```
 
 ### 0.4 Figure C — Titration response (Type 3 or Type 3B)
