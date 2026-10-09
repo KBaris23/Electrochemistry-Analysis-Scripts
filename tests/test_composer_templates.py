@@ -180,6 +180,22 @@ def test_loading_preset_keeps_explicit_capture_ids(monkeypatch):
     assert session["bo_composer_capture_id_1"] == "a"
 
 
+def test_replacing_capture_preserves_layout_at_panel_capacity(monkeypatch):
+    state = {"bo_composer_count":12, "bo_composer_left_2":.42,
+             "bo_composer_text_size_2":9, "bo_composer_type1_linked_controls":True}
+    monkeypatch.setattr(viewer.st, "session_state", state)
+    capture = viewer._queue_plot_for_composer(
+        b"preview", label="replacement", file_stem="replacement",
+        figure=None, replace_index=2,
+    )
+    assert state["bo_composer_count"] == 12
+    assert state["bo_composer_left_2"] == .42
+    assert state["bo_composer_text_size_2"] == 9
+    assert state["bo_composer_capture_id_2"] == capture
+    assert not state.get("bo_composer_pending_captures")
+    assert state["bo_composer_type1_linked_controls"] is False
+
+
 def test_captured_matplotlib_plot_defaults_report_axis_limits_and_apply_window():
     from matplotlib.figure import Figure
 
@@ -522,7 +538,7 @@ def test_paper_figure_types_have_requested_linked_layouts():
     assert [focused[f"bo_composer_kind_{i}"] for i in range(3)] == [
         "Measured 3D tensor", "Global trend", "Buffer/target trend",
     ]
-    assert focused["bo_composer_aspect"] == "ACS 2-col (7.0 x 5.25 in)"
+    assert focused["bo_composer_aspect"] == "16:9"
     assert focused["bo_composer_global_running_mean_1"] == 5
 
 
@@ -539,8 +555,8 @@ def test_compact_sweep_comparison_presets_are_mirrored_and_directional():
         observations, ["5"], ["5"], mirrored=True,
     )["config"]["state"]
     assert normal["bo_composer_count"] == 6
-    assert normal["bo_composer_aspect"] == "ACS 1-col tall (3.3 x 7.0 in)"
-    assert viewer.COMPOSER_CANVAS_SIZES[normal["bo_composer_aspect"]] == (3.3, 7.0)
+    assert normal["bo_composer_aspect"] == "Sweep workspace (9 x 10 in)"
+    assert viewer.COMPOSER_CANVAS_SIZES[normal["bo_composer_aspect"]] == (9.0, 10.0)
     assert normal["bo_composer_type1_compact_linked_controls"] is True
     assert normal["bo_composer_type1_compact_signal_on_iteration"] == 1
     assert normal["bo_composer_type1_compact_signal_off_iteration"] == 3
@@ -601,9 +617,58 @@ def test_compact_colorbar_stays_inside_left_of_scene():
     ))
     figure.update_layout(scene={"domain": {"x": [0.1, 0.9], "y": [0, 1]}})
     viewer._composer_place_plotly_colorbars(figure, "left")
-    assert figure.data[0].marker.colorbar.x == pytest.approx(.075)
+    assert figure.data[0].marker.colorbar.x == pytest.approx(.15)
     assert figure.data[0].marker.colorbar.thickness == 10
     assert figure.layout.scene.domain.x[0] == pytest.approx(.18)
+
+
+def test_composer_export_does_not_create_colorbars_for_cube_helpers(monkeypatch):
+    import plotly.graph_objects as go
+    figure = go.Figure([
+        go.Scatter3d(x=[0, 1], y=[0, 1], z=[0, 1],
+                     marker={"color": [-2, 8], "showscale": True}),
+        go.Scatter3d(x=[0], y=[0], z=[0], marker={"color": "red"}),
+        go.Scatter3d(x=[0, 1], y=[0, 1], z=[0, 1], mode="lines", name="Cube edges"),
+    ])
+    captured = []
+    def image_stub(self, **kwargs):
+        captured.append(self)
+        return b"png"
+    monkeypatch.setattr(go.Figure, "to_image", image_stub)
+    viewer._plotly_png_bytes(figure, text_size=10, composer_colorbar_side="left")
+    assert captured[0].data[0].marker.showscale is True
+    assert all(t.marker.showscale is False for t in captured[0].data[1:])
+
+
+def test_bo_trace_settings_retain_saved_acceptance_windows():
+    settings = {"crop_min_v": -.55, "smooth_window": 15,
+                "peak_voltage_min_v": -.45, "require_local_minima_on_both_sides": True}
+    resolved = viewer._bo_analysis_settings({"analysis": settings})
+    assert all(resolved[k] == value for k, value in settings.items())
+
+
+def test_publication_cube_has_one_scale_and_millivolt_step_ticks(monkeypatch):
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    points = pd.DataFrame({
+        "step_potential": [.001, .010], "amplitude": [.01, .20],
+        "frequency": [10, 500], "value": [-4, 8], "iteration": [1, 2],
+    })
+    monkeypatch.setattr(viewer, "_composer_real_points", lambda *args: points)
+    figure = plt.figure()
+    try:
+        slot = figure.add_axes([.05,.05,.9,.9])
+        cube = viewer._composer_draw_cube(figure, slot, {
+            "rect": [.05,.05,.9,.9], "x": "step_potential", "y": "amplitude",
+            "z": "frequency", "metric": "Paired Q",
+        }, [])
+        assert len(figure.axes) == 2
+        assert cube.get_xlabel() == "Step size (mV)"
+        assert list(cube.get_xticks()) == [1,4,7,10]
+        assert all(not axis.pane.get_fill() for axis in (cube.xaxis,cube.yaxis,cube.zaxis))
+        figure.canvas.draw()
+    finally:
+        plt.close(figure)
 
 
 def test_composer_global_trend_can_add_dashed_running_mean():
@@ -671,7 +736,7 @@ def test_sweep_and_validation_presets_use_square_canvas_and_linked_borders():
     colours = [sweep[f"bo_composer_border_color_{i}"] for i in range(4, 8)]
     assert len(set(colours)) == 4
     validation = viewer._paper_bo_validation_preset()["config"]["state"]
-    assert validation["bo_composer_aspect"] == "ACS 2-col square (7.0 x 7.0 in)"
+    assert validation["bo_composer_aspect"] == "4:3"
     # "Iteration" is drawn automatically as the first parallel-coordinates axis.
     assert "iteration" not in validation["bo_composer_measured_parallel_params_4"]
 

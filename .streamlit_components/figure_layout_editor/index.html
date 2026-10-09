@@ -18,7 +18,8 @@
       display: flex;
       align-items: center;
       gap: 9px;
-      height: 32px;
+      min-height: 32px;
+      flex-wrap: wrap;
       color: #4b5563;
       font-size: 13px;
     }
@@ -160,7 +161,21 @@
     <button id="delete-selected" type="button" disabled>Delete selected</button>
     <button id="apply-layout" type="button" disabled>Apply layout</button>
   </div>
-  <div id="canvas"></div>
+  <div id="viewport" style="max-height:850px;overflow:auto;border:1px solid #e5e7eb">
+    <div id="canvas"></div>
+  </div>
+  <div id="edit-tools" style="display:flex;flex-wrap:wrap;gap:8px;padding:8px 0;font-size:12px">
+    <label><input id="snap" type="checkbox" checked> Snap</label>
+    <label>Workspace zoom <select id="workspace-zoom"><option value=".75">75%</option><option value="1" selected>Fit</option><option value="1.25">125%</option><option value="1.5">150%</option><option value="2">200%</option></select></label>
+    <label>Grid <select id="grid"><option value=".01">1%</option><option value=".025">2.5%</option><option value=".05" selected>5%</option></select></label>
+    <button id="square">Make square</button>
+    <button id="copy">Copy panels</button><button id="paste">Paste panels</button>
+    <label>X % <input id="pos-x" type="number" min="0" max="95" step=".5" style="width:55px"></label>
+    <label>Y % <input id="pos-y" type="number" min="0" max="95" step=".5" style="width:55px"></label>
+    <label>Width % <input id="pos-w" type="number" min="5" max="100" step=".5" style="width:55px"></label>
+    <label>Height % <input id="pos-h" type="number" min="5" max="100" step=".5" style="width:55px"></label>
+    <span>Y is measured from the bottom. Apply layout to save changes.</span>
+  </div>
   <div id="context-menu">
     <button data-command="left">Align left edges</button>
     <button data-command="hcenter">Align horizontal centers</button>
@@ -192,6 +207,44 @@
     let contextAnchor = null;
     let dirty = false;
     let lastInputSignature = "";
+    let clipboard = [];
+    const snapped = value => document.getElementById("snap").checked
+      ? Math.round(value / Number(document.getElementById("grid").value)) * Number(document.getElementById("grid").value)
+      : value;
+    function copyPanels() {
+      clipboard = [...selected];
+      status.textContent = clipboard.length + " panel(s) copied";
+    }
+    function pastePanels() {
+      if (!clipboard.length) return;
+      setComponentValue({event_id: Date.now() + "-paste", rects,
+        duplicate_indices: clipboard.filter(i => i < rects.length)});
+    }
+    document.getElementById("copy").onclick = copyPanels;
+    document.getElementById("paste").onclick = pastePanels;
+    document.getElementById("square").onclick = () => {
+      selected.forEach(i => {
+        const r = rects[i];
+        const h = Math.min(r[2] * aspectRatio(args.aspect), 1 - r[1]);
+        rects[i] = normalizedRect([r[0], r[1], h / aspectRatio(args.aspect), h]);
+      });
+      draw(); markDirty("square size pending");
+    };
+    ["x", "y", "w", "h"].forEach((key, axis) => {
+      document.getElementById("pos-" + key).onchange = event => {
+        if (!Number.isFinite(event.target.valueAsNumber)) return;
+        selected.forEach(i => {
+          rects[i][axis] = event.target.valueAsNumber / 100;
+          rects[i] = normalizedRect(rects[i]);
+        });
+        draw(); markDirty("dimensions pending");
+      };
+    });
+    document.getElementById("grid").onchange = () => {
+      const percent = Number(document.getElementById("grid").value) * 100;
+      canvas.style.backgroundSize = percent + "% " + percent + "%";
+    };
+    document.getElementById("workspace-zoom").onchange = () => { sizeCanvas(); draw(); };
 
     function streamlitMessage(type, data = {}) {
       window.parent.postMessage({isStreamlitMessage: true, type, ...data}, "*");
@@ -217,6 +270,7 @@
       streamlitMessage("streamlit:setComponentValue", {value});
     }
     function aspectRatio(name) {
+      if (name === "Sweep workspace (9 x 10 in)") return 9 / 10;
       if (name === "16:9") return 16 / 9;
       if (name === "1:1") return 1;
       if (name === "Letter") return 8.5 / 11;
@@ -244,11 +298,12 @@
     function sizeCanvas() {
       const ratio = aspectRatio(args.aspect);
       const availableWidth = Math.max(280, window.innerWidth - 4);
-      const height = Math.min(620, availableWidth / ratio);
+      const zoom = Number(document.getElementById("workspace-zoom").value);
+      const height = Math.min(800, availableWidth / ratio) * zoom;
       const width = height * ratio;
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
-      setFrameHeight(Math.ceil(height + 38));
+      setFrameHeight(Math.ceil(Math.min(850,height) + document.getElementById("toolbar").offsetHeight + document.getElementById("edit-tools").offsetHeight + 18));
     }
     function updatePanel(element, rect) {
       element.style.left = `${rect[0] * 100}%`;
@@ -266,6 +321,12 @@
       });
       selectionCount.textContent = selected.size > 1 ? `${selected.size} panels selected` : "";
       deleteButton.disabled = selected.size === 0;
+      const first = rects[[...selected][0]];
+      ["x", "y", "w", "h"].forEach((key, axis) => {
+        const input = document.getElementById("pos-" + key);
+        input.disabled = !first;
+        input.value = first ? rounded(first[axis] * 100) : "";
+      });
     }
     function draw() {
       canvas.replaceChildren();
@@ -274,7 +335,20 @@
         const panel = document.createElement("div");
         panel.className = "panel";
         panel.dataset.index = String(index);
-        panel.innerHTML = `<span class="label"></span><span class="dimensions"></span><span class="resize-handle" title="Drag to resize"></span>`;
+        panel.innerHTML = '<span class="label"></span><span class="dimensions"></span>';
+        ["nw", "n", "ne", "e", "se", "s", "sw", "w"].forEach(dir => {
+          const handle = document.createElement("span");
+          handle.className = "resize-handle";
+          handle.dataset.direction = dir;
+          handle.title = "Resize " + dir;
+          Object.assign(handle.style, {
+            width: "10px", height: "10px", right: "auto", bottom: "auto",
+            left: dir.includes("w") ? "-5px" : dir.includes("e") ? "calc(100% - 5px)" : "calc(50% - 5px)",
+            top: dir.includes("n") ? "-5px" : dir.includes("s") ? "calc(100% - 5px)" : "calc(50% - 5px)",
+            cursor: dir + "-resize"
+          });
+          panel.appendChild(handle);
+        });
         panel.querySelector(".label").textContent = (args.labels || [])[index] || String(index + 1);
         panel.title = "Drag to move; Ctrl/Cmd-click to select; right-click to align";
         updatePanel(panel, rect);
@@ -310,6 +384,7 @@
         index,
         indices,
         mode,
+        direction: event.target.dataset.direction,
         startX: event.clientX,
         startY: event.clientY,
         startRects: new Map(indices.map(item => [item, [...rects[item]]])),
@@ -327,6 +402,8 @@
       let bottomDelta = -(event.clientY - gesture.startY) / canvas.clientHeight;
       if (gesture.mode === "move") {
         const starts = [...gesture.startRects.values()];
+        dx = snapped(starts[0][0] + dx) - starts[0][0];
+        bottomDelta = snapped(starts[0][1] + bottomDelta) - starts[0][1];
         dx = clamp(
           dx,
           -Math.min(...starts.map(rect => rect[0])),
@@ -344,10 +421,14 @@
         });
       } else {
         const start = gesture.startRects.get(gesture.index);
-        const top = start[1] + start[3];
-        const width = clamp(start[2] + dx, .05, 1 - start[0]);
-        const bottom = clamp(start[1] + bottomDelta, 0, top - .05);
-        rects[gesture.index] = normalizedRect([start[0], bottom, width, top - bottom]);
+        let [left, bottom, width, height] = start;
+        let right = left + width, top = bottom + height;
+        const dir = gesture.direction;
+        if (dir.includes("w")) left = clamp(snapped(left + dx), 0, right - .05);
+        if (dir.includes("e")) right = clamp(snapped(right + dx), left + .05, 1);
+        if (dir.includes("s")) bottom = clamp(snapped(bottom + bottomDelta), 0, top - .05);
+        if (dir.includes("n")) top = clamp(snapped(top + bottomDelta), bottom + .05, 1);
+        rects[gesture.index] = normalizedRect([left, bottom, right - left, top - bottom]);
         updatePanel(gesture.panel, rects[gesture.index]);
       }
     }
@@ -360,6 +441,10 @@
       finished.panel.removeEventListener("pointerup", endGesture);
       finished.panel.removeEventListener("pointercancel", endGesture);
       gesture = null;
+      if (Math.abs(event.clientX-finished.startX) < 3 && Math.abs(event.clientY-finished.startY) < 3) {
+        setComponentValue({event_id: Date.now() + "-select", rects, active_index: finished.index});
+        return;
+      }
       markDirty(finished.mode === "resize" ? "resize pending" : "move pending");
     }
     function openContextMenu(event) {
@@ -466,6 +551,12 @@
       if (!menu.contains(event.target) && !event.target.closest?.(".panel")) hideContextMenu();
     });
     window.addEventListener("keydown", event => {
+      if (event.target.closest("input, select, textarea")) return;
+      if ((event.ctrlKey || event.metaKey) && ["c", "v"].includes(event.key.toLowerCase())) {
+        event.preventDefault();
+        if (event.key.toLowerCase() === "c") copyPanels(); else pastePanels();
+        return;
+      }
       if (event.key === "Escape") {
         selected.clear();
         hideContextMenu();

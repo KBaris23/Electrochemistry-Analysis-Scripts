@@ -3336,6 +3336,34 @@ def plot_titration_plateaus(
     return fig
 
 
+def add_titration_on_off_difference(figure, step_rows, signal_on, signal_off):
+    """Difference of baseline-processed plateaus at matched positive doses.
+
+    Repeated doses are averaged per method; this is not a third Langmuir fit.
+    """
+    by_method = {}
+    for method in (signal_on, signal_off):
+        doses = {}
+        for row in step_rows:
+            if row.get("channel") != method or str(row.get("step_note", "")).lower() == "buffer":
+                continue
+            try:
+                concentration, response = float(row["step_concentration"]), float(row["plateau_value"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if concentration > 0 and np.isfinite([concentration, response]).all():
+                doses.setdefault(concentration, []).append(response)
+        by_method[method] = {c: float(np.mean(v)) for c, v in doses.items()}
+    shared = sorted(set(by_method[signal_on]) & set(by_method[signal_off]))
+    if figure is None or not figure.axes or not shared:
+        return False
+    figure.axes[0].plot(shared, [by_method[signal_on][c]-by_method[signal_off][c] for c in shared],
+                        "D--", color="#333333", linewidth=1.3, markersize=4,
+                        label="ON minus OFF (matched plateaus; not a fit)")
+    figure.axes[0].legend()
+    return True
+
+
 def plot_titration_langmuir(
     all_results: List[dict],
     metric: str,

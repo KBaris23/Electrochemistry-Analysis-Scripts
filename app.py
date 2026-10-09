@@ -50,6 +50,7 @@ from core import (
     run_batch,
 )
 from core.analysis import analyze_swv_arrays
+from core.plotting import add_titration_on_off_difference
 from core.processing import (
     detect_dominant_peak,
     rotate_offset_using_bracketing_minima,
@@ -1834,7 +1835,7 @@ def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cel
 
 def _paper_figure_image(source: plt.Figure, dpi: int = 300) -> np.ndarray:
     buffer = io.BytesIO()
-    source.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
+    source.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight", transparent=True)
     buffer.seek(0)
     return plt.imread(buffer)
 
@@ -1859,9 +1860,11 @@ def _paper_stack_vertically(
     padded = []
     for image in images:
         pad = width - image.shape[1]
-        padded.append(np.pad(
-            image, ((0, 0), (pad // 2, pad - pad // 2), (0, 0)), constant_values=1.0,
-        ))
+        canvas = np.ones((image.shape[0], width, image.shape[2]), dtype=image.dtype)
+        if image.shape[2] == 4:
+            canvas[:, :, 3] = 0
+        canvas[:, pad // 2:pad // 2 + image.shape[1], :] = image
+        padded.append(canvas)
     stacked = np.vstack(padded)
     output = plt.figure(
         figsize=(stacked.shape[1] / raster_dpi, stacked.shape[0] / raster_dpi)
@@ -1962,7 +1965,7 @@ def _paper_composite_figure(
             axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
             plt.close(source)
         axis.text(
-            -.02, 1.02, chr(ord("A") + index), transform=axis.transAxes,
+            -.02, 1.02, chr(ord("A") + index) if st.session_state.get("paper_show_panel_letters", False) else "", transform=axis.transAxes,
             ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
         )
     entries = _PAPER_LEGEND_STORE.get("entries") or {}
@@ -2014,7 +2017,7 @@ def _paper_directional_titration_figure(
             axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
             plt.close(source)
         axis.text(
-            -.02, 1.02, chr(ord("A") + index), transform=axis.transAxes,
+            -.02, 1.02, chr(ord("A") + index) if st.session_state.get("paper_show_panel_letters", False) else "", transform=axis.transAxes,
             ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
         )
     entries = _PAPER_LEGEND_STORE.get("entries") or {}
@@ -2030,8 +2033,8 @@ def _paper_directional_titration_figure(
 def _paper_figure_downloads(figure: plt.Figure, stem: str) -> None:
     png = io.BytesIO()
     pdf = io.BytesIO()
-    figure.savefig(png, format="png", dpi=600, bbox_inches="tight", facecolor="white")
-    figure.savefig(pdf, format="pdf", bbox_inches="tight", facecolor="white")
+    figure.savefig(png, format="png", dpi=600, bbox_inches="tight", transparent=True)
+    figure.savefig(pdf, format="pdf", bbox_inches="tight", transparent=True)
     st.pyplot(figure, use_container_width=True)
     left, right = st.columns(2)
     left.download_button(
@@ -6780,6 +6783,8 @@ if view == "Paper Figures":
             "SWV trace stride", 1, 50, value=5, key="paper_titration_stride",
             help="1 plots every trace; larger values thin dense overlays without changing fits.",
         ))
+        st.checkbox("Show panel letters", value=False, key="paper_show_panel_letters")
+        st.caption("Transparent, content-cropped exports. Scan range crops the display; fitting uses all included doses. PDF panels retain the selected raster DPI.")
         display_cols = st.columns(4)
         paper_swv_display = display_cols[0].radio(
             "SWV traces", ["Stacked (offset)", "Overlaid"], horizontal=True,
@@ -6997,6 +7002,16 @@ if view == "Paper Figures":
                     response_directions=consistent_response_directions,
                     channel_colors=directional_colors,
                 )
+                difference_steps = build_titration_step_table(
+                    titration_results, metric="peak_current_selected", vlines=titration_active_vlines,
+                    channels=[signal_on, signal_off], vlines_by_channel=titration_vlines_by_channel,
+                    edge_trim_fraction=titration_edge_trim_fraction,
+                    concentration_unit=titration_concentration_unit, baseline_mode=titration_baseline_mode,
+                    included_step_labels=titration_included_step_labels,
+                    remove_extreme_outliers=remove_extreme_titration_outliers,
+                )
+                if not add_titration_on_off_difference(shared_langmuir, difference_steps, signal_on, signal_off):
+                    st.warning("No matched accepted concentrations for ON minus OFF; no difference curve was fabricated.")
                 composite = _paper_directional_titration_figure(
                     row_figures, shared_langmuir, width=paper_width,
                     row_height=2.6, font_size=paper_font, raster_dpi=paper_raster_dpi,

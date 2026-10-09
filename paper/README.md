@@ -4,6 +4,19 @@ Updated 8 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage
 
 ## 0. Start here: planar-kana sweep first
 
+### Latest reference-figure fixes
+
+- Type 1/1A/1B now default to **Raw / unsmoothed (corrected)**. In **Edit panel → B/C → Trace smoothing (after correction)** choose raw or smoothed; either retains saved BO baseline correction and the selected peak-bracket crop. Linked controls no longer reset this choice. Reload a preset for the new default; existing saved selections are preserved.
+- **Edit panel → Show SWV example markers** independently hides/shows the coloured symbol in an SWV panel or the highlighted points and iteration callouts on a cube. Q colours, slice planes, waveform titles and selected data are unchanged.
+- Type 2 has a larger chronological-stack panel with less internal whitespace and clearer early traces. Rejected/missing scans leave no display gaps or error-count footer; diagnostics remain attached to the generated source figure. Spacing shows chronological order, not elapsed time. Measured current/voltage arrays are unchanged. Reload the preset to adopt its larger rectangle; existing manual layouts stay untouched. Cube frequency labels sit slightly closer to the cube.
+
+- Reload **Type 2** or **Type 2A**, then render again to apply the new preset geometry. Existing saved layouts are not overwritten. Type 2 uses a large 4:3 workspace: two trends upper-left, progression cube upper-right, chronological SWVs lower-left, parallel coordinates lower-right. Type 2A omits the bottom panels and uses a wide workspace.
+- Q has a dashed five-point trailing mean; buffer/target remain blue/orange. Trend titles, black axes frames and upper-left boxed legends remain visible. The cube has separate Q and red-to-black iteration scales. Parallel coordinates highlight the **selected observation**, not an assumed optimum; select the desired observation before rendering. Step size is shown in mV.
+- Select the same channel/direction throughout (for example `5_max` for kana channel 5 ON). Archived physical-channel trace names are reconciled with directional analysis names. The chronological stack uses saved BO analysis settings by default and labels its displayed subset; rejected scans are omitted rather than plotted uncorrected.
+- SWV **Paper Figures** Types 3/3B/4 now export transparent, tightly cropped figures. **Show panel letters** is optional and off by default. These composites still contain rasterized panels: set **Panel raster DPI** before generating; PDF does not make those panels vector graphics.
+- Type 3B includes ON, OFF and **ON minus OFF at matched positive concentrations**. The latter subtracts the baseline-processed plateau values, averaging repeated doses within each method. It is a descriptive difference curve, **not a third Langmuir fit**. No unmatched dose is extrapolated. Choose the baseline mode deliberately before generation.
+- For Types 3/3B/4, the measurement range is a display crop. Fits use all included titration steps; change the included doses to change the calibration fit. Type 4 remains within-calibration prediction, not independent validation.
+
 ### Paper figure scope
 
 | Dataset | BO validation | BO sweep | Titration response / concentration validation |
@@ -36,11 +49,22 @@ Use this only for a **survey/parameter-sweep** session, not an optimization sess
 2. Open **Figure Composer -> Load a preset or saved figure**.
 3. Pick one template:
    - **Type 1:** full 8-panel, 7 × 7 in standalone landscape.
-   - **Type 1A:** 3.3 × 7 in comparison half with the cube on the left.
+   - **Type 1A:** spacious 9 × 10 in workspace with the cubes on the left.
    - **Type 1B:** mirrored Type 1A with support panels on the left.
-4. For Type 1A/1B, use **Compact Type 1 linked controls**: choose one channel and two measured step-size planes. The app automatically sets **signal-on = maximum paired-response Q** and **signal-off = minimum paired-response Q** for that channel, then keeps the highlighted cube points, corrected/smoothed buffer/target SWVs, planes, and maps linked. To reframe one cube, choose it under **Edit panel**, then change **Marker size**, **Camera X/Y/Z**, or **Camera distance** (smaller is closer); each cube is independent.
+4. For Type 1A/1B, choose one shared channel and two measured step-size planes. The ON example defaults to maximum paired Q. **Signal-off example selection** offers the recorded minimum or a **Peak-aligned example**: lowest negative Q among the 12 leading candidates with six accepted scans and median buffer/target peak positions within 50 mV. This changes the illustrated record, never the underlying Q data. For setup-5 sweep channel 10, the recorded minimum is iteration 167; the aligned example is iteration 42. Cube highlights and SWVs stay linked. Use **Edit panel → Marker size / Camera X/Y/Z / Camera distance** for each cube.
+
+   SWVs default to **Use saved BO analysis settings**, including acceptance windows, and **Show only corrected peak bracket** (between the detected minima). This is a display crop after analysis. Uncheck it to see the full saved voltage crop. **Black SWV axes box** toggles the black frame; **Coloured panel border** controls an optional extra frame. Slice coloured borders follow the data axes, not the entire panel slot. Titles show iteration/parameters or step/channel, without ON/OFF wording.
+
+   Exports use tight content bounds with a small margin and transparent background. Empty space outside the composition is removed; your spacing between panels is retained. Cube faces are transparent and step ticks are labelled in mV.
 5. **Loading a preset does not render an image yet.** Confirm that the canvas and panel count changed (Type 1 = 8 panels; Type 1A/1B = 6 panels), scroll below the panel settings, then click **Render figure (fast preview)**. When the preview is correct, click **Create final PNG/PDF/SVG**. The compact templates have no A–F letters, keep a tight 2:1 cube/support width ratio, and permit exactly two linked slice planes.
 6. Use Type 1A plus Type 1B only when you have two genuinely comparable sweep datasets (for example planar and nanoporous). Use Type 1 only with a loaded survey/parameter-sweep session: BO-only folders do not contain the required sweep landscape.
+
+**To reproduce the latest checked sweep:** load Type 1A, choose **Shared channel = 10**, **Signal-off example selection = Peak-aligned example**, and planes **0.004 / 0.007 V**. Verify ON iteration **120** and OFF **42**. These sweep examples are not the channel-5 titration methods below.
+
+1. In **Edit panel → A**, set marker size **6**, opacity **0.75**, Camera X/Y/Z **1.65 / 1.15 / 1.10**, Camera distance **1.0**, and Plot text **9**. Repeat for cube **D**.
+2. In **B**, select **Raw / unsmoothed (corrected)** under **Trace smoothing (after correction)**. Keep **Corrected**, **Use saved BO analysis settings**, **Show only corrected peak bracket**, and **Black SWV axes box** on. Repeat for **C**. Raw means unsmoothed display, not uncorrected current; saved analysis smoothing still helps determine the baseline/peak.
+3. To hide coloured example symbols, uncheck **Show SWV example markers** separately in **A, B and C**. Leave it on where you want the correspondence shown. Slice-plane colours and Q scales are unaffected.
+4. Set **Plot text = 9** on the remaining panels; keep panel letters off and the **9 × 10 in** workspace. Render a fast preview. If satisfied, create the final exports and save the analysis session as `kana_sweep_ch10`.
 
 ```text
 Type 1A                         Type 1B
@@ -61,7 +85,9 @@ Use this figure to show that BO explored parameter space and improved/selected w
 2. Choose the listed channel group and optimization direction.
 3. Open **Figure Composer -> Load a preset or saved figure**.
 4. Choose **Type 2 - BO validation** for the five-panel version, or **Type 2A - BO validation (focused)** for cube + two trends only. Click **Load preset**.
-5. Keep the dashed **5-point running mean** in Q_run vs iteration and leave display clipping off for the first export. Render, inspect, and download PNG/PDF.
+5. Set the cube, buffer/target, chronological SWV and parallel-coordinate panels to the same channel/direction (e.g. `5_max`). Use **Observation iteration** to choose the red dashed selection in parallel coordinates; it is not automatically the optimum.
+6. Keep the dashed **5-point running mean** in Q_run vs iteration and leave display clipping off. Type 2 uses a large **4:3** canvas with no panel letters by default. Its chronological stack uses saved BO settings and packs accepted displayed scans together; retain a caption explaining that it is a subset.
+7. Click **Render figure (fast preview)**. Inspect the stack and both Q/iteration colourbars, then **Create final PNG/PDF/SVG**. Save the session as `kana_BO_ch5_on` (or the matching dataset/channel). Loading a new preset replaces the working layout, so save before switching.
 
 | Dataset | Session path | Group / direction |
 |---|---|---|
@@ -72,13 +98,12 @@ Use this figure to show that BO explored parameter space and improved/selected w
 
 ```text
 Type 2                         Type 2A (focused)
-┌─────────┬───────┐            ┌──────────────┬───────┐
-│ A cube  │ B Q   │            │    A cube    │ B Q   │
-│         ├───────┤            │    + path    ├───────┤
-│         │ C phase│           │              │ C phase│
-├─────────┼───────┤            └──────────────┴───────┘
-│ D stack │ E ||| │
-└─────────┴───────┘
+┌──────────────┬────────────┐   ┌───────────┬────────────┐
+│ Q trend      │ cube/path  │   │ Q trend   │ cube/path  │
+│ buffer/target│            │   │ phases    │            │
+├──────────────┼────────────┤   └───────────┴────────────┘
+│ SWV stack    │ parallel   │
+└──────────────┴────────────┘
 ```
 
 ### 0.4 Figure C — Titration response (Type 3 or Type 3B)
@@ -179,13 +204,51 @@ Other dataset claims (amp0 detectability rescue, vanco response strength, statio
 
 The app deliberately has two figure tools:
 
-- **BO Session → Figure Composer** builds Types 1 and 2. It has an **Edit panel** selector: choose A/B/C… to open that panel's plot type, data source, axes, colours, text, and layout settings. The layout canvas is for moving/resizing panels. It does not currently open a settings pane merely by clicking the rendered preview. Type 1 has intentionally linked channel/iteration/slice controls, so its highlighted cube points, SWV traces, planes, and maps cannot disagree.
+**Editing content without losing layout:** select a panel (click its layout
+rectangle or use **Edit panel**), then use **Selected panel source → Edit source**.
+The dedicated source editor opens the panel's existing choices. **Preview source
+changes** previews the draft; **Update panel** applies it and refreshes Composer;
+**Add as new panel** makes an independent copy; **Cancel / Back** discards the
+draft. This editor currently covers SWV overlays, measured cubes/maps, Q trends,
+and buffer/target trends. It uses the same plotting routines and BO settings as
+the final figure, without switching browser tabs. In linked sweeps, channel,
+trace iteration and slice edits also update their cube links. **Reset source
+iteration choices** returns to automatic example selection.
+
+For plots made in other plotting tabs, **Add to Composer** retains its existing
+behavior. **Replace selected Composer panel A/B/...** replaces only the selected
+panel's content while retaining its layout; replacing a linked sweep panel turns
+the composition into an independent custom layout. Captured plots do not yet
+support reopening every original tab control automatically.
+
+Use **Workspace zoom → 125–200%** to enlarge the editor, then scroll within it.
+This is editing zoom and does not change export dimensions. Cube highlight
+callouts identify iterations; red circles and blue diamonds match the symbols
+in the corresponding SWV panels. Channel titles follow the cube top.
+
+Layout editing: drag any of the eight edge/corner handles to resize. Enable
+**Snap** and choose the grid spacing. Select a panel to enter X/Y/width/height
+as percentages; Y starts at the bottom. **Make square** makes a square at the
+actual printed canvas proportions. **Copy panels / Paste panels** (Ctrl/Cmd+C/V
+while focused on the layout canvas) duplicates plot settings as well as geometry,
+up to 12 panels. Copies switch a linked sweep template to a custom composition.
+Use Ctrl/Cmd-click for multiple selection and right-click for alignment or equal
+sizes. Click **Apply layout** before rendering. Type 1 SWV panels have no coloured
+outer frames by default; reload the preset to replace older saved defaults.
+
+**Type 2 uses the loaded BO optimization session**, including its iteration
+history and paired buffer/target measurements. Choose the channel's group and
+maximize (ON) or minimize (OFF). It is appropriate for kana, amp0 and vanco;
+no parameter sweep is required. Type 2A retains only the cube, Q trend and
+buffer/target trend. A sweep session belongs in Type 1 instead.
+
+- **BO Session → Figure Composer** builds Types 1 and 2. Use **Edit panel** or click a layout rectangle to select a panel. The static rendered preview is not clickable. Use **Edit source** for content and the panel controls for formatting. Type 1 links channel/iteration/slice choices to its cube markers, SWVs, planes and maps.
 - **SWV → Paper Figures** builds Types 3 and 4 from a selected physical channel and two methods. It is a guided, reproducible template rather than a fully free-form panel editor: the row, methods, scan range, stack/overlay choice, font, width, and raster resolution are adjustable, but individual generated subpanels are not yet independently restyled. For fully individual titration panels, create/capture the underlying plots and use the Figure Composer.
 
 | Template | Where to open it | Use it for |
 |---|---|---|
 | Type 1 – Parameter sweep | BO Session, **survey** session only | Standalone eight-panel setup-5 kanamycin landscape. The station-2 sweep can be supplementary, not a required main figure. |
-| Type 1A / 1B – Sweep comparison | BO Session, **survey** session only | Compact mirrored one-column halves for a planar/nanoporous side-by-side comparison: cube-left (1A) and support-left (1B). Choose one channel and two measured step planes; the app uses that channel's max-Q signal-on and min-Q signal-off records automatically. |
+| Type 1A / 1B – Sweep comparison | BO Session, **survey** session only | Mirrored layouts: cube-left (1A) and support-left (1B). Choose a shared channel, two planes, and the OFF example-selection rule. Large workspace; content-cropped export. |
 | Type 2 – BO validation | BO Session, BO experiment session | setup-5 kana, amp0, vanco, and optionally station-2 kana. |
 | Type 2A – BO validation (focused) | BO Session, BO experiment session | The Type 2 cube and the two essential quantitative trends only; omit the chronological stack and parallel coordinates. |
 | Type 3 – SWV and titration response | SWV → Paper Figures | each selected physical channel: manual/reference vs one optimized method, traces + time course + Langmuir response. |
@@ -204,15 +267,15 @@ The app deliberately has two figure tools:
 
 ### Formatting defaults
 
-- Types 1 and 2 load as 7 × 7 in ACS two-column square figures, Arial 7 pt, 9 pt panel letters, journal styling, and 600 DPI. Type 1A/1B load as 3.3 × 7.0 in ACS one-column tall halves. Leave those settings unchanged for the first render. Use **Edit panel** to change a single panel; use **Expand all panel settings** only for a final audit.
+- Original Type 1 uses a 7 × 7 in canvas. Type 1A/1B use a 9 × 10 in workspace; Type 2 uses 12 × 9 in (4:3), and Type 2A uses 12.8 × 7.2 in (16:9). The newer presets start with 10 pt text; use 9 pt for the checked sweep example. Canvas size is editable and export crops to content. Use **Edit panel** to change one panel; use **Expand all panel settings** only for an audit.
 - For Type 1, use the shared controls, not per-panel overrides: choose one channel, two highlighted iterations, and up to four real step-size planes. The colour frames are intended to identify these links.
 - For Type 2, retain the 5-point Q_run running mean; choose a channel-specific group and correct direction before rendering. If peak prominence has extreme values, inspect them rather than clipping them away.
-- For Type 3, start with one comparison row, 7.0 in width, 7–8 pt font, 300 DPI, and no optional columns. Use stacked traces only when temporal progression matters; otherwise use overlays. Add SNR or predicted-vs-known only in the SI.
-- For Type 4, use the same row/method choice as Type 3, 7.0 in width, 8 pt font, and 300 DPI. The predicted-versus-known diagnostic uses data also used to fit the calibration, so it is descriptive rather than external validation.
+- For Type 3, start with one comparison row, 10–12 in width, 8–10 pt font, 300 panel raster DPI, and no optional columns. Type 3B fixes two rows and a shared fourth column. Panel letters are optional; exports are transparent. Use stacked traces only when temporal progression matters; otherwise use overlays. Verify readability again at final manuscript placement size.
+- For Type 4, use the same channel/method choices as Type 3, 10–12 in width, 8–10 pt font, and 300 panel raster DPI. The predicted-versus-known diagnostic uses data also used to fit the calibration, so it is descriptive rather than external validation.
 
 1. **Main titration figure:** start with four panels: full-width channel-5 time course; three-method Langmuir response; optimized-ON SWV overlay; manual SWV overlay. Put OFF overlays, SNR, inverse-calibration diagnostics, and the all-channel table in SI. Keep the low-dose time course visible; omit equilibration only from the stated fit/statistics selection. A shared overlay colorbar requires the same limits and coordinate definition; otherwise keep clearly labeled separate bars.
 2. **Composer workflow:** use the guided Type 3 template for a reproducible two-method comparison, or capture individual Metrics/Overlays plots and use a manual Composer layout when every titration subpanel needs independent styling. Verify all sources and render at final size. Save PNG/PDF plus the available metadata/portable export. A PNG or JSON config alone does not guarantee restoration of in-memory editable captures in a fresh browser session.
-3. **Main BO figure:** open setup-5 session below; select Group 5 and maximize. Start with Q_run/best-so-far, phase metric with its honest label, and selected buffer/target traces. Add either parameter parallel coordinates or a 3D view only if informative. Set clipping off. Export minimize separately if showing the signal-off optimization. Verify any claimed optimum within the exact group/direction; do not substitute another group's global maximum.
+3. **Main BO figure:** open the setup-5 session; select Group 5 and maximize. Use Type 2 for Q_run with trailing mean, buffer/target peak prominence, a progression cube, chronological SWVs and parallel coordinates. Use Type 2A when the latter two panels are unnecessary. Set clipping off. Export minimize separately if showing signal-off optimization. The red dashed parallel-coordinate line identifies the selected observation, not an automatically verified optimum.
 4. **Landscape:** open setup-5 sweep below. Explicitly choose channels 3 and 5 in each panel. Use paired Q if available and appropriate, and confirm colorbar labels. Set step slices explicitly to **0.001, 0.004, 0.007 V**, documenting slice tolerance/interpolation and showing sampled points. Use common color limits for directly comparable maps. Identify best/worst observations from the selected channel's history and verify the trace filename, iteration, phase, and waveform. Normalizing the same trace is not a best/worst comparison. Interpolated smooth maps are not additional measured data.
 5. **Other datasets:** repeat section 1 with each exact snapshot, saving separate bundles. Use kana station 2 as a replicate with its different crop; amp0 and vanco as secondary results. Use minimize for the proposed amp0/vanco signal-off BO panels. Report unsuccessful channels and uncertain/nonsaturating fits alongside selected illustrations.
 6. **Simulations last:** first define the benchmark: same objective/landscape, domain, observation noise, evaluation budget, failure handling, and multiple recorded seeds for BO and random search. Count initialization within the budget. Vary initialization while holding other settings fixed. Save per-seed histories and aggregate variability. A simulated benchmark must be labeled simulated; the existing 200-point survey is not by itself a repeated BO-versus-random benchmark. The old ten-panel "Hyperparameter Sweep" figure preset is a landscape layout, not a simulation experiment.
