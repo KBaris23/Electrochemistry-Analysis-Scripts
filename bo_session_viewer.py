@@ -27238,11 +27238,13 @@ def _plotly_png_bytes(
     scale: float = 2,
     text_size: float | None = None,
     mark_scale: float | None = None,
+    composer_colorbar_side: str | None = None,
 ) -> bytes:
     export_fig = go.Figure(fig)
     _apply_global_plot_style(export_fig)
     if text_size is not None:
         _composer_apply_plotly_text_size(export_fig, text_size, width)
+    _composer_place_plotly_colorbars(export_fig, composer_colorbar_side)
     _apply_plotly_3d_turntable_dragmode(export_fig)
     _prepare_plotly_static_export(export_fig)
     if mark_scale is not None:
@@ -31878,7 +31880,15 @@ def _paper_parameter_sweep_comparison_preset(
         if _finite_float((obs.get("params") or {}).get("step_potential")) is not None
     })
     if step_values:
-        indexes = np.linspace(0, len(step_values) - 1, min(2, len(step_values))).round().astype(int)
+        # End planes are mostly edge cases and make the pair of maps look
+        # unrepresentative.  Use two interior, evenly spaced sampled planes
+        # when the sweep provides enough step sizes (e.g. 4 and 7 mV from a
+        # 1–10 mV sweep).
+        indexes = np.linspace(0, len(step_values) - 1, 4).round().astype(int)[1:3]
+        if len(step_values) < 4:
+            indexes = np.linspace(
+                0, len(step_values) - 1, min(2, len(step_values))
+            ).round().astype(int)
         slices = list(dict.fromkeys(step_values[index] for index in indexes))
     else:
         slices = [0.001, 0.010]
@@ -31930,6 +31940,7 @@ def _paper_parameter_sweep_comparison_preset(
             f"bo_composer_measured_dot_opacity_{index}": .72,
             f"bo_composer_measured_iteration_path_{index}": False,
             f"bo_composer_measured_cube_edges_{index}": True,
+            f"bo_composer_measured_colorbar_side_{index}": "left",
         })
     extra.update({
         "bo_composer_trace_iteration_1": on_iteration,
@@ -31940,6 +31951,8 @@ def _paper_parameter_sweep_comparison_preset(
         "bo_composer_trace_corrected_2": True,
         "bo_composer_trace_key_1": "smoothed_corrected_current",
         "bo_composer_trace_key_2": "smoothed_corrected_current",
+        "bo_composer_trace_role_1": "Signal-on",
+        "bo_composer_trace_role_2": "Signal-off",
         "bo_composer_border_on_1": True,
         "bo_composer_border_on_2": True,
         "bo_composer_border_color_1": "#d62728",
@@ -31958,7 +31971,10 @@ def _paper_parameter_sweep_comparison_preset(
             f"bo_composer_real_y_{map_index}": "frequency",
             f"bo_composer_real_slice_axis_{map_index}": "step_potential",
             f"bo_composer_real_slice_value_{map_index}": slice_value,
-            f"bo_composer_real_show_points_{map_index}": True,
+            # The surfaces, their labelled plane, and the cube already show
+            # what was sampled.  Extra hollow points make these mini-maps
+            # busy without adding information.
+            f"bo_composer_real_show_points_{map_index}": False,
         })
     name = (
         "Type 1B - Sweep comparison (support left)"
@@ -32515,8 +32531,8 @@ def _composer_draw_trace(
         ax.text(.5, .5, "No traces for selected channels", ha="center", va="center")
         ax.set_axis_off()
         return
-    trace_colors = plt.get_cmap("turbo")(np.linspace(.03, .97, max(len(traces), 2)))
     line_override = _plot_line_color_override()
+    phase_counts: dict[str, int] = {}
     for trace_index, item in enumerate(traces[:24]):
         try:
             voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
@@ -32527,13 +32543,16 @@ def _composer_draw_trace(
             )
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
+            phase = str(item.get("phase") or "measurement").strip().lower()
+            phase_counts[phase] = phase_counts.get(phase, 0) + 1
+            label = f"{phase.title()} {phase_counts[phase]}"
             ax.plot(
                 voltage,
                 y,
-                color=line_override or trace_colors[trace_index],
+                color=line_override or SWV_PHASE_COLORS.get(phase, "#444444"),
                 linewidth=1.0,
                 alpha=.88,
-                label=f"{str(item.get('phase') or '').title()} {_trace_channel_label(_trace_channel_key(item))}",
+                label=label,
             )
         except Exception:
             continue
@@ -32623,6 +32642,35 @@ def _composer_trace_observations_for_channels(
         return candidates
     positions = np.linspace(0, len(candidates) - 1, maximum).round().astype(int)
     return [candidates[index] for index in dict.fromkeys(positions)]
+
+
+def _composer_observation_for_trace(
+    observations: Sequence[dict],
+    iteration: int | None,
+    channels: Sequence[str],
+    fallback: dict,
+) -> dict:
+    """Find the paired record for an iteration *and* its selected channel.
+
+    Survey sessions repeat iteration numbers for every channel group.  Looking
+    up only iteration 87 could therefore select channel 1 while the cube
+    highlighted channel 3, producing the misleading "No traces" panel.
+    """
+    if iteration is None:
+        return fallback
+    candidates = [
+        item for item in observations
+        if _finite_float(item.get("iteration")) is not None
+        and int(float(item["iteration"])) == int(iteration)
+    ]
+    requested = {str(channel) for channel in channels if channel is not None}
+    for item in candidates:
+        stored = item.get("analysis_channels") or item.get("channels") or []
+        if not isinstance(stored, (list, tuple, set)):
+            stored = [stored]
+        if requested & {str(channel) for channel in stored if channel is not None}:
+            return item
+    return candidates[0] if candidates else fallback
 
 
 def _composer_trace_channels(trace_entries: Sequence[tuple[dict, dict]]) -> list[str]:
@@ -32785,10 +32833,13 @@ _PLOTLY_MARK_DESIGN_WIDTH_PX = 800.0
 
 def _composer_scale_plotly_marks(fig: go.Figure, factor: float) -> None:
     """Scale marker sizes and line widths so dots/lines keep their proportions."""
-    factor = max(1.0, float(factor))
-    # Dots grow a bit slower than the canvas and lines slower still, so wide
-    # print panels do not end up with blobs and heavy strokes.
-    marker_factor = 1.0 + (factor - 1.0) * 0.75
+    # Plotly marker sizes are pixels.  The previous lower bound of 1.0 meant
+    # that a narrow exported cube could never shrink its dots, then multiplied
+    # them again for 3D; compact sweep cubes became a cloud of oversized disks.
+    factor = max(0.45, float(factor))
+    # Dots scale slightly more gently than the canvas and lines more gently
+    # still, preserving readable points at both preview and print resolution.
+    marker_factor = factor ** 0.75
     line_factor = factor ** 0.6
 
     def scaled(value: Any, amount: float) -> Any:
@@ -32816,7 +32867,7 @@ def _composer_scale_plotly_marks(fig: go.Figure, factor: float) -> None:
             if size is not None:
                 # 3D markers are drawn smaller than 2D ones at the same size.
                 is_3d = str(getattr(trace, "type", "")).lower().endswith("3d")
-                marker.size = scaled(size, marker_factor * (1.8 if is_3d else 1.0))
+                marker.size = scaled(size, marker_factor * (1.25 if is_3d else 1.0))
             marker_line = getattr(marker, "line", None)
             marker_line_width = getattr(marker_line, "width", None) if marker_line is not None else None
             if marker_line_width is not None:
@@ -32967,6 +33018,49 @@ def _composer_apply_plotly_text_size(
     return fig
 
 
+def _composer_place_plotly_colorbars(fig: go.Figure, side: str | None) -> go.Figure:
+    """Place a Composer panel's colour scale beside, not beyond, its plot.
+
+    Static 3D exports do not reserve space for a colourbar placed outside the
+    scene.  In a narrow panel that pushed Q into the inter-panel gutter while
+    leaving the cube undersized.  The left placement reserves a compact strip
+    *inside* the panel and expands the scene through the remaining width.
+    """
+    side = str(side or "").lower()
+    if side not in {"left", "right"}:
+        return fig
+    left = side == "left"
+    colorbar_x = 0.018 if left else 0.982
+    anchor = "left" if left else "right"
+    for trace in fig.data:
+        for colorbar in (
+            getattr(trace, "colorbar", None),
+            getattr(getattr(trace, "marker", None), "colorbar", None),
+        ):
+            if colorbar is not None:
+                colorbar.x = colorbar_x
+                colorbar.xanchor = anchor
+                colorbar.len = 0.80
+                colorbar.y = 0.50
+    for layout_key in fig.layout.to_plotly_json():
+        if re.fullmatch(r"coloraxis\d*", str(layout_key)):
+            coloraxis = getattr(fig.layout, str(layout_key), None)
+            colorbar = getattr(coloraxis, "colorbar", None)
+            if colorbar is not None:
+                colorbar.x = colorbar_x
+                colorbar.xanchor = anchor
+                colorbar.len = 0.80
+                colorbar.y = 0.50
+        elif re.fullmatch(r"scene\d*", str(layout_key)):
+            scene = getattr(fig.layout, str(layout_key), None)
+            if scene is not None:
+                scene.domain = {
+                    "x": [0.17, 0.99] if left else [0.01, 0.83],
+                    "y": [0.02, 0.98],
+                }
+    return fig
+
+
 def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
     """Give one embedded Matplotlib panel absolute, role-based point sizes.
 
@@ -33019,6 +33113,7 @@ def _composer_draw_embedded_figure(
     rect: Sequence[float],
     render_dpi: int,
     text_size: float | None = None,
+    colorbar_side: str | None = None,
 ) -> None:
     from PIL import Image
 
@@ -33046,6 +33141,7 @@ def _composer_draw_embedded_figure(
                     * _PLOTLY_TEXT_CALIBRATION
                 ),
                 mark_scale=float(width_px) / _PLOTLY_MARK_DESIGN_WIDTH_PX,
+                composer_colorbar_side=colorbar_side,
             )
             buffer = BytesIO(png)
         else:
@@ -33424,7 +33520,11 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
                 name=f"Selected iteration {iteration}",
                 hovertemplate=f"Selected iteration {iteration}<extra></extra>",
             ))
-        _apply_plotly_camera(figure, _stored_plotly_camera(None))
+        _apply_plotly_camera(
+            figure,
+            _valid_plotly_camera(spec.get("camera"))
+            or _stored_plotly_camera(None),
+        )
     return figure
 
 
@@ -33829,7 +33929,35 @@ def _composer_scale_axes_marks(
         if hasattr(collection, "get_linewidths") and hasattr(collection, "set_linewidths"):
             widths = collection.get_linewidths()
             if len(widths):
-                collection.set_linewidths([max(0.2, float(w) * scale) for w in widths])
+                    collection.set_linewidths([max(0.2, float(w) * scale) for w in widths])
+
+
+def _composer_swv_header(observation: Mapping[str, Any], role: str = "") -> str:
+    """Return a compact, publication-readable waveform identity line."""
+    params = observation.get("params") or {}
+    frequency = _finite_float(params.get("frequency"))
+    amplitude = _finite_float(params.get("amplitude"))
+    step = _finite_float(params.get("step_potential"))
+    fragments = [f"Iteration {observation.get('iteration', '?')}" ]
+    if frequency is not None:
+        fragments.append(f"Freq {frequency:g} Hz")
+    if step is not None:
+        fragments.append(f"Step {step * 1000:g} mV")
+    if amplitude is not None:
+        fragments.append(f"Amp {amplitude * 1000:g} mV")
+    prefix = f"{role} · " if role else ""
+    return prefix + " | ".join(fragments)
+
+
+def _composer_landscape_header(spec: Mapping[str, Any]) -> str:
+    """Name linked compact cubes/maps by their selected channel and slice."""
+    channels = [str(channel) for channel in (spec.get("channels") or [])]
+    channel_text = ", ".join(f"Ch {channel}" for channel in channels)
+    if spec.get("kind") == "Measured 2D map":
+        slice_value = _finite_float(spec.get("slice_value"))
+        if slice_value is not None:
+            return f"{slice_value * 1000:g} mV step · {channel_text}"
+    return channel_text
 
 
 def _build_composer_figure(
@@ -33896,6 +34024,7 @@ def _build_composer_figure_inner(
         for index, spec in enumerate(specs):
             ax = fig.add_axes(spec["rect"])
             kind = spec["kind"]
+            panel_header = str(spec.get("header") or "")
             _COMPOSER_CLIP_EXTREMES.set(bool(spec.get("clip_extremes")))
             if kind == "Global trend":
                 _composer_draw_global(
@@ -33917,19 +34046,23 @@ def _build_composer_figure_inner(
                     spec["rect"],
                     render_dpi,
                     spec.get("text_size", font_size),
+                    spec.get("colorbar_side"),
                 )
             elif kind == "Surrogate 2D map":
                 _composer_draw_surrogate_map(fig, ax, session, observation, spec["artifact_iteration"], spec["value"], spec["x"], spec["y"])
             elif kind == "SWV trace overlay":
-                trace_observation = next(
-                    (
-                        item for item in observations
-                        if int(item.get("iteration", -1))
-                        == int(spec.get("observation_iteration", observation.get("iteration", -1)))
-                    ),
+                trace_observation = _composer_observation_for_trace(
+                    observations,
+                    int(spec.get("observation_iteration", observation.get("iteration", -1))),
+                    spec.get("channels") or [],
                     observation,
                 )
                 _composer_draw_trace(ax, session, trace_observation, spec["corrected"], spec["channels"], trace_analysis, spec["corrected_trace_key"], spec["normalize_to_peak"])
+                if not panel_header and spec.get("trace_role"):
+                    panel_header = _composer_swv_header(
+                        trace_observation,
+                        str(spec.get("trace_role") or ""),
+                    )
             elif kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS:
                 _composer_draw_embedded_figure(
                     fig,
@@ -33938,7 +34071,15 @@ def _build_composer_figure_inner(
                     spec["rect"],
                     render_dpi,
                     spec.get("text_size", font_size),
+                    spec.get("colorbar_side"),
                 )
+                if not panel_header and not spec.get("show_measured_points", True):
+                    panel_header = _composer_landscape_header(spec)
+                if not panel_header and (
+                    spec.get("colorbar_side") == "left"
+                    or not spec.get("show_measured_points", True)
+                ):
+                    panel_header = _composer_landscape_header(spec)
             elif kind == "Measured parallel coordinates":
                 _composer_draw_embedded_figure(
                     fig,
@@ -34058,6 +34199,15 @@ def _build_composer_figure_inner(
             panel_label = spec.get("label") or chr(ord("A") + index)
             if journal_style:
                 _composer_journal_axes(ax)
+            if panel_header:
+                fig.text(
+                    spec["rect"][0] + spec["rect"][2] / 2,
+                    min(.994, spec["rect"][1] + spec["rect"][3] + .002),
+                    panel_header,
+                    fontsize=max(4.0, panel_text_size * .95),
+                    ha="center",
+                    va="bottom",
+                )
             if not spec.get("show_label", True):
                 continue
             if journal_style:
@@ -35019,6 +35169,37 @@ def _render_figure_composer(
                             value=True,
                             key=f"bo_composer_measured_cube_edges_{index}",
                         )
+                        spec["colorbar_side"] = st.selectbox(
+                            "Q colorbar side",
+                            ["left", "right"],
+                            key=f"bo_composer_measured_colorbar_side_{index}",
+                            help="Keeps the Q scale beside this cube instead of wasting the support-panel gutter.",
+                        )
+                        camera_cols = st.columns(4)
+                        camera_x = float(camera_cols[0].slider(
+                            "Camera X", -3.0, 3.0, 1.45, 0.05,
+                            key=f"bo_composer_camera_x_{index}",
+                        ))
+                        camera_y = float(camera_cols[1].slider(
+                            "Camera Y", -3.0, 3.0, 1.45, 0.05,
+                            key=f"bo_composer_camera_y_{index}",
+                        ))
+                        camera_z = float(camera_cols[2].slider(
+                            "Camera Z", -3.0, 3.0, 1.15, 0.05,
+                            key=f"bo_composer_camera_z_{index}",
+                        ))
+                        camera_zoom = float(camera_cols[3].slider(
+                            "Camera distance", 0.45, 2.50, 1.0, 0.05,
+                            key=f"bo_composer_camera_zoom_{index}",
+                            help="Smaller is closer (zoom in); larger is farther away.",
+                        ))
+                        spec["camera"] = {
+                            "eye": {
+                                "x": camera_x * camera_zoom,
+                                "y": camera_y * camera_zoom,
+                                "z": camera_z * camera_zoom,
+                            }
+                        }
                         iteration_options = sorted({
                             int(value) for value in pd.to_numeric(
                                 points.get("iteration", pd.Series(dtype=float)), errors="coerce"
@@ -35172,8 +35353,20 @@ def _render_figure_composer(
                     key=f"bo_composer_trace_iteration_{index}",
                 ) if observation_iterations else int(observation.get("iteration", 0))
                 spec["observation_iteration"] = int(selected_trace_iteration)
-                trace_observation = next(
-                    (item for item in observations if int(item.get("iteration", -1)) == int(selected_trace_iteration)),
+                spec["trace_role"] = st.text_input(
+                    "Trace label",
+                    value="",
+                    key=f"bo_composer_trace_role_{index}",
+                    help="For compact Type 1 this is automatically Signal-on or Signal-off.",
+                )
+                requested_trace_channels = st.session_state.get(
+                    f"bo_composer_trace_channels_{index}",
+                    [],
+                )
+                trace_observation = _composer_observation_for_trace(
+                    observations,
+                    int(selected_trace_iteration),
+                    requested_trace_channels,
                     observation,
                 )
                 trace_items = _trace_paths(session, trace_observation)

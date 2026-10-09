@@ -38,7 +38,7 @@ Use this only for a **survey/parameter-sweep** session, not an optimization sess
    - **Type 1:** full 8-panel, 7 × 7 in standalone landscape.
    - **Type 1A:** 3.3 × 7 in comparison half with the cube on the left.
    - **Type 1B:** mirrored Type 1A with support panels on the left.
-4. For Type 1A/1B, use **Compact Type 1 linked controls**: choose one channel, then choose the real signal-on and signal-off observations and two measured step-size planes. The highlights, framed SWVs, planes, and maps stay linked.
+4. For Type 1A/1B, use **Compact Type 1 linked controls**: choose one channel, then choose the real signal-on and signal-off observations and two measured step-size planes. The highlights, paired buffer/target SWVs, planes, and maps stay linked. To reframe one cube, choose it under **Edit panel** and adjust **Camera X/Y/Z** and **Camera distance** (smaller is closer); this affects that cube only.
 5. **Loading a preset does not render an image yet.** Confirm that the canvas and panel count changed (Type 1 = 8 panels; Type 1A/1B = 6 panels), scroll below the panel settings, then click **Render figure (fast preview)**. When the preview is correct, click **Create final PNG/PDF/SVG**. The compact templates have no A–F letters, keep a tight 2:1 cube/support width ratio, and permit exactly two linked slice planes.
 6. Use Type 1A plus Type 1B only when you have two genuinely comparable sweep datasets (for example planar and nanoporous). Do not label arbitrary survey observations as signal-on/off without checking their files/settings.
 

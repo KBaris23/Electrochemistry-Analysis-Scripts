@@ -356,7 +356,10 @@ def test_plotly_panel_text_is_converted_from_points_to_pixels(monkeypatch):
 
     seen = {}
 
-    def fake_png(fig, *, width, height, scale, text_size, mark_scale=None):
+    def fake_png(
+        fig, *, width, height, scale, text_size, mark_scale=None,
+        composer_colorbar_side=None,
+    ):
         seen["text_size"] = text_size
         seen["mark_scale"] = mark_scale
         # 1x1 transparent PNG
@@ -392,17 +395,17 @@ def test_plotly_marker_sizes_and_line_widths_scale_with_panel_width():
     flat = go.Figure(go.Scatter(x=[0, 1], y=[0, 1], mode="markers", marker={"size": 6}))
     viewer._composer_scale_plotly_marks(figure, 3.0)
     viewer._composer_scale_plotly_marks(flat, 3.0)
-    # Dots grow 0.75x as fast as the canvas; 3D dots get an extra 1.8x because
-    # Plotly draws them smaller; lines grow as factor ** 0.6.
-    assert flat.data[0].marker.size == pytest.approx(6 * (1 + 2.0 * 0.75))
-    assert figure.data[0].marker.size == pytest.approx(6 * (1 + 2.0 * 0.75) * 1.8)
+    # Dots scale as factor ** 0.75; 3D dots get a small compensation because
+    # Plotly draws them smaller. Lines grow as factor ** 0.6.
+    assert flat.data[0].marker.size == pytest.approx(6 * 3.0 ** 0.75)
+    assert figure.data[0].marker.size == pytest.approx(6 * 3.0 ** 0.75 * 1.25)
     assert figure.data[0].line.width == pytest.approx(2 * 3.0 ** 0.6)
     size_after, width_after = figure.data[0].marker.size, figure.data[0].line.width
-    assert size_after == pytest.approx(27.0)
-    # A factor below 1 is clamped to 1, so narrow panels never shrink marks.
+    assert size_after == pytest.approx(6 * 3.0 ** 0.75 * 1.25)
+    # Narrow panels shrink marks, with a modest floor that prevents invisible dots.
     viewer._composer_scale_plotly_marks(figure, 0.2)
-    assert figure.data[0].marker.size >= size_after
-    assert figure.data[0].line.width == pytest.approx(width_after)
+    assert figure.data[0].marker.size < size_after
+    assert figure.data[0].line.width < width_after
 
 
 def test_plotly_static_export_helper_traces_are_not_scaled():
@@ -555,6 +558,28 @@ def test_compact_sweep_comparison_presets_are_mirrored_and_directional():
     assert normal["bo_composer_left_0"] < normal["bo_composer_left_1"]
     assert mirrored["bo_composer_left_0"] > mirrored["bo_composer_left_1"]
     assert normal["bo_composer_bottom_0"] == mirrored["bo_composer_bottom_0"]
+
+
+def test_composer_trace_observation_uses_matching_channel_for_repeated_iterations():
+    first = {"iteration": 87, "channels": [1]}
+    selected = {"iteration": 87, "channels": [3]}
+    fallback = {"iteration": 88, "channels": [3]}
+    assert viewer._composer_observation_for_trace(
+        [first, selected], 87, ["3"], fallback,
+    ) is selected
+
+
+def test_compact_colorbar_stays_inside_left_of_scene():
+    import plotly.graph_objects as go
+
+    figure = go.Figure(go.Scatter3d(
+        x=[0, 1], y=[0, 1], z=[0, 1],
+        marker={"color": [0, 1], "showscale": True},
+    ))
+    figure.update_layout(scene={"domain": {"x": [0.1, 0.9], "y": [0, 1]}})
+    viewer._composer_place_plotly_colorbars(figure, "left")
+    assert figure.data[0].marker.colorbar.x == pytest.approx(.018)
+    assert figure.layout.scene.domain.x[0] == pytest.approx(.17)
 
 
 def test_composer_global_trend_can_add_dashed_running_mean():
