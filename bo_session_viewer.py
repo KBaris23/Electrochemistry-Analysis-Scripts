@@ -9878,6 +9878,7 @@ def _plot_real_data_landscape(
                 log_frequency=log_frequency,
             )
         fig = go.Figure()
+        colorbar_label = "Q" if metric_label == "Paired Q" else metric_label
         if grid is not None:
             grid_x, grid_y, grid_values = grid
             fig.add_trace(go.Heatmap(
@@ -9893,7 +9894,7 @@ def _plot_real_data_landscape(
                     display_value_range[1]
                     if display_value_range is not None else None
                 ),
-                colorbar={"title": metric_label},
+                colorbar={"title": {"text": colorbar_label, "side": "top"}},
                 hovertemplate=(
                     f"{x_name}: %{{x:.4g}}<br>{y_name}: %{{y:.4g}}<br>"
                     f"Interpolated {metric_label}: %{{z:.4g}}<extra></extra>"
@@ -9929,7 +9930,8 @@ def _plot_real_data_landscape(
                         display_value_range[1]
                         if display_value_range is not None else None
                     ),
-                    "showscale": grid is None, "colorbar": {"title": metric_label},
+                    "showscale": grid is None,
+                    "colorbar": {"title": {"text": colorbar_label, "side": "top"}},
                     "line": {"color": "white", "width": 1},
                 },
                 name="measured points",
@@ -9984,10 +9986,18 @@ def _plot_real_data_landscape(
                     path_colorbar_added or len(ordered_path) >= 2
                 )
         fig.update_layout(
-            xaxis_title=x_name,
-            yaxis_title=y_name,
-            xaxis_type="log" if log_frequency and x_name == "frequency" else "linear",
-            yaxis_type="log" if log_frequency and y_name == "frequency" else "linear",
+            xaxis={
+                "title": _metric_label(x_name),
+                "type": "log" if log_frequency and x_name == "frequency" else "linear",
+                "showgrid": False, "zeroline": False, "showline": True,
+                "mirror": True, "ticks": "outside", "linecolor": "#202020",
+            },
+            yaxis={
+                "title": _metric_label(y_name),
+                "type": "log" if log_frequency and y_name == "frequency" else "linear",
+                "showgrid": False, "zeroline": False, "showline": True,
+                "mirror": True, "ticks": "outside", "linecolor": "#202020",
+            },
             height=420,
         )
     else:
@@ -31920,13 +31930,13 @@ def _paper_parameter_sweep_comparison_preset(
     # version of the full Type 1 template.
     if mirrored:
         rects = [
-            (.365, .535, .600, .420), (.035, .755, .290, .195), (.035, .535, .290, .195),
-            (.365, .045, .600, .420), (.035, .275, .290, .195), (.035, .045, .290, .195),
+            (.365, .535, .600, .420), (.035, .855, .290, .090), (.035, .745, .290, .090),
+            (.365, .045, .600, .420), (.035, .300, .290, .140), (.035, .100, .290, .140),
         ]
     else:
         rects = [
-            (.035, .535, .600, .420), (.675, .755, .290, .195), (.675, .535, .290, .195),
-            (.035, .045, .600, .420), (.675, .275, .290, .195), (.675, .045, .290, .195),
+            (.035, .535, .600, .420), (.675, .855, .290, .090), (.675, .745, .290, .090),
+            (.035, .045, .600, .420), (.675, .300, .290, .140), (.675, .100, .290, .140),
         ]
     kinds = (
         "Measured 3D tensor", "SWV trace overlay", "SWV trace overlay",
@@ -31995,6 +32005,8 @@ def _paper_parameter_sweep_comparison_preset(
             # busy without adding information.
             f"bo_composer_real_show_points_{map_index}": False,
             f"bo_composer_real_show_contours_{map_index}": True,
+            f"bo_composer_real_colorbar_side_{map_index}": "right",
+            f"bo_composer_real_compact_square_map_{map_index}": True,
         })
     name = (
         "Type 1B - Sweep comparison (support left)"
@@ -33053,12 +33065,13 @@ def _composer_apply_plotly_text_size(
                     if eye is not None and eye.x is not None
                     else (1.5, 1.5, 1.1)
                 )
-                # Pull back far enough that the cube's left-hand axis title
-                # (frequency, z) is not clipped by the panel edge.
+                # Earlier exports multiplied this by 1.28, overriding the
+                # user's Composer zoom and leaving compact cubes tiny.  Keep
+                # only a small safety margin for axis labels.
                 scene.camera = {
-                    "eye": {"x": base[0] * 1.28, "y": base[1] * 1.28, "z": base[2] * 1.28}
+                    "eye": {"x": base[0] * 1.06, "y": base[1] * 1.06, "z": base[2] * 1.06}
                 }
-                scene.domain = {"x": [0.10, 0.94], "y": [0.02, 0.98]}
+                scene.domain = {"x": [0.08, 0.98], "y": [0.03, 0.97]}
     for annotation in fig.layout.annotations or ():
         annotation.font = {
             **(annotation.font.to_plotly_json() if annotation.font else {}),
@@ -33090,8 +33103,15 @@ def _composer_place_plotly_colorbars(fig: go.Figure, side: str | None) -> go.Fig
     if side not in {"left", "right"}:
         return fig
     left = side == "left"
-    colorbar_x = 0.018 if left else 0.982
-    anchor = "left" if left else "right"
+    meta = fig.layout.meta
+    compact_square_map = bool(
+        isinstance(meta, Mapping) and meta.get("composer_compact_square_map")
+    )
+    # Keep the scale *inside* the panel, beside the cube.  A left position of
+    # .018 is clipped by Plotly's static-export margin and was responsible for
+    # the black, oversized-looking bar in compact Figure 1A.
+    colorbar_x = 0.075 if left else 0.925
+    anchor = "center"
     for trace in fig.data:
         for colorbar in (
             getattr(trace, "colorbar", None),
@@ -33100,8 +33120,10 @@ def _composer_place_plotly_colorbars(fig: go.Figure, side: str | None) -> go.Fig
             if colorbar is not None:
                 colorbar.x = colorbar_x
                 colorbar.xanchor = anchor
-                colorbar.len = 0.80
+                colorbar.len = 0.66
                 colorbar.y = 0.50
+                colorbar.thickness = 10
+                colorbar.title.side = "top"
     for layout_key in fig.layout.to_plotly_json():
         if re.fullmatch(r"coloraxis\d*", str(layout_key)):
             coloraxis = getattr(fig.layout, str(layout_key), None)
@@ -33109,15 +33131,36 @@ def _composer_place_plotly_colorbars(fig: go.Figure, side: str | None) -> go.Fig
             if colorbar is not None:
                 colorbar.x = colorbar_x
                 colorbar.xanchor = anchor
-                colorbar.len = 0.80
+                colorbar.len = 0.66
                 colorbar.y = 0.50
+                colorbar.thickness = 10
+                colorbar.title.side = "top"
         elif re.fullmatch(r"scene\d*", str(layout_key)):
             scene = getattr(fig.layout, str(layout_key), None)
             if scene is not None:
                 scene.domain = {
-                    "x": [0.17, 0.99] if left else [0.01, 0.83],
-                    "y": [0.02, 0.98],
+                    "x": [0.18, 0.99] if left else [0.01, 0.82],
+                    "y": [0.04, 0.96],
                 }
+    if compact_square_map:
+        # A 3.3 x 7 in comparison half has a narrow, tall map slot.  Reserve
+        # the right strip for Q and constrain the data rectangle itself to a
+        # square, matching the clean standalone slice treatment.
+        for trace in fig.data:
+            for colorbar in (
+                getattr(trace, "colorbar", None),
+                getattr(getattr(trace, "marker", None), "colorbar", None),
+            ):
+                if colorbar is not None:
+                    colorbar.x = 0.83
+                    colorbar.xanchor = "center"
+                    colorbar.y = 0.50
+                    colorbar.len = 0.70
+                    colorbar.thickness = 9
+                    colorbar.title.side = "top"
+        fig.update_layout(showlegend=False)
+        fig.update_xaxes(domain=[0.0, 0.70])
+        fig.update_yaxes(domain=[0.15, 0.85])
     return fig
 
 
@@ -33556,6 +33599,11 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
                 continue
             trace.marker.size = spec.get("dot_size", 6)
             trace.marker.opacity = spec.get("dot_opacity", .45)
+        if spec.get("compact_square_map"):
+            # The two Type 1A/B maps share a narrow, tall support column.
+            # Store this export instruction here; the final PNG renderer knows
+            # the panel geometry and makes the data rectangle square.
+            figure.update_layout(meta={"composer_compact_square_map": True})
     if view == "3D tensor":
         highlight_iterations = [
             int(value) for value in spec.get("highlight_iterations", [])
@@ -33589,6 +33637,15 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
         # A cube's Q colorbar is its legend.  Hiding Plotly's generic boxed
         # legend prevents the black "Channel average" key from stealing space.
         figure.update_layout(showlegend=False)
+        if spec.get("metric") == "Paired Q":
+            for trace in figure.data:
+                for colorbar in (
+                    getattr(trace, "colorbar", None),
+                    getattr(getattr(trace, "marker", None), "colorbar", None),
+                ):
+                    if colorbar is not None:
+                        colorbar.title.text = "Q"
+                        colorbar.title.side = "top"
         _apply_plotly_camera(
             figure,
             _valid_plotly_camera(spec.get("camera"))
@@ -35129,7 +35186,7 @@ def _render_figure_composer(
                 else:
                     spec["slice_axis"] = None
                     spec["slice_value"] = None
-                map_style_cols = st.columns(4)
+                map_style_cols = st.columns(5)
                 spec["dot_size"] = int(map_style_cols[0].slider(
                     "Measured point size",
                     2,
@@ -35156,6 +35213,14 @@ def _render_figure_composer(
                     key=f"bo_composer_real_show_contours_{index}",
                     help="Draws unobtrusive iso-response contours over the interpolated map.",
                 )
+                spec["colorbar_side"] = map_style_cols[4].selectbox(
+                    "Q scale side",
+                    ["right", "left"],
+                    key=f"bo_composer_real_colorbar_side_{index}",
+                )
+                spec["compact_square_map"] = bool(st.session_state.get(
+                    f"bo_composer_real_compact_square_map_{index}", False,
+                ))
                 spec["colorscale"] = st.selectbox(
                     "Colorscale",
                     ["Viridis", "Plasma", "Cividis", "Turbo", "Inferno", "Magma"],

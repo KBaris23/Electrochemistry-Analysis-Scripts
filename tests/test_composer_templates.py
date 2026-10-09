@@ -601,8 +601,9 @@ def test_compact_colorbar_stays_inside_left_of_scene():
     ))
     figure.update_layout(scene={"domain": {"x": [0.1, 0.9], "y": [0, 1]}})
     viewer._composer_place_plotly_colorbars(figure, "left")
-    assert figure.data[0].marker.colorbar.x == pytest.approx(.018)
-    assert figure.layout.scene.domain.x[0] == pytest.approx(.17)
+    assert figure.data[0].marker.colorbar.x == pytest.approx(.075)
+    assert figure.data[0].marker.colorbar.thickness == 10
+    assert figure.layout.scene.domain.x[0] == pytest.approx(.18)
 
 
 def test_composer_global_trend_can_add_dashed_running_mean():
