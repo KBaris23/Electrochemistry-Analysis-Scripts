@@ -5,6 +5,24 @@ import bo_session_viewer as viewer
 from core.plotting import add_titration_on_off_difference
 
 
+def test_off_example_rechecks_changed_trace_acceptance(monkeypatch):
+    points = pd.DataFrame({'iteration': [1, 2], 'value': [-10., -5.]})
+    monkeypatch.setattr(viewer, '_real_metric_points', lambda *a, **k: points)
+    monkeypatch.setattr(viewer, '_composer_observation_for_trace', lambda obs, iteration, *a: {'iteration':iteration})
+    monkeypatch.setattr(viewer, '_trace_paths', lambda session, obs: [
+        {'path': (obs['iteration'], i), 'phase': 'buffer' if i < 3 else 'target', 'channel':'1'} for i in range(6)])
+    restored = [False]
+    def arrays(path, *args):
+        if path[0] == 1 and not restored[0]:
+            raise ValueError('Rejected / missing scan')
+        return np.array([-.4,-.2,0.]), np.array([0.,1.,0.]), 1, 0, 2
+    monkeypatch.setattr(viewer, '_swv_trace_arrays', arrays)
+    session = {'config':{}}
+    assert viewer._composer_representative_off(session, [], '1') == 2
+    restored[0] = True
+    assert viewer._composer_representative_off(session, [], '1') == 1
+
+
 def test_reference_validation_layout():
     state = viewer._paper_bo_validation_preset()["config"]["state"]
     assert state["bo_composer_left_0"] > state["bo_composer_left_1"]
@@ -82,4 +100,29 @@ def test_compact_stack_removes_display_gaps_without_changing_records(monkeypatch
     np.testing.assert_allclose(lines[1].get_ydata()-lines[0].get_ydata(), .1)
     assert [r["stack_index"] for r in loaded] == [0,4]
     assert not errors
+    plt.close(fig)
+
+
+def test_waterfall_default_spacing_and_endpoint_labels(monkeypatch):
+    loaded = [dict(iteration=i+1, stack_index=i, phase="buffer", channel="1",
+                   voltage=np.array([-.5,-.4,-.3]), current=np.array([0.,1.,0.])) for i in (0,4)]
+    entries = [({"iteration":r["iteration"]}, {"channel":"1"}) for r in loaded]
+    monkeypatch.setattr(viewer, "_chronological_swv_stack_entries", lambda *a,**kw:(loaded,[],entries))
+    fig, _ = viewer._plot_chronological_swv_stack([],True,["1"],{}, {},"saved","selected",compact_stack=True)
+    x_step, y_step = viewer._chronological_swv_stack_steps(loaded)
+    ax = fig.axes[0]
+    np.testing.assert_allclose(ax.lines[1].get_xdata()-ax.lines[0].get_xdata(), x_step*.55)
+    np.testing.assert_allclose(ax.lines[1].get_ydata()-ax.lines[0].get_ydata(), -y_step*.70)
+    assert ax.lines[0].get_alpha() == .18
+    assert ax.lines[1].get_alpha() == 1.0
+    # Offsets only: waveform shape, voltage order and cached records survive.
+    for line, row in zip(ax.lines[:2], loaded):
+        np.testing.assert_allclose(np.diff(line.get_ydata()), np.diff(row['current']))
+        np.testing.assert_allclose(np.diff(line.get_xdata()), np.diff(row['voltage']))
+    assert [r['stack_index'] for r in loaded] == [0, 4]
+    assert fig._bo_iteration_range == (1,5)
+    label = next(t for t in ax.texts if getattr(t, '_bo_chronological_order_label', False))
+    assert label.get_text() == 'Iteration number'
+    assert label._bo_axis_end[0] > label._bo_axis_start[0]
+    assert label._bo_axis_end[1] < label._bo_axis_start[1]
     plt.close(fig)

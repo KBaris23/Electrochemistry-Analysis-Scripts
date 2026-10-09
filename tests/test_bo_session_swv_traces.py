@@ -2274,7 +2274,7 @@ def test_chronological_order_label_is_marked_for_plot_customization(monkeypatch)
         if getattr(text, "_bo_chronological_order_label", False)
     ]
     assert len(labels) == 1
-    assert labels[0].get_text() == "chronological order"
+    assert labels[0].get_text() == "Iteration number"
     axis_start = labels[0]._bo_axis_start
     axis_end = labels[0]._bo_axis_end
     midpoint_display = figure.axes[0].transData.transform((

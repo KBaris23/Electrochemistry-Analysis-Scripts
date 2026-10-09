@@ -25,6 +25,7 @@ _EXCLUDED_PREFIXES = (
 _EXCLUDED_KEYS = {
     "results", "last_results", "analysis_cache_results", "swv_annotated_results",
     "mat_conversion_report",
+    "bo_composer_source_editor_open",
 }
 
 

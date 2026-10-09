@@ -40,6 +40,14 @@ def test_workspace_without_cache_is_small_and_uses_timestamp_fallback(tmp_path):
     assert recipe.stat().st_size < 2048
 
 
+def test_open_source_dialog_is_not_saved_in_workspace(tmp_path):
+    recipe, _ = save_workspace(tmp_path, 'closed-dialog', {
+        'bo_composer_source_editor_open': 3, 'bo_composer_count': 5,
+    })
+    payload, _ = load_workspace(recipe)
+    assert payload['state'] == {'bo_composer_count': 5}
+
+
 def test_recovery_recipe_is_not_presented_as_a_named_workspace(tmp_path):
     save_workspace(tmp_path, RECOVERY_STEM, {"answer": 42}, cache_results=False)
     saved, _ = save_workspace(tmp_path, "named", {"answer": 43}, cache_results=False)

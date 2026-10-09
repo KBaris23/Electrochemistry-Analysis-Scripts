@@ -3,6 +3,101 @@
 Interactive Streamlit app for batch SWV/CV electrochemistry analysis and saved
 Bayesian-optimization sessions.
 
+## Current workflow and capabilities
+
+For the manuscript's exact dataset paths, channels and analysis settings, use
+[the per-figure paper guide](paper/README.md). Start with the sweep, then BO
+validation, then titration. These are different inputs, not interchangeable tabs.
+
+| Task | Mode / input | Output |
+|---|---|---|
+| SWV processing | SWV; measurement CSVs or converted MAT files | Raw/smoothed/corrected overlays, peak metrics, failures, tables and export bundles |
+| CV processing | CV; supported CV files | CV traces, analysis, plots and exports |
+| Parameter sweep | BO Session; **survey** session | Types 1 / 1A / 1B: measured landscape, example SWVs and slices |
+| BO validation | BO Session; **optimization** session | Type 2: cube, Q with running mean, buffer/target trend, chronological SWVs, parallel coordinates; Type 2A: cube and two trends |
+| Titration response | SWV → **Paper Figures**; titration and Langmuir enabled | Type 3: manual/optimized SWVs, response and fits; Type 3B: ON/OFF rows with a shared fit/difference panel |
+| Concentration prediction | Same SWV channel/method/step selection | Type 4: concentration by measurement and predicted versus known; within-calibration assessment, not independent validation |
+
+**Why a preset is missing:** survey inputs offer the Type 1 family; optimization
+inputs offer the Type 2 family. Types 3/3B/4 are in SWV **Paper Figures**, not the
+BO preset menu. Saved custom presets additionally require compatible data fields
+and plot types. Select the correct session before loading a preset.
+
+### Analysis settings and scientific safeguards
+
+BO corrected traces use the session's saved analysis snapshot by default. In
+SWV mode, the sidebar can automatically load a uniquely matched nearby snapshot
+when input folders change, including extracted titrations with provenance in
+`session_log.txt`. Use **Check current settings**, **Reload matched settings**, or
+enter the snapshot/session/experiment path manually. Ambiguous matches require
+your choice. Settings stay editable; click **Run Analysis** to apply changes.
+
+| Option | Effect | Does not do |
+|---|---|---|
+| Composer **Clip extreme values** | Limits trend y-ranges or color ranges to the 1st–99th percentiles | Does not delete observations, recompute Q, or remove outliers from fits |
+| SWV **Remove extreme titration outliers** | Excludes extreme responses within each channel/method and interval; robust modified z-score cutoff 5, with a zero-MAD consensus fallback; prediction filtering also checks log concentrations | Does not change raw files or supply missing measurements |
+| **Concentrations included in titration statistics** | Selects steps for plateau statistics, fits, SNR and prediction analysis | Not the same as cropping the displayed measurement range |
+| Plateau edge trim | Uses the middle of each interval for plateau estimation | Does not repair failed peak detection |
+| Immediately preceding buffer | Corrects each target plateau against its preceding buffer | Does not invent a missing baseline; fits need a valid anchor buffer |
+| Landscape interpolation | Estimates a response surface between measured parameter points | Interpolated pixels are not additional experiments or repaired Q observations |
+
+Missing/unreadable scans and failed acceptance checks remain failures or omitted
+values. The chronological stack packs accepted displayed traces together; its
+spacing represents order, not elapsed time. There is **no automatic scientific
+data imputation** for missing SWV scans, titration doses or Q observations.
+Restore genuine missing source files and rerun analysis, or report omissions.
+Do not use visual clipping to conceal exclusions in the paper; document every
+analysis filter and compare filtered/unfiltered results.
+
+### Composer editing, rendering and reuse
+
+- **Layout:** select blocks locally without a full app rerun. Drag any handle,
+  or enter X/Y/Width/Height percentages in **Selected block**. The default grid
+  is 1%; **Fit width** fills the editor without changing export proportions.
+  **Square**, Ctrl/Cmd+C/V, and geometry undo/redo (Ctrl/Cmd+Z, Ctrl+Y or
+  Ctrl/Cmd+Shift+Z) are available. Undo does not restore deleted panels or source
+  changes. **Apply layout** saves the draft; **Reset edits** discards it.
+- **Formatting:** use **Edit panel** for camera, marker size, fonts, axes,
+  legends, borders and layout. Block bounds include labels and colorbars.
+  **Allow overlap** deliberately permits overlapping rectangles. Exports crop
+  unused outer workspace; workspace zoom is separate from physical figure size.
+- **Source:** **Edit source — panel …** opens a focused dialog for supported
+  traces, cubes/maps, trends, chronological stacks and parallel coordinates.
+  **Preview source changes** renders only that draft panel. **Update panel**
+  saves source settings without changing its placement/style; click **Render
+  figure** to update the whole figure. **Add as new panel** preserves the original.
+  Linked sweep channels, trace iterations and slice planes remain synchronized.
+  This dialog is not a general jump back to every original plotting tab.
+- **Other plots:** generate them in their source tab, then use **Add to Composer**
+  or **Replace selected Composer panel**. Captured/image panels have different
+  editing capabilities from live generated panels. SWV Paper Figures are guided
+  composites, not arbitrary independently editable Composer panels.
+- **Exports:** use **Render figure (fast preview)** first, then **Create final
+  PNG/PDF/SVG**. Titration Paper Figures contain rasterized subplots even in PDF;
+  set their panel raster DPI before generation. Transparent export and optional
+  panel letters are supported.
+- **Presets:** local named presets are in `.figure_composer_presets.json` under
+  the app directory; saving the same name replaces that saved preset. Built-in
+  templates are defined in `bo_session_viewer.py`. Use your own preset name to
+  preserve variants. Share a metadata JSON/portable figure package explicitly;
+  local presets and generated figures are ignored by Git.
+
+### Saved analysis sessions
+
+Open the sidebar's **Saved analysis sessions**, enter **Save as**, then click
+**Save**. Choose the saved entry and **Open** to return later. Recipes are stored
+in `analysis_sessions/` relative to the app's launch working directory. Paths
+inside them are retained as recorded and are **not automatically portable** to
+another computer. Start the app from its repository folder for consistent storage.
+
+Recipes contain settings, annotations and paths; raw data are not copied. The
+optional derived-results cache speeds up reopening but uses more space and is
+discarded when the checked input signature changes. Only load trusted local
+caches (they use Python pickle). Recovery is saved on ordinary app reruns.
+There is no reliable save-on-browser-close prompt or built-in double-click
+association for session JSON files. Make a named save before leaving; use a
+portable figure package separately for captured figure assets.
+
 ## Setup
 
 ```bash

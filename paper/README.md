@@ -1,10 +1,48 @@
 # BO paper: working guide
 
-Updated 8 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage/data-audit instructions. Raw data remain in `C:\TEMP\BO`. Start with the exact runbook below; the remaining sections explain the assessment and later work.
+Updated 9 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage/data-audit instructions. Raw data remain in `C:\TEMP\BO`. Start with the exact runbook below; the remaining sections explain the assessment and later work.
 
 ## 0. Start here: planar-kana sweep first
 
+### Final software audit (9 October)
+
+The real-input smoke checks loaded the kana sweep and all four BO experiments,
+validated preset compatibility, and regenerated their selected BO validation
+figures. The Streamlit widget path was exercised for sweep source editing and
+BO stack edits (including changing and applying the displayed trace count).
+Removing whole-experiment hashing from automatic OFF-example selection reduced
+the measured warm sweep rerun from about 10.6 to 2.5 seconds in the local test
+harness; timings are not a guarantee for every computer or final export.
+
+Selected-channel titration processing used each experiment's saved analysis
+settings and acceptance windows, with outlier removal **off**. Counts include
+all methods on that physical channel, not just the optimized method:
+
+| Dataset / physical channel | Analyzed scans | Accepted | Rejected |
+|---|---:|---:|---:|
+| Kana setup 5 / 5 | 600 | 594 | 6 |
+| Kana station 2 / 10 | 600 | 571 | 29 |
+| Amp0 / 10 | 480 | 241 | 239 |
+| Vanco / 6 | 600 | 600 | 0 |
+
+These are processing checks, **not new Kd/LOD results or a claim that every
+channel responds**. Amp0's rejected scans must remain reported. Vanco channel 6
+belongs to **BO Group 4**, not Group 6; selecting mismatched group/channel data
+produces empty panels. The raw-data directories were not modified. Before the
+paper handoff, inspect one final export at intended size and save/reopen one
+named workspace in the actual browser. Automated tests do not replace that
+browser/print-size check or independent validation of fitted concentrations.
+
 ### Latest reference-figure fixes
+
+- **Missing presets:** Types 1/1A/1B appear for survey sessions; Types 2/2A appear for optimization sessions. For kana validation, replace the `parameter_sweep...` path with the `planar_BO_kana...` BO path in Figure B below. Types 3/3B/4 are under **SWV → Paper Figures**.
+- **Edit source:** Preview renders just the selected plot. Update saves its source settings without rebuilding the whole composition; click **Render figure** afterward. Stack and parallel-coordinate source controls are supported too. In a stack, **Maximum displayed traces** controls display sampling and rendering cost, not scientific analysis.
+- See the [main README capability guide](../README.md#current-workflow-and-capabilities) for save/reopen limitations, outlier filtering versus display clipping, and missing-data handling. No missing measurements are synthesized.
+
+- **Canvas boxes now describe the whole panel**, including titles, labels, legends and colourbars. Rendering fits those elements inside the box with a small safety margin. Ordinary 2D charts use the available width/height; cubes, square maps and embedded images retain their proportions. Very small boxes can reduce text size, so enlarge the box if needed.
+- **Allow overlap**, below the manual layout canvas, is off by default. Touching edges are fine; overlapping boxes cannot be applied/rendered unless you enable it. Existing rectangles are not moved automatically. Export still crops unused outside canvas without deleting the deliberate gaps between panels. Explicit cross-panel zoom connectors remain cross-panel annotations.
+
+- The Composer chronological stack now follows the paper's direction: early scans are faint at the upper-left/back; later scans progress toward the lower-right/front in darker blue/orange. Current is not inverted: only the display offsets change. Its title retains the displayed iteration range. Offset spacing indicates order, not elapsed time; no additional smoothing, normalization or scan selection is applied by this style. Refresh the app and click **Render figure (fast preview)** to update an existing composition. Only reload a preset if you also want to reset its layout.
 
 - Type 1/1A/1B now default to **Raw / unsmoothed (corrected)**. In **Edit panel → B/C → Trace smoothing (after correction)** choose raw or smoothed; either retains saved BO baseline correction and the selected peak-bracket crop. Linked controls no longer reset this choice. Reload a preset for the new default; existing saved selections are preserved.
 - **Edit panel → Show SWV example markers** independently hides/shows the coloured symbol in an SWV panel or the highlighted points and iteration callouts on a cube. Q colours, slice planes, waveform titles and selected data are unchanged.
@@ -12,7 +50,7 @@ Updated 8 October 2026. This replaces the old handoff, STEP_BY_STEP, and storage
 
 - Reload **Type 2** or **Type 2A**, then render again to apply the new preset geometry. Existing saved layouts are not overwritten. Type 2 uses a large 4:3 workspace: two trends upper-left, progression cube upper-right, chronological SWVs lower-left, parallel coordinates lower-right. Type 2A omits the bottom panels and uses a wide workspace.
 - Q has a dashed five-point trailing mean; buffer/target remain blue/orange. Trend titles, black axes frames and upper-left boxed legends remain visible. The cube has separate Q and red-to-black iteration scales. Parallel coordinates highlight the **selected observation**, not an assumed optimum; select the desired observation before rendering. Step size is shown in mV.
-- Select the same channel/direction throughout (for example `5_max` for kana channel 5 ON). Archived physical-channel trace names are reconciled with directional analysis names. The chronological stack uses saved BO analysis settings by default and labels its displayed subset; rejected scans are omitted rather than plotted uncorrected.
+- Select the same channel/direction throughout (for example `5_max` for kana channel 5 ON). Archived physical-channel trace names are reconciled with directional analysis names. The chronological stack uses saved BO analysis settings by default and shows the displayed iteration range without “subset” in the title. Its arrow reads **Iteration number**. Rejected scans are omitted rather than plotted uncorrected.
 - SWV **Paper Figures** Types 3/3B/4 now export transparent, tightly cropped figures. **Show panel letters** is optional and off by default. These composites still contain rasterized panels: set **Panel raster DPI** before generating; PDF does not make those panels vector graphics.
 - Type 3B includes ON, OFF and **ON minus OFF at matched positive concentrations**. The latter subtracts the baseline-processed plateau values, averaging repeated doses within each method. It is a descriptive difference curve, **not a third Langmuir fit**. No unmatched dose is extrapolated. Choose the baseline mode deliberately before generation.
 - For Types 3/3B/4, the measurement range is a display crop. Fits use all included titration steps; change the included doses to change the calibration fit. Type 4 remains within-calibration prediction, not independent validation.
@@ -93,7 +131,7 @@ Use this figure to show that BO explored parameter space and improved/selected w
 |---|---|---|
 | Kana setup 5 | `C:\TEMP\BO\500um_planar_BO_try_again_20260918_112055\planar_BO_kana_20260918_112056\bo_sessions\bo_113013_8dd581` | Channel 5; **maximize** |
 | Amp0 | `C:\TEMP\BO\100um_amp0_high_conc_20260915_130213\amp0_100um_20260915_130234\bo_sessions\bo_145633_9f5760` | Channel 10; **minimize** |
-| Vanco | `C:\TEMP\BO\vanco_first_try_20260826_132944\vanco_try_1_20260826_132945\bo_sessions\bo_142117_84662a` | Channel 6; **minimize** |
+| Vanco | `C:\TEMP\BO\vanco_first_try_20260826_132944\vanco_try_1_20260826_132945\bo_sessions\bo_142117_84662a` | **Group 4**, channel `6_min`; **minimize** (group IDs are not channel numbers) |
 | Kana station 2 | `C:\TEMP\BO\500um_planar_kana_20260917_170330\500um_planar_kana_20260917_170349\bo_sessions\bo_171120_dc5dbc` | Channel 10; **maximize** |
 
 ```text
@@ -207,10 +245,11 @@ The app deliberately has two figure tools:
 **Editing content without losing layout:** select a panel (click its layout
 rectangle or use **Edit panel**), then use **Selected panel source → Edit source**.
 The dedicated source editor opens the panel's existing choices. **Preview source
-changes** previews the draft; **Update panel** applies it and refreshes Composer;
+changes** previews just the draft panel; **Update panel** saves its settings.
+Click **Render figure** afterward to refresh the full composition;
 **Add as new panel** makes an independent copy; **Cancel / Back** discards the
-draft. This editor currently covers SWV overlays, measured cubes/maps, Q trends,
-and buffer/target trends. It uses the same plotting routines and BO settings as
+draft. This editor covers SWV overlays, measured cubes/maps, Q trends,
+buffer/target trends, chronological stacks and parallel coordinates. It uses the same plotting routines and BO settings as
 the final figure, without switching browser tabs. In linked sweeps, channel,
 trace iteration and slice edits also update their cube links. **Reset source
 iteration choices** returns to automatic example selection.
@@ -221,19 +260,34 @@ panel's content while retaining its layout; replacing a linked sweep panel turns
 the composition into an independent custom layout. Captured plots do not yet
 support reopening every original tab control automatically.
 
-Use **Workspace zoom → 125–200%** to enlarge the editor, then scroll within it.
-This is editing zoom and does not change export dimensions. Cube highlight
+The editor defaults to **Workspace zoom → Fit width** and a **1% grid**.
+It fills the available width uniformly; tall figures scroll vertically rather
+than becoming narrow thumbnails. Use **Fit whole figure** for an overview or
+**125–200%** for closer editing. This view-only zoom preserves panel proportions,
+layout coordinates, and exported PNG dimensions. Exports still crop to the
+figure's content, not the visible editor workspace. Physical figure-size controls
+remain separate and do affect rendering scale. Cube highlight
 callouts identify iterations; red circles and blue diamonds match the symbols
 in the corresponding SWV panels. Channel titles follow the cube top.
 
 Layout editing: drag any of the eight edge/corner handles to resize. Enable
 **Snap** and choose the grid spacing. Select a panel to enter X/Y/width/height
-as percentages; Y starts at the bottom. **Make square** makes a square at the
-actual printed canvas proportions. **Copy panels / Paste panels** (Ctrl/Cmd+C/V
+as percentages in the **Selected block** row; press Tab or click outside to
+finish entering a value. Increasing width/height moves the block inward if
+needed instead of silently reducing your requested size. Y starts at the bottom.
+**Square** makes a square at the actual printed canvas proportions.
+**Copy / Paste** (Ctrl/Cmd+C/V
 while focused on the layout canvas) duplicates plot settings as well as geometry,
 up to 12 panels. Copies switch a linked sweep template to a custom composition.
 Use Ctrl/Cmd-click for multiple selection and right-click for alignment or equal
-sizes. Click **Apply layout** before rendering. Type 1 SWV panels have no coloured
+sizes. **Ctrl/Cmd+Z** undoes moves, resizing, square and alignment edits;
+**Ctrl+Y** or **Ctrl/Cmd+Shift+Z** redoes them. This geometry history is local to
+the open editor; adding/deleting panels or loading a different layout clears it.
+It does not undo plot-content changes or panel deletion. Normal text-field
+shortcuts remain native while typing. Selecting a block no longer triggers an
+app rerun; use **Edit plot settings** explicitly to apply the layout and open
+that panel's settings. **Reset edits** discards the draft and restores the latest
+server layout. Click **Apply layout** before rendering. Type 1 SWV panels have no coloured
 outer frames by default; reload the preset to replace older saved defaults.
 
 **Type 2 uses the loaded BO optimization session**, including its iteration

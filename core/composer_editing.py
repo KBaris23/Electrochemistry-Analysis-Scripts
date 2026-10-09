@@ -25,6 +25,17 @@ SOURCE_FIELDS = {
     },
     "Global trend": {"metric": "global_metric", "running_mean_window": "global_running_mean"},
     "Buffer/target trend": {"metric": "paired_metric", "channels": "paired_channels"},
+    "Chronological SWV stack": {
+        "channels": "stack_channels", "phases": "stack_phases",
+        "corrected": "stack_corrected", "corrected_trace_key": "stack_trace_key",
+        "normalize_to_peak": "stack_norm", "offset_to_baseline": "stack_offset",
+        "max_traces": "stack_max_traces", "use_bo_snapshot": "stack_snapshot",
+    },
+    "Measured parallel coordinates": {
+        "channels": "measured_channels", "metric": "measured_metric",
+        "phase": "measured_phase", "average_channels": "measured_average",
+        "parameters": "measured_parallel_params",
+    },
 }
 
 
@@ -75,5 +86,7 @@ def apply_source_edit(state, edit):
                 planes[index-4] = spec["slice_value"]
                 state[prefix + "_slice_values"] = list(dict.fromkeys(planes))
     state["bo_composer_active_panel"] = index
-    state["bo_composer_auto_render"] = True
+    # Source changes are cheap state edits. Rebuilding every panel here made
+    # Update feel frozen; the user can preview one source or render explicitly.
+    state["bo_composer_auto_render"] = False
     return True

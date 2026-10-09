@@ -10,6 +10,7 @@ import contextvars
 import copy
 import hashlib
 import html
+import inspect
 from concurrent.futures import FIRST_COMPLETED, wait
 from contextlib import ExitStack
 from functools import lru_cache
@@ -20850,6 +20851,13 @@ def _plot_chronological_swv_stack(
         x_offset_per_iteration,
         y_offset_per_iteration,
     )
+    if compact_stack:
+        if x_offset_per_iteration is None:
+            x_step *= .55
+        if y_offset_per_iteration is None:
+            # Paper view: earliest scans recede upper-left; later scans move
+            # toward the foreground at lower-right. Do not invert current.
+            y_step *= -.70
     phase_colors = SWV_PHASE_COLORS
     use_phase_colors = any(
         str(row["phase"]).lower() in phase_colors for row in loaded
@@ -20873,6 +20881,9 @@ def _plot_chronological_swv_stack(
         age = (offset_index - stack_min) / stack_span
         age = min(1.0, max(0.0, float(age)))
         alpha = min(1.0, max(0.0, 0.18 + 0.82 * age))
+        phase = str(row.get("phase", "")).lower()
+        if compact_stack and phase in ("buffer", "target"):
+            phase_trace_colors[row_index] = plt.get_cmap("Blues" if phase == "buffer" else "Oranges")(.30 + .56*age)
         ax.plot(
             row["voltage"] + offset_index * x_step,
             row["current"] + offset_index * y_step,
@@ -20935,6 +20946,11 @@ def _plot_chronological_swv_stack(
         oldest_edge[0] + 1.04 * axis_dx + normal_x * side_gap,
         oldest_edge[1] + 1.04 * axis_dy + normal_y * side_gap,
     )
+    if compact_stack:
+        # Give the paper-view arrow a little more clearance from the scans.
+        arrow_left_shift = plotted_x_span * .035
+        axis_start = (axis_start[0] - arrow_left_shift, axis_start[1])
+        axis_end = (axis_end[0] - arrow_left_shift, axis_end[1])
     parameter_lines = _swv_trace_parameter_lines(
         [item for _observation, item in entries],
         entries[-1][0],
@@ -20990,7 +21006,7 @@ def _plot_chronological_swv_stack(
     chronological_order_label = ax.text(
         label_position[0],
         label_position[1],
-        "chronological order",
+        "Iteration number",
         fontsize=8,
         color="#222222",
         ha="center",
@@ -21005,6 +21021,9 @@ def _plot_chronological_swv_stack(
     chronological_order_label._bo_axis_start = axis_start
     chronological_order_label._bo_axis_end = axis_end
     _position_chronological_order_label(ax, chronological_order_label)
+    if compact_stack:
+        # Keep iteration IDs available without adding labels over crowded traces.
+        fig._bo_iteration_range = (oldest_iteration, newest_iteration)
     channel_handles = [
         Line2D(
             [0],
@@ -31094,6 +31113,7 @@ def _render_app_scrollbar_style() -> None:
 _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_pending_source_edit",
     "bo_composer_source_draft",
+    "bo_composer_source_editor_open",
     "bo_composer_capture_counter",
     "bo_composer_consumed_seq",
     "bo_composer_render_",
@@ -31921,13 +31941,6 @@ def _paper_parameter_sweep_preset(
         aspect="ACS 2-col square (7.0 x 7.0 in)",
         extra_state=extra,
     )
-    if compact_stack:
-        # Less translation makes each waveform wider/taller within the panel;
-        # measured voltage/current arrays themselves are never stretched.
-        if x_offset_per_iteration is None:
-            x_step *= .55
-        if y_offset_per_iteration is None:
-            y_step *= .70
 
 
 def _paper_parameter_sweep_comparison_preset(
@@ -32264,10 +32277,13 @@ def _composer_validate_saved_config(
                 )
                 break
         for axis in ("x", "y", "z"):
+            # Only data-axis selectors refer to columns. Camera, label and
+            # zoom coordinates share the suffix but are presentation values.
             axis_values = [
-                value
-                for key, value in state.items()
-                if str(key).endswith(f"_{axis}_{index}") and value
+                state[key]
+                for family in ("real", "measured", "sur", "surrogate", "hp")
+                for key in (f"bo_composer_{family}_{axis}_{index}",)
+                if state.get(key)
             ]
             for value in axis_values:
                 if field_set and str(value) not in field_set:
@@ -32834,10 +32850,15 @@ def _composer_signal_extreme_iterations(
     return int(on_row["iteration"]), int(off_row["iteration"])
 
 
-@st.cache_data(show_spinner=False, max_entries=16)
 def _composer_representative_off(session: dict, observations: list[dict], channel: str) -> int | None:
     """Lowest negative Q among 12 leading candidates with six accepted scans
-    and buffer/target peak centers within 50 mV. Presentation selection only."""
+    and buffer/target peak centers within 50 mV. Presentation selection only.
+
+    Do not cache/hash the entire session here: large surveys contain millions
+    of nested values and hashing cost dominated every Composer interaction.
+    Trace processing already has file-version-aware caches; recheck this small
+    candidate list so restored/changed files also invalidate the selection.
+    """
     points = _real_metric_points(observations, "Paired Q", "target", [channel], False)
     if points.empty:
         return None
@@ -33980,7 +34001,10 @@ def _composer_build_chronological_swv(
     )
     if errors:
         figure._composer_trace_failures = list(errors)
-    figure.suptitle("Chronological SWV scans (display subset)", fontsize=spec.get("text_size", 10), y=.99)
+    iteration_range = getattr(figure, "_bo_iteration_range", None)
+    stack_title = (f"Chronological SWVs · iterations {iteration_range[0]}–{iteration_range[1]}"
+                   if iteration_range else "Chronological SWV scans")
+    figure.suptitle(stack_title, fontsize=spec.get("text_size", 10), y=.99)
     if figure.axes:
         # The source tab reserves half its height for waveform metadata. In a
         # composite that metadata is redundant; let the stack fill its panel.
@@ -33990,8 +34014,11 @@ def _composer_build_chronological_swv(
         axis.margins(x=.025, y=.04)
         for line in axis.lines:
             if len(line.get_xdata()) > 10:
-                line.set_alpha(max(.45, line.get_alpha() or 1.0))
-                line.set_linewidth(.95)
+                line.set_linewidth(1.1)
+                # A subtle white separation keeps crossing traces legible.
+                import matplotlib.patheffects as path_effects
+                line.set_path_effects([path_effects.Stroke(linewidth=1.7, foreground="white", alpha=.7 * (line.get_alpha() or 0.0)),
+                                       path_effects.Normal()])
         for label in figure.texts:
             if getattr(label, "_bo_customizable_ylabel", False):
                 label.set_text("Normalized current" if spec.get("normalize_to_peak") else "Current (uA)")
@@ -34527,7 +34554,9 @@ def _build_composer_figure_inner(
             for metric, columns in _channel_metric_columns(history).items()
             if _history_metric_impacts_q(metric, session["config"], paired_objective)
         }
+        panel_snapshots = []
         for index, spec in enumerate(specs):
+            panel_snapshots.append((set(fig.axes), set(fig.texts), set(fig.artists)))
             ax = fig.add_axes(spec["rect"])
             kind = spec["kind"]
             panel_header = str(spec.get("header") or "")
@@ -34775,6 +34804,14 @@ def _build_composer_figure_inner(
                     va="top",
                     ha="left",
                 )
+        panel_snapshots.append((set(fig.axes), set(fig.texts), set(fig.artists)))
+        panel_groups = []
+        for index, spec in enumerate(specs):
+            before, after = panel_snapshots[index:index+2]
+            axes = list(after[0]-before[0])
+            for parent in list(axes):
+                axes.extend(child for child in parent.child_axes if child not in axes)
+            panel_groups.append((spec["rect"], axes, list(after[1]-before[1]), list(after[2]-before[2])))
         for spec in specs:
             source_index = spec.get("zoom_from")
             if not isinstance(source_index, int) or not 0 <= source_index < len(specs):
@@ -34845,6 +34882,9 @@ def _build_composer_figure_inner(
     for cube in fig.axes:
         if hasattr(cube, "_composer_cube_title"):
             _composer_cube_annotations(cube, cube.xaxis.label.get_fontsize())
+    from core.composer_bounds import fit_panel_bounds
+    fit_panel_bounds(fig, panel_groups)
+    fig._composer_panel_groups = panel_groups
     _COMPOSER_CLIP_EXTREMES.set(False)
     return fig
 
@@ -34922,14 +34962,23 @@ def _composer_filter_optimizer(
     return kept, history
 
 
-@st.dialog("Edit plot source", width="large")
+def _composer_close_source_editor():
+    st.session_state.pop("bo_composer_source_editor_open", None)
+
+
+_SOURCE_DIALOG_DISMISS_SUPPORTED = "on_dismiss" in inspect.signature(st.dialog).parameters
+
+
+@st.dialog("Edit plot source", width="large", **(
+    {"on_dismiss": _composer_close_source_editor} if _SOURCE_DIALOG_DISMISS_SUPPORTED else {}
+))
 def _composer_source_editor(index, source_spec, session, history, observations, observation, analysis, paired):
     """Draft changes use the same generation routines as the final panel."""
     draft = copy.deepcopy(source_spec)
     kind = draft["kind"]
     letter = chr(65 + index)
     linked = bool(st.session_state.get("bo_composer_type1_compact_linked_controls") or st.session_state.get("bo_composer_type1_linked_controls"))
-    st.caption(f"Editing panel {letter} — {kind}. Layout and formatting will be preserved.")
+    st.caption(f"Editing panel {letter} — {kind}. Preview renders only this panel; Update saves its source choices. Then use Render figure to refresh the full composition. Layout and formatting are preserved.")
     if linked:
         st.info("This panel belongs to a linked sweep. Channel changes apply to the group; trace and slice choices update the matching cube.")
     channels = _real_data_channels(observations)
@@ -34947,15 +34996,20 @@ def _composer_source_editor(index, source_spec, session, history, observations, 
         draft["corrected"] = st.checkbox("Corrected trace", value=bool(draft.get("corrected", True)))
         draft["use_bo_snapshot"] = st.checkbox("Use saved BO analysis settings", value=bool(draft.get("use_bo_snapshot", True)))
         keys = ["corrected_current", "smoothed_corrected_current", "wavelet_denoised_current"]
-        draft["corrected_trace_key"] = st.selectbox("Trace processing", keys, index=keys.index(draft.get("corrected_trace_key",keys[0])),
+        old_key = draft.get("corrected_trace_key", keys[0])
+        draft["corrected_trace_key"] = st.selectbox("Trace processing", keys, index=keys.index(old_key) if old_key in keys else 0, disabled=not draft["corrected"],
             format_func=lambda key: {"corrected_current": "Raw / unsmoothed (corrected)", "smoothed_corrected_current": "Smoothed (corrected)", "wavelet_denoised_current": "Wavelet denoised"}[key])
         draft["crop_to_minima"] = st.checkbox("Display detected peak bracket only", value=bool(draft.get("crop_to_minima",True)))
         draft["normalize_to_peak"] = st.checkbox("Normalize to peak", value=bool(draft.get("normalize_to_peak",False)))
-    elif kind in ("Measured 3D tensor", "Measured 2D map"):
+    elif kind in ("Measured 3D tensor", "Measured 2D map", "Measured parallel coordinates"):
         metrics = list(REAL_DATA_METRICS)
         draft["metric"] = st.selectbox("Response metric", metrics, index=metrics.index(draft["metric"]), disabled=linked)
         phases = ["buffer","target"] if paired else ["measurement"]
         draft["phase"] = st.selectbox("Phase", phases, index=phases.index(draft["phase"]) if draft["phase"] in phases else 0, disabled=linked)
+        if kind == "Measured parallel coordinates":
+            dimensions = _composer_parameter_dimensions_from_observations(observations)
+            draft["parameters"] = st.multiselect("Parameter axes", dimensions,
+                default=[p for p in draft.get("parameters", []) if p in dimensions])
         if kind == "Measured 2D map" and draft.get("slice_axis"):
             points = _composer_real_points(draft, observations)
             values = _numeric_slice_values(points, draft["slice_axis"])
@@ -34969,6 +35023,20 @@ def _composer_source_editor(index, source_spec, session, history, observations, 
     elif kind == "Buffer/target trend":
         metrics = list(PAIRED_TREND_METRICS)
         draft["metric"] = st.selectbox("Metric", metrics, index=metrics.index(draft["metric"]))
+    elif kind == "Chronological SWV stack":
+        phases = ["buffer", "target"] if paired else ["measurement"]
+        draft["phases"] = st.multiselect("Phases", phases,
+            default=[p for p in draft.get("phases", phases) if p in phases])
+        draft["corrected"] = st.checkbox("Corrected trace", value=bool(draft.get("corrected", True)))
+        draft["use_bo_snapshot"] = st.checkbox("Use saved BO analysis settings", value=bool(draft.get("use_bo_snapshot", True)))
+        keys = ["corrected_current", "smoothed_corrected_current", "wavelet_denoised_current"]
+        old_key = draft.get("corrected_trace_key", keys[1])
+        draft["corrected_trace_key"] = st.selectbox("Trace processing", keys,
+            index=keys.index(old_key) if old_key in keys else 1, disabled=not draft["corrected"])
+        draft["max_traces"] = st.number_input("Maximum displayed traces", 2, 500, int(draft.get("max_traces", 120)),
+            help="Representative displayed traces, not invented scans. Lower values render faster. Analysis results are unchanged.")
+        draft["normalize_to_peak"] = st.checkbox("Normalize to peak", value=bool(draft.get("normalize_to_peak", False)))
+        draft["offset_to_baseline"] = st.checkbox("Offset baseline", value=bool(draft.get("offset_to_baseline", False)))
     if st.button("Preview source changes"):
         preview = dict(draft, rect=[.08,.10,.83,.80], show_label=False)
         figure = None
@@ -34986,11 +35054,13 @@ def _composer_source_editor(index, source_spec, session, history, observations, 
     if add.button("Add as new panel", disabled=int(st.session_state.get("bo_composer_count",0)) >= 12):
         action = "add"
     if action:
+        _composer_close_source_editor()
         st.session_state["bo_composer_pending_source_edit"] = {
             "index": index, "spec": draft, "duplicate": action == "add",
         }
         st.rerun()
     if cancel.button("Cancel / Back"):
+        _composer_close_source_editor()
         st.rerun()
 
 
@@ -35004,7 +35074,7 @@ def _render_figure_composer(
 ) -> None:
     pending_edit = st.session_state.pop("bo_composer_pending_source_edit", None)
     if pending_edit and apply_source_edit(st.session_state, pending_edit):
-        st.success("Source updated. Layout preserved; refreshing the Composer preview.")
+        st.success("Source settings updated; layout preserved. Click Render figure to refresh the full preview.")
     added_captures, skipped_captures = _composer_apply_pending_captures()
     duplicates = st.session_state.pop("bo_composer_pending_duplicates", [])
     count_before = int(st.session_state.get("bo_composer_count", 4))
@@ -35054,7 +35124,7 @@ def _render_figure_composer(
             **Manual mouse layout**
 
             - Drag a panel to move it.
-            - Drag its lower-right square to resize it.
+            - Drag any edge/corner handle to resize it; enter Width/Height for exact sizes.
             - Make as many mouse edits as needed, then click **Apply layout** once.
             - Ctrl-click (Cmd-click on macOS) to select multiple panels.
             - Click **Delete selected**, press Delete/Backspace, or use the
@@ -35062,6 +35132,8 @@ def _render_figure_composer(
             - Right-click a selected panel to align, match sizes, or distribute.
             - Click empty canvas space to clear the selection.
             - Use the coordinate fields for exact final adjustments.
+            - Ctrl/Cmd+C/V copies/pastes panels; Ctrl/Cmd+Z undoes geometry edits.
+            - Edit source previews one panel; Update saves choices, then Render refreshes the figure.
             - Mouse and coordinate changes remain pending until **Render figure**.
             """
         )
@@ -35189,6 +35261,15 @@ def _render_figure_composer(
         )
     saved_presets.update(_composer_load_presets())
     with st.expander("Load a preset or saved figure", expanded=False):
+        st.info(
+            "Survey session: Types 1 / 1A / 1B show the parameter landscape. "
+            "For BO validation (Types 2 / 2A), open the optimization session, not parameter_sweep. "
+            "Titration Types 3 / 3B / 4 are in SWV mode → Paper figures."
+            if is_survey_session else
+            "Optimization session: Types 2 / 2A show BO validation. "
+            "For Types 1 / 1A / 1B, open a parameter-sweep (survey) session. "
+            "Titration Types 3 / 3B / 4 are in SWV mode → Paper figures."
+        )
         preset_cols = st.columns([2.2, 1])
         selected_preset_name = preset_cols[0].selectbox(
             "Named preset",
@@ -35474,7 +35555,7 @@ def _render_figure_composer(
             if iteration is not None:
                 st.session_state[f"bo_composer_trace_iteration_{index}"] = iteration
             st.session_state[f"bo_composer_trace_channels_{index}"] = [linked_channel]
-            st.session_state[f"bo_composer_trace_corrected_{index}"] = True
+            st.session_state.setdefault(f"bo_composer_trace_corrected_{index}", True)
             # Keep the user's processing choice across linked-control reruns.
             st.session_state.setdefault(f"bo_composer_trace_key_{index}", "corrected_current")
         st.session_state["bo_composer_trace_role_1"] = "Signal-on (max paired Q)"
@@ -35495,6 +35576,7 @@ def _render_figure_composer(
             labels=[chr(ord("A") + index) for index in range(panel_count)],
             aspect=aspect,
             key="bo_composer_layout_editor",
+            allow_overlap=bool(st.session_state.get("bo_composer_allow_overlap", False)),
             default=None,
         )
         if _composer_apply_layout_editor_result(editor_result, panel_count):
@@ -35506,6 +35588,9 @@ def _render_figure_composer(
             "multi-select · Delete/Backspace removes selected panels · "
             "right-click for alignment · use Snap, Make square, or Copy/Paste panels · Apply layout when done"
         )
+        st.checkbox("Allow overlap", value=False, key="bo_composer_allow_overlap",
+                    help="Permit layout rectangles to overlap deliberately. Rectangles include labels, legends and colourbars.")
+        st.caption("Boxes contain complete panels with a small margin. Export trims unused outer canvas.")
         rects = manual_rects
     else:
         rects = _composer_layout_rects(panel_count, preset)
@@ -35589,8 +35674,9 @@ def _render_figure_composer(
                 )
             )
             label = top_cols[1].text_input("Label", value=chr(ord("A") + index), key=f"bo_composer_label_{index}")
-            label_x = top_cols[2].number_input("Label X", value=-0.08, step=.02, format="%.2f", key=f"bo_composer_label_x_{index}")
-            label_y = top_cols[3].number_input("Label Y", value=1.06, step=.02, format="%.2f", key=f"bo_composer_label_y_{index}")
+            letter_enabled = bool(st.session_state.get(f"bo_composer_show_label_{index}", True))
+            label_x = top_cols[2].number_input("Label X", value=-0.08, step=.02, format="%.2f", key=f"bo_composer_label_x_{index}", disabled=not letter_enabled)
+            label_y = top_cols[3].number_input("Label Y", value=1.06, step=.02, format="%.2f", key=f"bo_composer_label_y_{index}", disabled=not letter_enabled)
             panel_text_size = float(top_cols[4].slider(
                 "Plot text",
                 4,
@@ -35654,6 +35740,9 @@ def _render_figure_composer(
                 )
             if kind == "Global trend":
                 options = global_metrics or _numeric_columns(history)
+                chosen = st.session_state.get(f"bo_composer_global_metric_{index}")
+                if chosen in _numeric_columns(history) and chosen not in options:
+                    options = [*options, chosen]
                 spec["metric"] = st.selectbox("Metric", options, index=options.index("Q_run") if "Q_run" in options else 0, key=f"bo_composer_global_metric_{index}")
                 spec["running_mean_window"] = int(st.number_input(
                     "Running mean window (0 disables)",
@@ -35693,6 +35782,9 @@ def _render_figure_composer(
                     paired_objective,
                     phase=phase,
                 ) or list(REAL_DATA_METRICS)
+                chosen = st.session_state.get(f"bo_composer_real_metric_{index}")
+                if chosen in REAL_DATA_METRICS and chosen not in metric_options:
+                    metric_options = [*metric_options, chosen]
                 metric = st.selectbox("Metric", metric_options, key=f"bo_composer_real_metric_{index}")
                 channels = st.multiselect("Channels", real_channels, default=real_channels[:8], key=f"bo_composer_real_channels_{index}")
                 average_channels = st.checkbox("Average channels", value=True, key=f"bo_composer_real_average_{index}")
@@ -35783,10 +35875,11 @@ def _render_figure_composer(
                     paired_objective,
                     phase=phase,
                 ) or list(REAL_DATA_METRICS)
+                chosen = st.session_state.get(f"bo_composer_measured_metric_{index}")
+                if chosen in REAL_DATA_METRICS and chosen not in metric_options:
+                    metric_options = [*metric_options, chosen]
                 _preserve_valid_widget_value(
-                    f"bo_composer_measured_metric_{index}",
-                    list(metric_options),
-                    list(metric_options)[0],
+                    f"bo_composer_measured_metric_{index}", list(metric_options), list(metric_options)[0],
                 )
                 metric = st.selectbox("Metric", metric_options, key=f"bo_composer_measured_metric_{index}")
                 channels = st.multiselect(
@@ -36100,6 +36193,7 @@ def _render_figure_composer(
                     format_func=lambda key: {"corrected_current": "Raw / unsmoothed (corrected)", "smoothed_corrected_current": "Smoothed (corrected)", "wavelet_denoised_current": "Wavelet denoised"}[key],
                     help="Raw here means no display smoothing. Saved BO baseline correction, peak detection and the selected display crop still apply.",
                     key=f"bo_composer_trace_key_{index}",
+                    disabled=not spec["corrected"],
                 )
                 spec["normalize_to_peak"] = st.checkbox("Normalize to peak", value=False, key=f"bo_composer_trace_norm_{index}")
             elif kind == "Chronological SWV stack":
@@ -36107,6 +36201,11 @@ def _render_figure_composer(
                 # controls makes a 2,000-point survey appear frozen.  The
                 # renderer resolves a bounded representative sample instead.
                 available = chronological_trace_channels or real_channels
+                spec["max_traces"] = int(st.number_input("Maximum displayed traces", 2, 500, 120,
+                    key=f"bo_composer_stack_max_traces_{index}",
+                    help="Representative display sample only. Fewer traces render faster; no missing scans are synthesized."))
+                spec["use_bo_snapshot"] = st.checkbox("Use saved BO analysis settings", value=True,
+                    key=f"bo_composer_stack_snapshot_{index}")
                 phases = ["buffer", "target"] if paired_objective else ["measurement"]
                 spec["channels"] = st.multiselect(
                     "Channels",
@@ -36153,6 +36252,7 @@ def _render_figure_composer(
                     "Corrected trace",
                     ["smoothed_corrected_current", "corrected_current", "wavelet_denoised_current"],
                     key=f"bo_composer_stack_trace_key_{index}",
+                    disabled=not spec["corrected"],
                 )
             elif kind == "Chronological buffer/target trend":
                 metrics = _q_relevant_metrics(PAIRED_TREND_METRICS, session["config"], True) or list(PAIRED_TREND_METRICS)
@@ -36463,7 +36563,10 @@ def _render_figure_composer(
         st.markdown("**Selected panel source**")
         source_spec = specs[active_panel]
         if source_spec["kind"] in SOURCE_FIELDS:
-            if st.button(f"Edit source — panel {chr(65 + active_panel)}", key="bo_composer_edit_source"):
+            source_clicked = st.button(f"Edit source — panel {chr(65 + active_panel)}", key="bo_composer_edit_source")
+            if source_clicked and _SOURCE_DIALOG_DISMISS_SUPPORTED:
+                st.session_state["bo_composer_source_editor_open"] = active_panel
+            if source_clicked or st.session_state.get("bo_composer_source_editor_open") == active_panel:
                 _composer_source_editor(active_panel, source_spec, session, history, observations, observation, trace_analysis, paired_objective)
         else:
             st.caption("For captured plots, generate a replacement in its plotting tab and use Replace selected Composer panel. Uploaded images can be replaced in the panel settings.")
@@ -36530,6 +36633,11 @@ def _render_figure_composer(
     if render_preview or render_final:
         figure = None
         try:
+            from core.composer_bounds import overlapping_rectangles
+            collisions = overlapping_rectangles([spec["rect"] for spec in specs])
+            if collisions and not st.session_state.get("bo_composer_allow_overlap", False):
+                pairs = ", ".join(f"{chr(65+i)}/{chr(65+j)}" for i,j in collisions)
+                raise ValueError(f"Panels overlap: {pairs}. Move them apart or enable Allow overlap below the canvas.")
             preview_only = not render_final
             active_render_dpi = dpi if render_final else preview_dpi
             stage = "final export" if render_final else "preview"
