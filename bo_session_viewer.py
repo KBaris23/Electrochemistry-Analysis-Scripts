@@ -122,7 +122,8 @@ PLOTLY_3D_TRACE_TYPES = {
 }
 COMPOSER_METADATA_SCHEMA = "swv.figure-composer/1"
 COMPOSER_PNG_METADATA_KEY = "SWVFigureComposer"
-COMPOSER_PRESET_STORE = Path(__file__).with_name(".figure_composer_presets.json")
+COMPOSER_PRESET_STORE = Path(__file__).with_name("figure_composer_presets.json")
+LEGACY_COMPOSER_PRESET_STORE = Path(__file__).with_name(".figure_composer_presets.json")
 OBSERVED_PATH_COLORS = ("#e31a1c", "#000000")
 SWV_PHASE_COLORS = {
     "buffer": "#1f77b4",
@@ -31527,28 +31528,33 @@ def _composer_open_source(metadata: Mapping[str, Any]) -> None:
     st.session_state["bo_session_folder"] = source_path
 
 
-def _composer_load_presets(path: Path = COMPOSER_PRESET_STORE) -> dict[str, dict]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    return {
-        str(name): metadata
-        for name, metadata in payload.items()
-        if isinstance(metadata, dict)
-        and metadata.get("schema") == COMPOSER_METADATA_SCHEMA
-    }
+def _composer_load_presets(path: Path | None = None) -> dict[str, dict]:
+    path = Path(path) if path is not None else COMPOSER_PRESET_STORE
+    # Read older installations without deleting their file. Shared presets win
+    # name collisions; the next Save carries legacy-only names into the new file.
+    paths = [LEGACY_COMPOSER_PRESET_STORE, path] if path == COMPOSER_PRESET_STORE else [path]
+    presets = {}
+    for source in paths:
+        try:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            presets.update({
+                str(name): metadata
+                for name, metadata in payload.items()
+                if isinstance(metadata, dict)
+                and metadata.get("schema") == COMPOSER_METADATA_SCHEMA
+            })
+    return presets
 
 
 def _composer_save_preset(
     name: str,
     metadata: Mapping[str, Any],
-    path: Path = COMPOSER_PRESET_STORE,
+    path: Path | None = None,
 ) -> None:
+    path = Path(path) if path is not None else COMPOSER_PRESET_STORE
     cleaned_name = str(name or "").strip()
     if not cleaned_name:
         raise ValueError("Enter a preset name.")
@@ -36594,7 +36600,7 @@ def _render_figure_composer(
         except (OSError, ValueError) as exc:
             st.error(f"Could not save preset: {exc}")
         else:
-            st.success(f"Saved preset '{preset_name.strip()}'.")
+            st.success(f"Saved preset '{preset_name.strip()}' to {COMPOSER_PRESET_STORE.name}. Commit and push that file to share the update.")
 
     render_identity = (
         f"{session['state'].get('session_id', session['root'].name)}::"

@@ -35,6 +35,8 @@ browser/print-size check or independent validation of fitted concentrations.
 
 ### Latest reference-figure fixes
 
+- **Shared custom templates:** save with **Figure Composer → Save preset**. The visible `figure_composer_presets.json` in the app root is tracked by Git; commit/push it to share subsequent edits with Max. Built-ins remain in code and generated exports remain ignored. Old hidden preset files are still read for compatibility.
+
 - **Missing presets:** Types 1/1A/1B appear for survey sessions; Types 2/2A appear for optimization sessions. For kana validation, replace the `parameter_sweep...` path with the `planar_BO_kana...` BO path in Figure B below. Types 3/3B/4 are under **SWV → Paper Figures**.
 - **Edit source:** Preview renders just the selected plot. Update saves its source settings without rebuilding the whole composition; click **Render figure** afterward. Stack and parallel-coordinate source controls are supported too. In a stack, **Maximum displayed traces** controls display sampling and rendering cost, not scientific analysis.
 - See the [main README capability guide](../README.md#current-workflow-and-capabilities) for save/reopen limitations, outlier filtering versus display clipping, and missing-data handling. No missing measurements are synthesized.

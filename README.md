@@ -76,11 +76,16 @@ analysis filter and compare filtered/unfiltered results.
   PNG/PDF/SVG**. Titration Paper Figures contain rasterized subplots even in PDF;
   set their panel raster DPI before generation. Transparent export and optional
   panel letters are supported.
-- **Presets:** local named presets are in `.figure_composer_presets.json` under
-  the app directory; saving the same name replaces that saved preset. Built-in
+- **Presets:** shared custom presets are in the visible, Git-tracked
+  `figure_composer_presets.json` under the app directory; saving the same name
+  replaces that saved preset. Commit and push this file after saving to share
+  new templates; saving in the app does not automatically push to Git. Built-in
   templates are defined in `bo_session_viewer.py`. Use your own preset name to
-  preserve variants. Share a metadata JSON/portable figure package explicitly;
-  local presets and generated figures are ignored by Git.
+  preserve variants. Older `.figure_composer_presets.json` files remain readable;
+  Save carries their legacy-only entries into the visible file, with visible-file
+  entries winning name conflicts. Generated figures and analysis sessions remain
+  Git-ignored. Templates can record local source paths; collaborators must select
+  their own compatible inputs. No raw measurements are bundled with a preset.
 
 ### Saved analysis sessions
 
