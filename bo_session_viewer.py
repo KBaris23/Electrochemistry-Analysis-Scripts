@@ -31885,17 +31885,20 @@ def _paper_parameter_sweep_comparison_preset(
     while len(slices) < 2:
         slices.append(slices[-1])
 
-    # Each half is a one-column, tall canvas.  The cube gets two thirds of the
-    # width and the two supporting panels share the remaining third.
+    # Each half is a one-column, tall canvas.  Keep a genuine 2:1 cube/support
+    # width ratio and a very small gutter: the two exported halves are designed
+    # to sit flush beside one another as one 7-in-wide comparison figure.
+    # There are deliberately only two map planes, not a disguised four-slice
+    # version of the full Type 1 template.
     if mirrored:
         rects = [
-            (.35, .52, .61, .44), (.04, .75, .27, .21), (.04, .52, .27, .21),
-            (.35, .04, .61, .43), (.04, .27, .27, .20), (.04, .04, .27, .20),
+            (.335, .510, .650, .475), (.015, .752, .305, .233), (.015, .510, .305, .233),
+            (.335, .015, .650, .475), (.015, .257, .305, .233), (.015, .015, .305, .233),
         ]
     else:
         rects = [
-            (.04, .52, .61, .44), (.69, .75, .27, .21), (.69, .52, .27, .21),
-            (.04, .04, .61, .43), (.69, .27, .27, .20), (.69, .04, .27, .20),
+            (.015, .510, .650, .475), (.680, .752, .305, .233), (.680, .510, .305, .233),
+            (.015, .015, .650, .475), (.680, .257, .305, .233), (.680, .015, .305, .233),
         ]
     kinds = (
         "Measured 3D tensor", "SWV trace overlay", "SWV trace overlay",
@@ -31910,6 +31913,11 @@ def _paper_parameter_sweep_comparison_preset(
         "bo_composer_real_highlight_iterations_0": [on_iteration, off_iteration],
         "bo_composer_real_slice_values_3": slices[:2],
     }
+    for index in range(len(kinds)):
+        # A–F wastes the already-limited print area and communicates nothing
+        # in this linked mini-layout.  Keep the value editable in the panel
+        # controls, but suppress it by default for both mirror variants.
+        extra[f"bo_composer_show_label_{index}"] = False
     for index in (0, 3):
         extra.update({
             f"bo_composer_measured_metric_{index}": "Paired Q",
@@ -34050,6 +34058,9 @@ def _build_composer_figure_inner(
             panel_label = spec.get("label") or chr(ord("A") + index)
             if journal_style:
                 _composer_journal_axes(ax)
+            if not spec.get("show_label", True):
+                continue
+            if journal_style:
                 # Bold letter just outside the panel's top-left corner, clear
                 # of axis labels, positioned in figure coordinates.
                 letter_x = max(0.004, spec["rect"][0] - 0.03)
@@ -34722,7 +34733,7 @@ def _render_figure_composer(
             order_cols[2].caption(
                 "Moving a panel reassigns its letter and preserves custom labels."
             )
-            top_cols = st.columns([1.4, .8, .8, .8, .9])
+            top_cols = st.columns([1.35, .72, .72, .72, .82, .75])
             kind = top_cols[0].selectbox("Figure", source_options, key=f"bo_composer_kind_{index}")
             capture_registry = st.session_state.get("bo_composer_captured_plots")
             capture_registry = (
@@ -34756,6 +34767,12 @@ def _render_figure_composer(
                 help="Text size for this panel only, including axes and colorbars.",
                 disabled=kind == "Captured plot" and not editable_capture,
             ))
+            show_label = top_cols[5].checkbox(
+                "Letter",
+                value=True,
+                key=f"bo_composer_show_label_{index}",
+                help="Show this panel's A/B/C… letter in the exported figure.",
+            )
             if preset == "Manual":
                 pos_cols = st.columns(4)
                 left = pos_cols[0].number_input("Left", 0.0, .95, float(default_rect[0]), .01, format="%.3f", key=f"bo_composer_left_{index}")
@@ -34770,6 +34787,7 @@ def _render_figure_composer(
                 "label": label,
                 "label_x": label_x,
                 "label_y": label_y,
+                "show_label": show_label,
                 "text_size": panel_text_size,
                 "rect": rect,
             }
@@ -35014,12 +35032,21 @@ def _render_figure_composer(
                             help="Adds large linked markers for the two SWV observation panels.",
                         )
                         step_slice_values = _numeric_slice_values(points, "step_potential")
+                        compact_slice_limit = (
+                            2 if st.session_state.get(
+                                "bo_composer_type1_compact_linked_controls"
+                            ) else 4
+                        )
                         spec["slice_sweep_values"] = st.multiselect(
                             "Step-size slice planes",
                             step_slice_values,
-                            max_selections=4,
+                            max_selections=compact_slice_limit,
                             key=f"bo_composer_real_slice_values_{index}",
-                            help="Draws up to four constant-step planes through the cube.",
+                            help=(
+                                "Draws "
+                                f"up to {compact_slice_limit} constant-step plane"
+                                f"{'s' if compact_slice_limit != 1 else ''} through the cube."
+                            ),
                         ) if step_slice_values else []
                 if kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS or kind in {
                     "Measured parallel coordinates",
@@ -35547,71 +35574,99 @@ def _render_figure_composer(
         f"{session.get('selected_group_id', 'all')}"
     )
     render_key = f"bo_composer_render_{render_identity}"
-    render_clicked = st.button(
-        "Render figure",
+    existing_rendered = st.session_state.get(render_key) or {}
+    current_preview_exists = (
+        bool(existing_rendered)
+        and existing_rendered.get("signature") == config_signature
+    )
+    preview_dpi = min(180, dpi)
+    render_cols = st.columns(2)
+    preview_clicked = render_cols[0].button(
+        "Render figure (fast preview)",
         type="primary",
         key="bo_composer_render_button",
         use_container_width=True,
     )
+    final_export_clicked = render_cols[1].button(
+        "Create final PNG/PDF/SVG",
+        key="bo_composer_final_export_button",
+        disabled=not current_preview_exists,
+        use_container_width=True,
+        help=(
+            "Creates the print-resolution files only after you approve the "
+            "fast preview. This can take longer for 3D sweep panels."
+        ),
+    )
+    st.caption(
+        f"Preview: {preview_dpi} DPI PNG only. Final export: {dpi} DPI PNG, PDF, SVG, and ZIP."
+    )
     automatic_render = bool(added_captures or auto_render_requested)
-    if render_clicked or automatic_render:
+    render_preview = bool(preview_clicked or automatic_render)
+    render_final = bool(final_export_clicked)
+    if render_preview or render_final:
         figure = None
         try:
-            preview_only = False
-            active_render_dpi = dpi
-            metadata = _composer_metadata(
-                session,
-                config,
-                preset_name=preset_name or title,
+            preview_only = not render_final
+            active_render_dpi = dpi if render_final else preview_dpi
+            stage = "final export" if render_final else "preview"
+            started = time.perf_counter()
+            with st.spinner(f"Rendering {stage}…"):
+                metadata = _composer_metadata(
+                    session,
+                    config,
+                    preset_name=preset_name or title,
+                )
+                metadata_bytes = _composer_json_bytes(metadata)
+                metadata_json = metadata_bytes.decode("utf-8")
+                figure = _build_composer_figure(
+                    session,
+                    history,
+                    observations,
+                    observation,
+                    trace_analysis,
+                    paired_objective,
+                    specs,
+                    aspect,
+                    font_family,
+                    font_size,
+                    label_size,
+                    title,
+                    active_render_dpi,
+                    panel_border,
+                    panel_border_color,
+                    panel_border_width,
+                    journal_style=journal_style,
+                )
+                png_bytes = _composer_figure_bytes(
+                    figure,
+                    "png",
+                    active_render_dpi,
+                    metadata_json=metadata_json,
+                )
+                stem = _safe_download_stem(
+                    preset_name or title or f"{session['root'].name}_multipanel"
+                )
+                rendered_payload = {
+                    "signature": config_signature,
+                    "metadata": metadata_bytes,
+                    "png": png_bytes,
+                    "stem": stem,
+                    "preview_only": preview_only,
+                }
+                if render_final:
+                    rendered_payload.update({
+                        "pdf": _composer_figure_bytes(figure, "pdf", dpi),
+                        "svg": _composer_figure_bytes(figure, "svg", dpi),
+                        "zip": _composer_portable_zip(
+                            png_bytes,
+                            metadata_bytes,
+                            stem=stem,
+                        ),
+                    })
+                st.session_state[render_key] = rendered_payload
+            st.success(
+                f"{stage.capitalize()} rendered in {time.perf_counter() - started:.1f} s."
             )
-            metadata_bytes = _composer_json_bytes(metadata)
-            metadata_json = metadata_bytes.decode("utf-8")
-            figure = _build_composer_figure(
-                session,
-                history,
-                observations,
-                observation,
-                trace_analysis,
-                paired_objective,
-                specs,
-                aspect,
-                font_family,
-                font_size,
-                label_size,
-                title,
-                active_render_dpi,
-                panel_border,
-                panel_border_color,
-                panel_border_width,
-                journal_style=journal_style,
-            )
-            png_bytes = _composer_figure_bytes(
-                figure,
-                "png",
-                active_render_dpi,
-                metadata_json=metadata_json,
-            )
-            stem = _safe_download_stem(
-                preset_name or title or f"{session['root'].name}_multipanel"
-            )
-            rendered_payload = {
-                "signature": config_signature,
-                "metadata": metadata_bytes,
-                "png": png_bytes,
-                "stem": stem,
-                "preview_only": preview_only,
-            }
-            if not preview_only:
-                rendered_payload.update({
-                    "pdf": _composer_figure_bytes(figure, "pdf", dpi),
-                    "svg": _composer_figure_bytes(figure, "svg", dpi),
-                    "zip": _composer_portable_zip(
-                        png_bytes,
-                        metadata_bytes,
-                        stem=stem,
-                    ),
-                })
-            st.session_state[render_key] = rendered_payload
         except Exception as exc:
             st.error(f"Figure rendering failed: {exc}")
         finally:
@@ -35683,16 +35738,25 @@ def _render_figure_composer(
             use_container_width=True,
         )
 def _load_simulated_sweep_section(session: dict, section: str) -> bool:
-    """Avoid executing expensive hidden tabs when a simulated sweep opens."""
-    if not _is_loaded_simulated_sweep_session(session):
+    """Defer expensive hidden tabs for simulated or genuinely large sessions.
+
+    Streamlit executes every ``st.tabs`` body on any normal rerun, even when a
+    tab is not visible.  A 2,000-point physical parameter sweep therefore
+    used to rebuild SWV, landscape, surrogate, and GIF controls while the user
+    was merely choosing a Composer preset.  Small ordinary BO sessions keep
+    the immediate tab behaviour; simulated and >=500-observation sessions
+    load each heavyweight section when the user asks for it.
+    """
+    observation_count = len(session.get("observations") or [])
+    if not _is_loaded_simulated_sweep_session(session) and observation_count < 500:
         return True
     token = hashlib.sha1(str(session["root"]).encode("utf-8")).hexdigest()[:12]
     return bool(st.checkbox(
-        f"Load {section}",
+        f"Load {section} (on demand)",
         value=False,
         key=f"bo_sweep_load_{token}_{section}",
         help=(
-            "Loads this section on demand to keep large simulated sweeps quick to open. "
+            "Loads this section on demand to keep large BO sessions quick to open. "
             "Turn it off when finished to skip its work on subsequent page updates."
         ),
     ))

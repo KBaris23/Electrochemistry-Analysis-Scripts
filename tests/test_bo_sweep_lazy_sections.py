@@ -29,6 +29,19 @@ def test_real_sessions_keep_existing_loading_behavior(monkeypatch, tmp_path):
     assert viewer._load_simulated_sweep_section({'root': tmp_path}, 'Surrogate plots')
 
 
+def test_large_physical_sessions_also_defer_hidden_tabs(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        viewer.st,
+        'checkbox',
+        lambda label, **kwargs: calls.append((label, kwargs)) or False,
+    )
+    session = {'root': tmp_path, 'observations': [{}] * 500}
+    assert not viewer._load_simulated_sweep_section(session, 'Real data landscapes')
+    assert calls[0][1]['value'] is False
+    assert 'on demand' in calls[0][0]
+
+
 @pytest.mark.parametrize('function', [
     '_render_swv_traces_tab', '_render_real_data_landscapes_tab',
     '_render_surrogate_tab', '_render_simulation_tab',

@@ -546,7 +546,12 @@ def test_compact_sweep_comparison_presets_are_mirrored_and_directional():
     assert normal["bo_composer_kind_2"] == "SWV trace overlay"
     assert normal["bo_composer_border_color_1"] == "#d62728"
     assert normal["bo_composer_border_color_2"] == "#17becf"
-    # Cubes and supporting panels swap sides, but their row geometry remains identical.
+    assert normal["bo_composer_show_label_0"] is False
+    assert normal["bo_composer_show_label_5"] is False
+    # Each compact half uses a tight 2:1 cube/support width ratio. Cubes and
+    # supporting panels swap sides, but their row geometry remains identical.
+    assert normal["bo_composer_width_0"] / normal["bo_composer_width_1"] > 2.0
+    assert normal["bo_composer_width_0"] / normal["bo_composer_width_1"] < 2.2
     assert normal["bo_composer_left_0"] < normal["bo_composer_left_1"]
     assert mirrored["bo_composer_left_0"] > mirrored["bo_composer_left_1"]
     assert normal["bo_composer_bottom_0"] == mirrored["bo_composer_bottom_0"]
