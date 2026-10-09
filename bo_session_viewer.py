@@ -9455,6 +9455,7 @@ def _plot_real_data_landscape(
     slice_colors: Sequence[Any] | None = None,
     tensor_interpolation_source: pd.DataFrame | None = None,
     show_measured_points: bool = False,
+    show_2d_contours: bool = False,
     value_colorscale: str = "Viridis",
     draw_full_cube_edges: bool = False,
 ):
@@ -9899,6 +9900,22 @@ def _plot_real_data_landscape(
                 ),
                 connectgaps=False,
             ))
+            if show_2d_contours:
+                # The heat map encodes magnitude; restrained contour lines
+                # make the response topology legible at one-column scale.
+                fig.add_trace(go.Contour(
+                    x=grid_x,
+                    y=grid_y,
+                    z=grid_values,
+                    autocontour=True,
+                    contours={"coloring": "none", "showlabels": False},
+                    line={"color": "rgba(20,20,20,0.52)", "width": 0.65},
+                    showscale=False,
+                    hoverinfo="skip",
+                    connectgaps=False,
+                    name="Contours",
+                    showlegend=False,
+                ))
         if show_measured_points and color_by == "Measured value":
             fig.add_trace(go.Scatter(
                 x=valid[x_name], y=valid[y_name], mode="markers",
@@ -31861,10 +31878,10 @@ def _paper_parameter_sweep_comparison_preset(
 ) -> dict[str, Any]:
     """Compact, half-page Type 1 for planar/nanoporous side-by-side figures.
 
-    The two traces are explicitly labelled signal-on and signal-off.  They are
-    still selected by observation number because a survey session does not
-    reliably encode a direction for every stored trace; the linked controls
-    make that scientific choice visible and keep the cube highlights in sync.
+    Signal-on and signal-off mean the maximum and minimum paired-response Q,
+    respectively, for the selected channel.  A survey does not have BO
+    maximize/minimize groups, so deriving the two records from its measured Q
+    is the only unambiguous and reproducible interpretation.
     """
     channels = list(map(str, real_channels))
     trace_channels = list(map(str, trace_channels))
@@ -31872,8 +31889,9 @@ def _paper_parameter_sweep_comparison_preset(
     iteration_values = sorted({
         int(obs.get("iteration")) for obs in observations if obs.get("iteration") is not None
     })
-    on_iteration = iteration_values[0] if iteration_values else 1
-    off_iteration = iteration_values[-1] if iteration_values else on_iteration
+    extrema = _composer_signal_extreme_iterations(observations, channel)
+    on_iteration = extrema[0] if extrema else (iteration_values[0] if iteration_values else 1)
+    off_iteration = extrema[1] if extrema else (iteration_values[-1] if iteration_values else on_iteration)
     step_values = sorted({
         float((obs.get("params") or {}).get("step_potential"))
         for obs in observations
@@ -31895,20 +31913,20 @@ def _paper_parameter_sweep_comparison_preset(
     while len(slices) < 2:
         slices.append(slices[-1])
 
-    # Each half is a one-column, tall canvas.  Keep a genuine 2:1 cube/support
-    # width ratio and a very small gutter: the two exported halves are designed
-    # to sit flush beside one another as one 7-in-wide comparison figure.
+    # Each half is a one-column, tall canvas.  The cube takes roughly two
+    # thirds of each row, but with a deliberate gutter and outer margin so the
+    # panels do not visually run into one another when printed side by side.
     # There are deliberately only two map planes, not a disguised four-slice
     # version of the full Type 1 template.
     if mirrored:
         rects = [
-            (.335, .510, .650, .475), (.015, .752, .305, .233), (.015, .510, .305, .233),
-            (.335, .015, .650, .475), (.015, .257, .305, .233), (.015, .015, .305, .233),
+            (.365, .535, .600, .420), (.035, .755, .290, .195), (.035, .535, .290, .195),
+            (.365, .045, .600, .420), (.035, .275, .290, .195), (.035, .045, .290, .195),
         ]
     else:
         rects = [
-            (.015, .510, .650, .475), (.680, .752, .305, .233), (.680, .510, .305, .233),
-            (.015, .015, .650, .475), (.680, .257, .305, .233), (.680, .015, .305, .233),
+            (.035, .535, .600, .420), (.675, .755, .290, .195), (.675, .535, .290, .195),
+            (.035, .045, .600, .420), (.675, .275, .290, .195), (.675, .045, .290, .195),
         ]
     kinds = (
         "Measured 3D tensor", "SWV trace overlay", "SWV trace overlay",
@@ -31921,6 +31939,7 @@ def _paper_parameter_sweep_comparison_preset(
         "bo_composer_type1_compact_signal_off_iteration": off_iteration,
         "bo_composer_type1_compact_slice_values": list(dict.fromkeys(slices[:2])),
         "bo_composer_real_highlight_iterations_0": [on_iteration, off_iteration],
+        "bo_composer_real_highlight_labels_0": ["ON (max Q)", "OFF (min Q)"],
         "bo_composer_real_slice_values_3": slices[:2],
     }
     for index in range(len(kinds)):
@@ -31975,6 +31994,7 @@ def _paper_parameter_sweep_comparison_preset(
             # what was sampled.  Extra hollow points make these mini-maps
             # busy without adding information.
             f"bo_composer_real_show_points_{map_index}": False,
+            f"bo_composer_real_show_contours_{map_index}": True,
         })
     name = (
         "Type 1B - Sweep comparison (support left)"
@@ -32532,8 +32552,11 @@ def _composer_draw_trace(
         ax.set_axis_off()
         return
     line_override = _plot_line_color_override()
-    phase_counts: dict[str, int] = {}
-    for trace_index, item in enumerate(traces[:24]):
+    displayed_traces = traces[:24]
+    phases = [str(item.get("phase") or "measurement").strip().lower() for item in displayed_traces]
+    phase_colors = _swv_phase_trace_colors(phases)
+    labels = _swv_phase_replicate_labels(phases)
+    for trace_index, item in enumerate(displayed_traces):
         try:
             voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
                 item["path"],
@@ -32543,16 +32566,13 @@ def _composer_draw_trace(
             )
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
-            phase = str(item.get("phase") or "measurement").strip().lower()
-            phase_counts[phase] = phase_counts.get(phase, 0) + 1
-            label = f"{phase.title()} {phase_counts[phase]}"
             ax.plot(
                 voltage,
                 y,
-                color=line_override or SWV_PHASE_COLORS.get(phase, "#444444"),
-                linewidth=1.0,
-                alpha=.88,
-                label=label,
+                color=line_override or phase_colors[trace_index] or "#444444",
+                linewidth=1.15,
+                alpha=.94,
+                label=labels[trace_index],
             )
         except Exception:
             continue
@@ -32564,8 +32584,18 @@ def _composer_draw_trace(
     handles, labels = ax.get_legend_handles_labels()
     if len(labels) <= 10:
         unique = dict(zip(labels, handles))
-        ax.legend(unique.values(), unique.keys(), fontsize=6)
-    ax.grid(alpha=.25)
+        ax.legend(
+            # Keep the compact upper-left legend box from the reference
+            # sweep figure: it separates six replicate identities from the
+            # waveform rather than relying on a caption or a generic colour
+            # key.  Buffer 1→3 and Target 1→3 use progressively darker blue
+            # and orange shades supplied by _swv_phase_trace_colors.
+            unique.values(), unique.keys(), fontsize=5.5, frameon=True,
+            facecolor="white", edgecolor="none", framealpha=.90, fancybox=False,
+            handlelength=1.15, handletextpad=.35, borderaxespad=.25,
+            labelspacing=.16, loc="upper left",
+        )
+    ax.grid(alpha=.18, linewidth=.45)
 
 
 COMPOSER_MEASURED_LANDSCAPE_VIEWS = {
@@ -32671,6 +32701,36 @@ def _composer_observation_for_trace(
         if requested & {str(channel) for channel in stored if channel is not None}:
             return item
     return candidates[0] if candidates else fallback
+
+
+def _composer_signal_extreme_iterations(
+    observations: Sequence[dict],
+    channel: str,
+) -> tuple[int, int] | None:
+    """Return (signal-on, signal-off) iterations for one survey channel.
+
+    The landscape sweep has no optimization direction: signal-on is therefore
+    the observation with the largest measured paired-response Q and signal-off
+    is the one with the smallest.  Grouping protects against duplicated metric
+    records while retaining the selected channel's actual run number.
+    """
+    points = _real_metric_points(
+        list(observations), "Paired Q", "target", [str(channel)], False,
+    )
+    if points.empty or "iteration" not in points or "value" not in points:
+        return None
+    values = points[["iteration", "value"]].copy()
+    values["iteration"] = pd.to_numeric(values["iteration"], errors="coerce")
+    values["value"] = pd.to_numeric(values["value"], errors="coerce")
+    values = values.dropna()
+    if values.empty:
+        return None
+    per_iteration = values.groupby("iteration", as_index=False)["value"].mean()
+    if per_iteration.empty:
+        return None
+    on_row = per_iteration.loc[per_iteration["value"].idxmax()]
+    off_row = per_iteration.loc[per_iteration["value"].idxmin()]
+    return int(on_row["iteration"]), int(off_row["iteration"])
 
 
 def _composer_trace_channels(trace_entries: Sequence[tuple[dict, dict]]) -> list[str]:
@@ -33488,6 +33548,7 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
             points if view == "2D map" and spec.get("slice_axis") else None
         ),
         show_measured_points=spec.get("show_measured_points", True),
+        show_2d_contours=spec.get("show_contours", False),
     )
     if view == "2D map":
         for trace in figure.data:
@@ -33501,6 +33562,7 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
             if _finite_float(value) is not None
         ]
         highlight_colors = list(spec.get("highlight_colors", ["#d62728", "#17becf"]))
+        highlight_labels = list(spec.get("highlight_labels", []))
         for highlight_index, iteration in enumerate(highlight_iterations):
             selected = points.loc[
                 pd.to_numeric(points.get("iteration"), errors="coerce") == iteration
@@ -33511,15 +33573,22 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
                 x=selected[spec["x"]],
                 y=selected[spec["y"]],
                 z=selected[spec["z"]],
-                mode="markers",
+                mode="markers+text" if highlight_index < len(highlight_labels) else "markers",
                 marker={
                     "size": max(10, int(spec.get("dot_size", 6)) + 5),
                     "color": highlight_colors[highlight_index % len(highlight_colors)],
                     "line": {"color": "white", "width": 2},
                 },
+                text=(highlight_labels[highlight_index] if highlight_index < len(highlight_labels) else None),
+                textposition="top center",
+                textfont={"size": 10, "color": highlight_colors[highlight_index % len(highlight_colors)]},
                 name=f"Selected iteration {iteration}",
                 hovertemplate=f"Selected iteration {iteration}<extra></extra>",
+                showlegend=False,
             ))
+        # A cube's Q colorbar is its legend.  Hiding Plotly's generic boxed
+        # legend prevents the black "Channel average" key from stealing space.
+        figure.update_layout(showlegend=False)
         _apply_plotly_camera(
             figure,
             _valid_plotly_camera(spec.get("camera"))
@@ -34063,6 +34132,11 @@ def _build_composer_figure_inner(
                         trace_observation,
                         str(spec.get("trace_role") or ""),
                     )
+                if panel_header:
+                    # The compact header identifies iteration and waveform
+                    # parameters; do not spend a second title line repeating
+                    # only the iteration inside a very short trace panel.
+                    ax.set_title("")
             elif kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS:
                 _composer_draw_embedded_figure(
                     fig,
@@ -34162,6 +34236,11 @@ def _build_composer_figure_inner(
                 _composer_scale_axes_marks(
                     ax, width / 12.0, (width / 12.0) ** 1.7,
                 )
+                if kind == "SWV trace overlay":
+                    # Compact SWV panels are narrow, but their replicate
+                    # lines must remain visibly blue/orange at print size.
+                    for line in ax.lines:
+                        line.set_linewidth(max(.85, line.get_linewidth()))
             if spec.get("clip_extremes") and kind in {
                 "Global trend", "Channel trend", "Buffer/target trend",
             }:
@@ -34747,10 +34826,10 @@ def _render_figure_composer(
                 _slice_highlight_color(offset, max(1, len(map_slices)))[0]
             )
 
-    # The compact Type 1 variants use the same measured points and maps, but
-    # require explicit signal-on/signal-off trace choices and only two planes.
-    # This makes each one-column half independently usable in a side-by-side
-    # planar/nanoporous comparison while retaining provenance links.
+    # Compact Type 1 uses the same measured points and maps but fixes the
+    # definitions: signal-on is max paired Q and signal-off is min paired Q
+    # for the shared channel.  The automatic choice prevents a labelled ON/OFF
+    # figure from silently drifting into an arbitrary pair of observations.
     if (
         st.session_state.get("bo_composer_type1_compact_linked_controls")
         and panel_count == 6
@@ -34765,24 +34844,25 @@ def _render_figure_composer(
             if _finite_float((item.get("params") or {}).get("step_potential")) is not None
         })
         st.caption(
-            "Compact Type 1 linked controls: choose the real signal-on and signal-off "
-            "observations. Their cube markers and framed SWVs stay synchronized; the "
-            "two selected step-size planes drive the matching maps."
+            "Compact Type 1 linked controls: signal-on is automatically the maximum "
+            "paired-response Q and signal-off the minimum for this channel. Their cube "
+            "markers, corrected/smoothed SWVs, and framed panels stay synchronized."
         )
-        link_cols = st.columns(4)
+        link_cols = st.columns([1.25, 1, 1, 1.35])
         linked_channel = link_cols[0].selectbox(
             "Shared channel",
             current_trace_channels or real_channels,
             key="bo_composer_type1_compact_channel",
         )
-        on_iteration = link_cols[1].selectbox(
-            "Signal-on observation", iteration_options,
-            key="bo_composer_type1_compact_signal_on_iteration",
-        ) if iteration_options else None
-        off_iteration = link_cols[2].selectbox(
-            "Signal-off observation", iteration_options,
-            key="bo_composer_type1_compact_signal_off_iteration",
-        ) if iteration_options else None
+        extrema = _composer_signal_extreme_iterations(observations, str(linked_channel))
+        on_iteration, off_iteration = extrema or (
+            (iteration_options[0], iteration_options[-1]) if iteration_options else (None, None)
+        )
+        # Keep saved metadata explicit, even though these are now derived.
+        st.session_state["bo_composer_type1_compact_signal_on_iteration"] = on_iteration
+        st.session_state["bo_composer_type1_compact_signal_off_iteration"] = off_iteration
+        link_cols[1].metric("Signal-on (max paired Q)", f"Iteration {on_iteration}" if on_iteration is not None else "Unavailable")
+        link_cols[2].metric("Signal-off (min paired Q)", f"Iteration {off_iteration}" if off_iteration is not None else "Unavailable")
         linked_slices = link_cols[3].multiselect(
             "Step-size planes", step_options, max_selections=2,
             key="bo_composer_type1_compact_slice_values",
@@ -34792,6 +34872,7 @@ def _render_figure_composer(
         map_slices = (list(linked_slices) + [linked_slices[-1]] * 2)[:2] if linked_slices else []
         highlighted = [value for value in (on_iteration, off_iteration) if value is not None]
         st.session_state["bo_composer_real_highlight_iterations_0"] = highlighted
+        st.session_state["bo_composer_real_highlight_labels_0"] = ["ON (max Q)", "OFF (min Q)"]
         st.session_state["bo_composer_real_slice_values_3"] = map_slices
         for index in (0, 3):
             st.session_state[f"bo_composer_measured_channels_{index}"] = [linked_channel]
@@ -34799,12 +34880,18 @@ def _render_figure_composer(
             if iteration is not None:
                 st.session_state[f"bo_composer_trace_iteration_{index}"] = iteration
             st.session_state[f"bo_composer_trace_channels_{index}"] = [linked_channel]
+            st.session_state[f"bo_composer_trace_corrected_{index}"] = True
+            st.session_state[f"bo_composer_trace_key_{index}"] = "smoothed_corrected_current"
+        st.session_state["bo_composer_trace_role_1"] = "Signal-on (max paired Q)"
+        st.session_state["bo_composer_trace_role_2"] = "Signal-off (min paired Q)"
         for offset, (index, slice_value) in enumerate(zip((4, 5), map_slices)):
             st.session_state[f"bo_composer_real_channels_{index}"] = [linked_channel]
             st.session_state[f"bo_composer_real_slice_value_{index}"] = slice_value
             st.session_state[f"bo_composer_border_color_{index}"] = to_hex(
                 _slice_highlight_color(offset, max(1, len(map_slices)))[0]
             )
+            st.session_state[f"bo_composer_real_show_points_{index}"] = False
+            st.session_state[f"bo_composer_real_show_contours_{index}"] = True
 
     if preset == "Manual":
         manual_rects = _composer_manual_rects(panel_count)
@@ -35042,7 +35129,7 @@ def _render_figure_composer(
                 else:
                     spec["slice_axis"] = None
                     spec["slice_value"] = None
-                map_style_cols = st.columns(3)
+                map_style_cols = st.columns(4)
                 spec["dot_size"] = int(map_style_cols[0].slider(
                     "Measured point size",
                     2,
@@ -35062,6 +35149,12 @@ def _render_figure_composer(
                     "Show measured points",
                     value=True,
                     key=f"bo_composer_real_show_points_{index}",
+                )
+                spec["show_contours"] = map_style_cols[3].checkbox(
+                    "Contour lines",
+                    value=False,
+                    key=f"bo_composer_real_show_contours_{index}",
+                    help="Draws unobtrusive iso-response contours over the interpolated map.",
                 )
                 spec["colorscale"] = st.selectbox(
                     "Colorscale",
@@ -35211,6 +35304,11 @@ def _render_figure_composer(
                             max_selections=2,
                             key=f"bo_composer_real_highlight_iterations_{index}",
                             help="Adds large linked markers for the two SWV observation panels.",
+                        )
+                        spec["highlight_labels"] = list(
+                            st.session_state.get(
+                                f"bo_composer_real_highlight_labels_{index}", []
+                            )
                         )
                         step_slice_values = _numeric_slice_values(points, "step_potential")
                         compact_slice_limit = (

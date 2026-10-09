@@ -38,9 +38,9 @@ Use this only for a **survey/parameter-sweep** session, not an optimization sess
    - **Type 1:** full 8-panel, 7 × 7 in standalone landscape.
    - **Type 1A:** 3.3 × 7 in comparison half with the cube on the left.
    - **Type 1B:** mirrored Type 1A with support panels on the left.
-4. For Type 1A/1B, use **Compact Type 1 linked controls**: choose one channel, then choose the real signal-on and signal-off observations and two measured step-size planes. The highlights, paired buffer/target SWVs, planes, and maps stay linked. To reframe one cube, choose it under **Edit panel** and adjust **Camera X/Y/Z** and **Camera distance** (smaller is closer); this affects that cube only.
+4. For Type 1A/1B, use **Compact Type 1 linked controls**: choose one channel and two measured step-size planes. The app automatically sets **signal-on = maximum paired-response Q** and **signal-off = minimum paired-response Q** for that channel, then keeps the highlighted cube points, corrected/smoothed buffer/target SWVs, planes, and maps linked. To reframe one cube, choose it under **Edit panel**, then change **Marker size**, **Camera X/Y/Z**, or **Camera distance** (smaller is closer); each cube is independent.
 5. **Loading a preset does not render an image yet.** Confirm that the canvas and panel count changed (Type 1 = 8 panels; Type 1A/1B = 6 panels), scroll below the panel settings, then click **Render figure (fast preview)**. When the preview is correct, click **Create final PNG/PDF/SVG**. The compact templates have no A–F letters, keep a tight 2:1 cube/support width ratio, and permit exactly two linked slice planes.
-6. Use Type 1A plus Type 1B only when you have two genuinely comparable sweep datasets (for example planar and nanoporous). Do not label arbitrary survey observations as signal-on/off without checking their files/settings.
+6. Use Type 1A plus Type 1B only when you have two genuinely comparable sweep datasets (for example planar and nanoporous). Use Type 1 only with a loaded survey/parameter-sweep session: BO-only folders do not contain the required sweep landscape.
 
 ```text
 Type 1A                         Type 1B
@@ -185,7 +185,7 @@ The app deliberately has two figure tools:
 | Template | Where to open it | Use it for |
 |---|---|---|
 | Type 1 – Parameter sweep | BO Session, **survey** session only | Standalone eight-panel setup-5 kanamycin landscape. The station-2 sweep can be supplementary, not a required main figure. |
-| Type 1A / 1B – Sweep comparison | BO Session, **survey** session only | Compact mirrored one-column halves for a planar/nanoporous side-by-side comparison: cube-left (1A) and support-left (1B). Select real signal-on/off observations and two measured step planes with the linked controls. |
+| Type 1A / 1B – Sweep comparison | BO Session, **survey** session only | Compact mirrored one-column halves for a planar/nanoporous side-by-side comparison: cube-left (1A) and support-left (1B). Choose one channel and two measured step planes; the app uses that channel's max-Q signal-on and min-Q signal-off records automatically. |
 | Type 2 – BO validation | BO Session, BO experiment session | setup-5 kana, amp0, vanco, and optionally station-2 kana. |
 | Type 2A – BO validation (focused) | BO Session, BO experiment session | The Type 2 cube and the two essential quantitative trends only; omit the chronological stack and parallel coordinates. |
 | Type 3 – SWV and titration response | SWV → Paper Figures | each selected physical channel: manual/reference vs one optimized method, traces + time course + Langmuir response. |

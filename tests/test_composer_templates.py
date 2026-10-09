@@ -551,6 +551,8 @@ def test_compact_sweep_comparison_presets_are_mirrored_and_directional():
     assert normal["bo_composer_border_color_2"] == "#17becf"
     assert normal["bo_composer_show_label_0"] is False
     assert normal["bo_composer_show_label_5"] is False
+    assert normal["bo_composer_real_show_contours_4"] is True
+    assert normal["bo_composer_real_show_contours_5"] is True
     # Each compact half uses a tight 2:1 cube/support width ratio. Cubes and
     # supporting panels swap sides, but their row geometry remains identical.
     assert normal["bo_composer_width_0"] / normal["bo_composer_width_1"] > 2.0
@@ -558,6 +560,27 @@ def test_compact_sweep_comparison_presets_are_mirrored_and_directional():
     assert normal["bo_composer_left_0"] < normal["bo_composer_left_1"]
     assert mirrored["bo_composer_left_0"] > mirrored["bo_composer_left_1"]
     assert normal["bo_composer_bottom_0"] == mirrored["bo_composer_bottom_0"]
+
+
+def test_compact_sweep_defines_signal_on_off_as_selected_channel_q_extremes():
+    observations = [
+        {
+            "iteration": iteration,
+            "channels": [5],
+            "quality": {"Q_channels": {"5": score}},
+            "params": {"step_potential": step},
+        }
+        for iteration, score, step in (
+            (1, 2.0, .001), (2, -3.5, .004), (3, 8.0, .010),
+        )
+    ]
+    assert viewer._composer_signal_extreme_iterations(observations, "5") == (3, 2)
+    state = viewer._paper_parameter_sweep_comparison_preset(
+        observations, ["5"], ["5"], mirrored=False,
+    )["config"]["state"]
+    assert state["bo_composer_type1_compact_signal_on_iteration"] == 3
+    assert state["bo_composer_type1_compact_signal_off_iteration"] == 2
+    assert state["bo_composer_real_highlight_labels_0"] == ["ON (max Q)", "OFF (min Q)"]
 
 
 def test_composer_trace_observation_uses_matching_channel_for_repeated_iterations():
