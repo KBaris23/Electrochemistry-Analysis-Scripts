@@ -434,7 +434,7 @@ def _cmap_fig(
 
         # Correction anchor dots - meaningful on corrected and offset-raw traces.
 
-        if show_anchors and (y_key == "corrected_current" or offset_to_baseline):
+        if show_anchors and (y_key in ("corrected_current", "smoothed_corrected_current") or offset_to_baseline):
 
             v = r["voltage"]
 
@@ -2106,7 +2106,7 @@ def build_titration_measurement_accuracy_table(
 
 
 
-def prepare_titration_swv_traces(results, *, peak_region=True):
+def prepare_titration_swv_traces(results, *, peak_region=True, zero_anchors=False, accepted_only=False):
     """Display-only copies of stored smoothed/corrected traces; never refit or fill.
 
     Analysis arrays already obey the voltage crop. The default additionally
@@ -2115,6 +2115,8 @@ def prepare_titration_swv_traces(results, *, peak_region=True):
     """
     prepared = []
     for row in results:
+        if accepted_only and row.get('status') != 'OK':
+            continue
         voltage = row.get("voltage")
         current = row.get("smoothed_corrected_current")
         if voltage is None or current is None:
@@ -2140,8 +2142,56 @@ def prepare_titration_swv_traces(results, *, peak_region=True):
         for key in ("left_min_idx", "right_min_idx", "peak_idx_corr", "peak_idx"):
             value = row.get(key)
             cropped[key] = int(value) - start if value is not None and start <= value <= end else None
+        if zero_anchors:
+            try:
+                cropped["smoothed_corrected_current"] = _offset_trace_to_anchor_baseline(
+                    cropped["smoothed_corrected_current"],
+                    cropped["left_min_idx"], cropped["right_min_idx"],
+                )
+            except (TypeError, ValueError):
+                continue
         prepared.append(cropped)
     return prepared
+
+
+def titration_measurement_changes(results, *, metric, vlines, vlines_by_channel=None,
+                                 edge_trim_fraction=.15, concentration_unit=""):
+    """Display copies: targets minus immediately preceding buffer, buffers minus own median.
+
+    Reuses the analysis plateau estimator. Missing buffer intervals stay missing;
+    no older buffer, interpolation, or fitted value is substituted.
+    """
+    steps = build_titration_step_table(
+        results, metric=metric, vlines=vlines, vlines_by_channel=vlines_by_channel,
+        edge_trim_fraction=edge_trim_fraction, concentration_unit=concentration_unit,
+        baseline_mode="none",
+    )
+    indexed = {(s["channel"], s["step_index"]): s for s in steps}
+    by_channel = {}
+    for step in steps:
+        by_channel.setdefault(step['channel'], []).append(step)
+    output = []
+    for row in results:
+        copy = dict(row)
+        copy[metric] = np.nan
+        if row.get('status') != 'OK':
+            output.append(copy)
+            continue
+        scan = row.get('scan_number', np.nan)
+        for step in by_channel.get(row.get('channel'), []):
+            if not step['step_start_scan'] <= scan < step['step_end_scan']:
+                continue
+            is_buffer = str(step.get('step_note', '')).lower() == 'buffer'
+            baseline = step if is_buffer else indexed.get((row['channel'], step['step_index'] - 1))
+            if baseline and str(baseline.get('step_note', '')).lower() == 'buffer':
+                try:
+                    copy[metric] = float(row.get(metric, np.nan)) - float(baseline['raw_plateau_value'])
+                except (TypeError, ValueError):
+                    pass
+                copy['display_buffer_baseline'] = float(baseline['raw_plateau_value'])
+            break
+        output.append(copy)
+    return output
 
 
 def plot_overlaid_traces(
@@ -2577,6 +2627,7 @@ def plot_metric_vs_scan(
     elapsed_time: bool = False,
 
     annotation_offset_by_channel: Optional[Dict[Any, float]] = None,
+    channel_labels: Optional[Dict[Any, str]] = None,
 
 ) -> Optional[plt.Figure]:
 
@@ -2841,6 +2892,7 @@ def plot_metric_vs_scan(
             ch,
             normalized_directions if use_direction_colors else None,
         )
+        trace_label = (channel_labels or {}).get(ch, trace_label)
         if show_measurement_rate:
             measurement_times = sorted(
                 float(mdates.date2num(row["measurement_time"]))
@@ -3384,7 +3436,7 @@ def plot_titration_plateaus(
     return fig
 
 
-def add_titration_on_off_difference(figure, step_rows, signal_on, signal_off):
+def add_titration_on_off_difference(figure, step_rows, signal_on, signal_off, *, offset_to_response_baseline=False):
     """Difference of baseline-processed plateaus at matched positive doses.
 
     Repeated doses are averaged per method; this is not a third Langmuir fit.
@@ -3397,6 +3449,8 @@ def add_titration_on_off_difference(figure, step_rows, signal_on, signal_off):
                 continue
             try:
                 concentration, response = float(row["step_concentration"]), float(row["plateau_value"])
+                if offset_to_response_baseline:
+                    response -= float(row['fixed_langmuir_baseline'])
             except (KeyError, TypeError, ValueError):
                 continue
             if concentration > 0 and np.isfinite([concentration, response]).all():
@@ -3440,6 +3494,8 @@ def plot_titration_langmuir(
     show_errorbar_legend: bool = False,
     response_directions: Optional[Dict[Any, str]] = None,
     channel_colors: Optional[Dict[Any, Any]] = None,
+    offset_to_response_baseline: bool = False,
+    channel_labels: Optional[Dict[Any, str]] = None,
 ) -> Optional[plt.Figure]:
     if metric not in {"peak_current_selected", "wavelet_energy"}:
         return None
@@ -3507,6 +3563,11 @@ def plot_titration_langmuir(
         if not ch_steps:
             continue
 
+        response_offset = 0.0
+        if offset_to_response_baseline:
+            response_offset = _fixed_baseline_from_steps(ch_steps)
+            if response_offset is None or not np.isfinite(response_offset):
+                continue
         dimmed = highlight_channel is not None and ch != highlight_channel
         color = colors[ch]
         line_style, marker = styles[ch]
@@ -3514,7 +3575,7 @@ def plot_titration_langmuir(
             ch_steps,
             step_concentrations=step_concentrations,
         )
-        raw_y = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float)
+        raw_y = np.asarray([row["plateau_value"] for row in ch_steps], dtype=float) - response_offset
         raw_y_spread = np.asarray(
             [row.get("plateau_std", np.nan) for row in ch_steps],
             dtype=float,
@@ -3561,7 +3622,7 @@ def plot_titration_langmuir(
             if show_errorbar_legend:
                 spread_legend_added = True
 
-        method_trace_label = _swv_direction_trace_label(ch, plotted_directions)
+        method_trace_label = (channel_labels or {}).get(ch, _swv_direction_trace_label(ch, plotted_directions))
         ax.scatter(
             raw_x,
             raw_y,
@@ -3579,7 +3640,7 @@ def plot_titration_langmuir(
             if show_fit_details:
                 ax.plot(
                     x,
-                    y,
+                    y - response_offset,
                     color=color,
                     lw=1.2,
                     linestyle=line_style,
@@ -3603,7 +3664,7 @@ def plot_titration_langmuir(
                 if hybrid_fit is not None:
                     saturation_idx = hybrid_fit["saturation_idx"]
                     saturation_x = hybrid_fit["saturation_x"]
-                    saturation_y = hybrid_fit["saturation_y"]
+                    saturation_y = hybrid_fit["saturation_y"] - response_offset
                     langmuir_params = hybrid_fit["langmuir_params"]
                     post_sat_poly = hybrid_fit["post_sat_poly"]
                     limit_of_detection, _blank_sigma = _langmuir_limit_of_detection(
@@ -3643,7 +3704,7 @@ def plot_titration_langmuir(
                         )
                         ax.plot(
                             x_dense_measured,
-                            y_dense_measured,
+                            y_dense_measured - response_offset,
                             color=color,
                             lw=2.2,
                             linestyle=line_style,
@@ -3660,7 +3721,7 @@ def plot_titration_langmuir(
                                 _langmuir_isotherm(
                                     x_dense_projected,
                                     *langmuir_params,
-                                ),
+                                ) - response_offset,
                                 color=color,
                                 lw=1.8,
                                 linestyle="--",
@@ -3673,7 +3734,7 @@ def plot_titration_langmuir(
                                 show_fit_details
                                 and np.nanmin(x) <= kd_x <= np.nanmax(x)
                             ):
-                                kd_y = float(_langmuir_isotherm(kd_x, *langmuir_params))
+                                kd_y = float(_langmuir_isotherm(kd_x, *langmuir_params)) - response_offset
                                 ax.axvline(
                                     kd_x,
                                     color=color,
@@ -3706,7 +3767,7 @@ def plot_titration_langmuir(
                                 lod_y = float(_langmuir_isotherm(
                                     limit_of_detection,
                                     *langmuir_params,
-                                ))
+                                )) - response_offset
                                 channel_label = (
                                     _swv_method_trace_label(ch)
                                     or _compact_channel_label(ch)
@@ -3734,7 +3795,7 @@ def plot_titration_langmuir(
                                 uloq_y = float(_langmuir_isotherm(
                                     upper_limit_of_quantification,
                                     *langmuir_params,
-                                ))
+                                )) - response_offset
                                 channel_label = (
                                     _swv_method_trace_label(ch)
                                     or _compact_channel_label(ch)
@@ -3770,7 +3831,7 @@ def plot_titration_langmuir(
                     elif show_fit_details and saturation_idx >= 1:
                         ax.plot(
                             x[:saturation_idx + 1],
-                            y[:saturation_idx + 1],
+                            y[:saturation_idx + 1] - response_offset,
                             color=color,
                             lw=1.8,
                             alpha=0.25 if dimmed else 0.75,
@@ -3866,7 +3927,10 @@ def plot_titration_langmuir(
         else metric
     )
     ax.set_ylabel(plotted_ylabel)
-    ax.set_ylim(bottom=0.0)
+    if offset_to_response_baseline:
+        ax.axhline(0.0, color='gray', linestyle='--', linewidth=.8, alpha=.6)
+    else:
+        ax.set_ylim(bottom=0.0)
     ax.set_title(title or f"{metric} titration isotherm")
     ax.grid(False)
     if show_legend:

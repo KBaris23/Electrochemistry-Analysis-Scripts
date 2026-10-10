@@ -91,6 +91,12 @@ analysis filter and compare filtered/unfiltered results.
   option changes fitted peak metrics. Missing waveforms/bounds are not filled.
   The same extreme-value filter is honored by the Paper Figures response plots
   and titration fits; its current status is shown next to the waveform controls.
+  **Use reference titration style** restores plasma overlays (every accepted
+  scan, zeroed correction anchors), dark-blue optimized/light-blue manual
+  response curves, and **Change from preceding buffer**. Buffer residual noise
+  is retained; missing references remain missing. Langmuir display subtracts
+  its anchor buffer without changing fitted parameters. Offset stacks and
+  absolute-current display remain selectable; saved choices are not silently reset.
 - **Exports:** use **Render figure (fast preview)** first, then **Create final
   PNG/PDF/SVG**. Titration Paper Figures contain rasterized subplots even in PDF;
   set their panel raster DPI before generation. Transparent export and optional

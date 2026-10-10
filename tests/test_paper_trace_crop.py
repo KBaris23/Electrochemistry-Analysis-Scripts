@@ -48,3 +48,15 @@ def test_descending_voltage_and_nan_gap_are_preserved():
     result, = prepare_titration_swv_traces([source])
     assert np.all(np.diff(result['voltage']) < 0)
     assert np.isnan(result['smoothed_corrected_current'][2])
+
+
+def test_display_baseline_reuses_anchor_offset_and_skips_rejected_scans():
+    source = trace()
+    source['status'] = 'OK'
+    source['smoothed_corrected_current'] = np.array([3, 3, 3, 4, 6, 9, 7, 5, 4, 3, 3, 3.])
+    bad = dict(source, status='FAILED')
+    result, = prepare_titration_swv_traces([source, bad], zero_anchors=True, accepted_only=True)
+    expected = source['smoothed_corrected_current'][2:9] - np.linspace(3, 4, 7)
+    np.testing.assert_allclose(result['smoothed_corrected_current'], expected)
+    assert result['smoothed_corrected_current'][0] == result['smoothed_corrected_current'][-1] == 0
+    assert source['smoothed_corrected_current'][2] == 3

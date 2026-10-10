@@ -51,7 +51,10 @@ from core import (
     run_batch,
 )
 from core.analysis import analyze_swv_arrays
-from core.plotting import add_titration_on_off_difference, prepare_titration_swv_traces
+from core.plotting import (
+    add_titration_on_off_difference, prepare_titration_swv_traces,
+    titration_measurement_changes,
+)
 from core.processing import (
     detect_dominant_peak,
     rotate_offset_using_bracketing_minima,
@@ -1767,6 +1770,7 @@ def _paper_proxy_handle(handle: Any) -> Any:
     """A figure-independent copy of a legend handle (sources are closed later)."""
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
+    from matplotlib.collections import PathCollection
     if isinstance(handle, Line2D):
         return Line2D(
             [0], [0], color=handle.get_color(), linestyle=handle.get_linestyle(),
@@ -1779,11 +1783,20 @@ def _paper_proxy_handle(handle: Any) -> Any:
             facecolor=handle.get_facecolor(), edgecolor=handle.get_edgecolor(),
             alpha=handle.get_alpha(),
         )
+    if isinstance(handle, PathCollection):
+        faces = handle.get_facecolors()
+        edges = handle.get_edgecolors()
+        return Line2D([0], [0], linestyle='none', marker='o', markersize=5,
+                      markerfacecolor=faces[0] if len(faces) else 'none',
+                      markeredgecolor=edges[0] if len(edges) else 'none',
+                      alpha=handle.get_alpha())
     return None
 
 
 def _paper_collect_legend(source: plt.Figure) -> None:
     """Move a source's legend entries into the shared figure legend."""
+    if getattr(source, '_paper_keep_legend', False):
+        return
     entries = _PAPER_LEGEND_STORE.setdefault("entries", {})
     for source_axis in source.axes:
         legend = source_axis.get_legend()
@@ -1808,6 +1821,10 @@ def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cel
     source.set_size_inches(cell_w, cell_h)
     for source_axis in source.axes:
         source_axis.title.set_fontsize(font_size * 1.05)
+        if getattr(source, '_paper_keep_legend', False) and source_axis.get_legend() is not None:
+            source_axis.get_legend().set_title('')
+            for text in source_axis.get_legend().get_texts():
+                text.set_fontsize(max(4.5, font_size * .8))
         source_axis.xaxis.label.set_fontsize(font_size)
         source_axis.yaxis.label.set_fontsize(font_size)
         source_axis.tick_params(labelsize=max(4.5, font_size * .85))
@@ -1868,6 +1885,33 @@ def _paper_stack_vertically(
     axis.set_axis_off()
     output._paper_prestyled = True
     return output
+
+
+def _paper_reference_style() -> None:
+    st.session_state.update({
+        'paper_titration_swv_display': 'Overlaid',
+        'paper_titration_stride': 1,
+        'paper_titration_trace_region': 'Corrected peak region (between minima)',
+        'paper_titration_zero_anchors': True,
+        'paper_titration_accepted_only': True,
+        'paper_titration_response_measure': 'Change from preceding buffer',
+    })
+
+
+def _paper_response_panel(rows, *, optimized, manual, physical, colors, vlines, scan_range, change):
+    figure = plot_metric_vs_scan(
+        rows, metric='peak_current_selected', channels=[optimized, manual],
+        title=f'Channel {physical}',
+        ylabel='Change in Peak Current (uA)' if change else 'Peak Current (uA)',
+        vlines=vlines, scan_range=scan_range, xlabel='SWV Measurement Number',
+        channel_colors=colors,
+        channel_labels={optimized: 'Optimized Method', manual: 'Manual Method'},
+    )
+    if figure is not None:
+        figure._paper_keep_legend = True
+        if change:
+            figure.axes[0].axhline(0, color='gray', linestyle='--', linewidth=.8, alpha=.6)
+    return figure
 
 
 def _paper_stacked_traces(
@@ -6839,6 +6883,8 @@ if view == "Paper Figures":
             ),
         )
         is_directional_type3 = figure_type.startswith("Type 3B")
+        st.button('Use reference titration style', on_click=_paper_reference_style,
+                  help='Overlaid plasma SWVs, every trace, zero correction anchors, and buffer-referenced response. Keeps your channel, methods and scan range.')
         control_cols = st.columns(4)
         paper_font = float(control_cols[0].number_input(
             "Font size (pt)", 5.0, 14.0, value=8.0, step=.5,
@@ -6854,7 +6900,7 @@ if view == "Paper Figures":
             help="Resolution used inside the composite. Higher settings create larger exports.",
         ))
         paper_trace_stride = int(control_cols[3].number_input(
-            "SWV trace stride", 1, 50, value=5, key="paper_titration_stride",
+            "SWV trace stride", 1, 50, value=1, key="paper_titration_stride",
             help="1 plots every trace; larger values thin dense overlays without changing fits.",
         ))
         st.checkbox("Show panel letters", value=False, key="paper_show_panel_letters")
@@ -6868,6 +6914,17 @@ if view == "Paper Figures":
                      "Peak region additionally clips each trace to its final correction minima; "
                      "traces without valid bounds are omitted, not replaced by raw data.",
             )
+            paper_zero_anchors = st.checkbox('Zero correction anchors', value=True,
+                key='paper_titration_zero_anchors',
+                help='Uses the existing SWV anchor-baseline offset on the smoothed corrected trace. Display-only; fitted peak values are unchanged.')
+            paper_accepted_only = st.checkbox('Accepted SWVs only', value=True,
+                key='paper_titration_accepted_only',
+                help='Matches the standard SWV overlay: show scans passing analysis acceptance. Failed scans stay in the quality audit and are not replaced.')
+            paper_response_change = st.radio('Response display',
+                ['Change from preceding buffer', 'Absolute peak current'],
+                key='paper_titration_response_measure', horizontal=True,
+                help='Targets minus the preceding buffer plateau; buffers minus their own plateau. Missing buffer references remain missing.') == 'Change from preceding buffer'
+            st.caption('Overlaid SWVs use the standard plasma measurement colorbar. Optimized response: dark blue; manual: light blue. Buffer-referenced Langmuir display removes the anchor baseline, without changing the fit.')
             st.caption(
                 f"Smoothed + corrected SWVs only. Extreme-value filter: "
                 f"{'ON' if remove_extreme_titration_outliers else 'OFF'}. "
@@ -6879,7 +6936,7 @@ if view == "Paper Figures":
             )
         display_cols = st.columns(4)
         paper_swv_display = display_cols[0].radio(
-            "SWV traces", ["Stacked (offset)", "Overlaid"], horizontal=True,
+            "SWV traces", ["Overlaid", "Stacked (offset)"], horizontal=True,
             key="paper_titration_swv_display",
         )
         paper_offset_fraction = float(display_cols[1].slider(
@@ -7027,8 +7084,8 @@ if view == "Paper Figures":
             # this composite, even when both methods have the same response sign.
             consistent_channel_colors = dict(consistent_channel_colors)
             for _physical, optimized, manual, _display_range in comparisons:
-                consistent_channel_colors[optimized] = "#1f77b4"
-                consistent_channel_colors[manual] = "#d95f02"
+                consistent_channel_colors[optimized] = "#1464a0"
+                consistent_channel_colors[manual] = "#8ecae6"
         st.caption(
             "Langmuir fitting currently uses selected target plateaus through the largest "
             "absolute response; later plateaus remain visible. See Export for fit-point counts "
@@ -7058,11 +7115,20 @@ if view == "Paper Figures":
                     vlines_by_channel=titration_vlines_by_channel,
                 ) if remove_extreme_titration_outliers else titration_results
             )
+            if paper_response_change:
+                paper_metric_results = titration_measurement_changes(
+                    paper_metric_results, metric='peak_current_selected',
+                    vlines=titration_active_vlines, vlines_by_channel=titration_vlines_by_channel,
+                    edge_trim_fraction=titration_edge_trim_fraction,
+                    concentration_unit=titration_concentration_unit,
+                )
+            paper_y_label = 'Change in Peak Current (uA)' if paper_response_change else 'Peak Current (uA)'
+            paper_fit_baseline = 'preceding_buffer' if paper_response_change else titration_baseline_mode
             if is_directional_type3:
                 physical, signal_on, signal_off, manual, display_range = directional_selection
                 directional_colors = {
-                    manual: "#666666",
-                    signal_on: "#1f77b4",
+                    manual: "#8ecae6",
+                    signal_on: "#1464a0",
                     signal_off: "#d62728",
                 }
 
@@ -7075,6 +7141,8 @@ if view == "Paper Figures":
                     title = f"Ch {physical} {direction_label} SWVs"
                     rows = prepare_titration_swv_traces(
                         rows, peak_region=paper_trace_region.startswith("Corrected peak"),
+                        zero_anchors=paper_zero_anchors,
+                        accepted_only=paper_accepted_only,
                     )
                     if paper_swv_display == "Stacked (offset)":
                         return _paper_stacked_traces(
@@ -7084,20 +7152,16 @@ if view == "Paper Figures":
                         )
                     return plot_overlaid_traces(
                         rows, y_key="smoothed_corrected_current", title=title,
-                        colormap_name=colormap, trace_modulo=paper_trace_stride,
+                        colormap_name='plasma', trace_modulo=paper_trace_stride,
+                        show_anchors=True, show_zero_baseline=True,
                     )
 
                 def directional_response(method, direction_label):
-                    return plot_metric_vs_scan(
-                        paper_metric_results,
-                        metric="peak_current_selected",
-                        channels=[manual, method],
-                        title=f"Ch {physical} {direction_label} vs manual response",
-                        ylabel="Peak Height (uA)",
-                        vlines=titration_active_vlines,
-                        scan_range=display_range,
-                        xlabel="SWV Measurement Number",
-                        channel_colors=directional_colors,
+                    return _paper_response_panel(
+                        paper_metric_results, optimized=method, manual=manual, physical=physical,
+                        colors={method: '#1464a0', manual: '#8ecae6'},
+                        vlines=titration_active_vlines, scan_range=display_range,
+                        change=paper_response_change,
                     )
 
                 row_figures = [
@@ -7119,26 +7183,29 @@ if view == "Paper Figures":
                     channels=[signal_on, signal_off],
                     vlines_by_channel=titration_vlines_by_channel,
                     title=f"Ch {physical} optimized signal-on/off Langmuir response",
-                    ylabel="Peak Height (uA)",
+                    ylabel=paper_y_label,
                     edge_trim_fraction=titration_edge_trim_fraction,
                     concentration_unit=titration_concentration_unit,
-                    baseline_mode=titration_baseline_mode,
+                    baseline_mode=paper_fit_baseline,
                     included_step_labels=titration_included_step_labels,
                     remove_extreme_outliers=remove_extreme_titration_outliers,
                     show_lod=show_titration_lod,
                     show_uloq=show_titration_uloq,
                     response_directions=consistent_response_directions,
                     channel_colors=directional_colors,
+                    offset_to_response_baseline=paper_response_change,
+                    channel_labels={signal_on: 'Optimized ON', signal_off: 'Optimized OFF'},
                 )
                 difference_steps = build_titration_step_table(
                     titration_results, metric="peak_current_selected", vlines=titration_active_vlines,
                     channels=[signal_on, signal_off], vlines_by_channel=titration_vlines_by_channel,
                     edge_trim_fraction=titration_edge_trim_fraction,
-                    concentration_unit=titration_concentration_unit, baseline_mode=titration_baseline_mode,
+                    concentration_unit=titration_concentration_unit, baseline_mode=paper_fit_baseline,
                     included_step_labels=titration_included_step_labels,
                     remove_extreme_outliers=remove_extreme_titration_outliers,
                 )
-                if not add_titration_on_off_difference(shared_langmuir, difference_steps, signal_on, signal_off):
+                if not add_titration_on_off_difference(shared_langmuir, difference_steps, signal_on, signal_off,
+                                                     offset_to_response_baseline=paper_response_change):
                     st.warning("No matched accepted concentrations for ON minus OFF; no difference curve was fabricated.")
                 composite = _paper_directional_titration_figure(
                     row_figures, shared_langmuir, width=paper_width,
@@ -7164,6 +7231,8 @@ if view == "Paper Figures":
                         row_map[method_key] = prepare_titration_swv_traces(
                             row_map[method_key],
                             peak_region=paper_trace_region.startswith("Corrected peak"),
+                            zero_anchors=paper_zero_anchors,
+                            accepted_only=paper_accepted_only,
                         )
                         if paper_swv_display == "Stacked (offset)":
                             panels.append(_paper_stacked_traces(
@@ -7175,22 +7244,29 @@ if view == "Paper Figures":
                         else:
                             panels.append(plot_overlaid_traces(
                                 row_map[method_key], y_key="smoothed_corrected_current",
-                                title=f"Ch {physical} {method_label} SWVs",
-                                colormap_name=colormap, trace_modulo=paper_trace_stride,
+                                title=f"{'Manual' if method_key == manual else 'Optimized'} Method | Channel {physical}",
+                                colormap_name='plasma', trace_modulo=paper_trace_stride,
+                                show_anchors=True, show_zero_baseline=True,
                             ))
 
                     def response_panel(method_channels, label):
-                        return plot_metric_vs_scan(
+                        response_figure = plot_metric_vs_scan(
                             paper_metric_results,
                             metric="peak_current_selected",
                             channels=method_channels,
                             title=label,
-                            ylabel="Peak Height (uA)",
+                            ylabel=paper_y_label,
                             vlines=titration_active_vlines,
                             scan_range=display_range,
                             xlabel="SWV Measurement Number",
                             channel_colors=consistent_channel_colors,
+                            channel_labels={optimized: 'Optimized Method', manual: 'Manual Method'},
                         )
+                        if response_figure is not None:
+                            response_figure._paper_keep_legend = True
+                            if paper_response_change:
+                                response_figure.axes[0].axhline(0, color='gray', linestyle='--', linewidth=.8, alpha=.6)
+                        return response_figure
 
                     if paper_response_display == "Stacked":
                         stacked_response = _paper_stack_vertically(
@@ -7213,16 +7289,18 @@ if view == "Paper Figures":
                         channels=[optimized, manual],
                         vlines_by_channel=titration_vlines_by_channel,
                         title=f"Ch {physical} Langmuir response",
-                        ylabel="Peak Height (uA)",
+                        ylabel=paper_y_label,
                         edge_trim_fraction=titration_edge_trim_fraction,
                         concentration_unit=titration_concentration_unit,
-                        baseline_mode=titration_baseline_mode,
+                        baseline_mode=paper_fit_baseline,
                         included_step_labels=titration_included_step_labels,
                         remove_extreme_outliers=remove_extreme_titration_outliers,
                         show_lod=show_titration_lod,
                         show_uloq=show_titration_uloq,
                         response_directions=consistent_response_directions,
                         channel_colors=consistent_channel_colors,
+                        offset_to_response_baseline=paper_response_change,
+                        channel_labels={optimized: 'Optimized Method', manual: 'Manual Method'},
                     ))
                     # The fit always uses the full titration (all selected doses);
                     # the display range above only crops the plotted portion.

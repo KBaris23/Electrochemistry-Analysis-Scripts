@@ -6,12 +6,14 @@ Updated 10 October 2026. Order: **sweep, BO validation, titration, concentration
 
 Start with [titrations — preliminary PNGs only](generated/preliminary_journal_plots/titrations/). All refreshed titration comparisons and concentration diagnostics are together there, named by dataset/channel/type. No PDFs, SVGs or individual SWV exports are in this review folder. BO/sweep outputs remain in their dataset folders.
 
-**What changed:** Type 3/3B SWVs use stored **smoothed + corrected current**, clipped to each trace's **final bracketing minima** inside the analysis voltage crop. The former plots included out-of-bracket tails. This is display-only: peak heights, dose statistics and fits are not recomputed or changed by the clipping.
+**Reference style:** Type 3/3B SWVs are **overlaid, not offset stacks**, using the standard SWV plotter and its purple-to-yellow (`plasma`) measurement colorbar. Only analysis-accepted **smoothed + corrected** traces are shown, clipped between final correction minima, with residual endpoint baseline removed using the existing anchor-offset method. Dashed zero line and anchor dots match the standard SWV view. These display operations do not recompute peak metrics or fit parameters.
+
+Response plots use **dark blue = Optimized Method**, **light blue = Manual Method**, with an in-panel legend. They show **Change in Peak Current**: each target measurement minus its immediately preceding buffer plateau; buffer measurements minus their own plateau (noise is retained). Langmuir curves/points have their anchor-buffer value subtracted for display only. Signal-off remains negative. In Type 3B, the shared fit distinguishes optimized ON (blue) and OFF (red); ON-minus-OFF now subtracts the two baseline-referenced changes, not unrelated absolute baselines.
 
 To make these again without starting over:
 
 1. Restart the app, then **Saved analysis sessions > Saved session > Open**: `preliminary_kana_ch3_titration`, `preliminary_amp0_analysis` or `preliminary_vanco_analysis`.
-2. Choose **View > Paper Figures** and the channel/type listed below. Under **SWV processing and filtering**, keep **Corrected peak region (between minima)**. Keep extreme filtering OFF for the main figures.
+2. Choose **View > Paper Figures** and the channel/type listed below. Click **Use reference titration style** (important when reopening older saved settings). This keeps your methods/range but selects **Overlaid**, stride **1**, **Zero correction anchors**, **Accepted SWVs only**, and **Change from preceding buffer**. Keep extreme filtering OFF for the main figures.
 3. Use **Generate paper figure > Download PNG**. Save into `paper/generated/preliminary_journal_plots/titrations/` with the dataset/channel/type in the filename. Detailed per-figure settings are in sections 6–7.
 
 | Figure | Open PNG | Assessment |
@@ -41,8 +43,9 @@ Filtering, simply:
 - **Main PNGs:** extreme filtering OFF; no interpolation, missing-dose patching or moving-average replacement.
 - **Separate sensitivity check:** `titrations/kana_try_filtered_sensitivity_ch3_type3.png`, extreme filtering ON. The response plot and fits now honor the same exclusions. Original measurements remain intact.
 - **Smoothing:** applies to each voltage/current SWV, using the recorded analysis settings (15-point, order 2), not across concentration steps. Cropping never invents a missing waveform or baseline bracket.
+- **Accepted-only waveform previews:** failed scans are omitted just as in the standard SWV overlay, not repaired or counted as successful responses. The full failure counts remain in section 8 and the audit. Waveform colorbars follow the standard plotter's within-panel accepted-measurement sequence; sparse methods can have fewer displayed measurements.
 
-The original run's `audit/output_manifest.json` records its original paths/hashes; archived titration paths now map to `audit/previous_titration_exports/<dataset>/`. The refreshed PNG inventory is `audit/titration_png_refresh/manifest.json`. Six older intermediate exports also remain in `audit/stale_ui_exports/`; use the figure links above, not those archives.
+The original run's `audit/output_manifest.json` records its original paths/hashes; archived titration paths now map to `audit/previous_titration_exports/<dataset>/`. The refreshed PNG inventory is `audit/titration_png_refresh/manifest.json`. The previous offset-stack PNG set is preserved in `audit/pre_reference_style_pngs/`. Six older intermediate exports also remain in `audit/stale_ui_exports/`; use the figure links above, not those archives.
 
 ### How these were made
 
@@ -167,7 +170,7 @@ Display start 21 removes the first 20 **method** scans (initial buffer/target pa
 
 ## 6. Figure C: generate Type 3 or 3B
 
-Open **SWV > Paper Figures**. Common settings: **14 in width, 10 pt font, panel raster DPI 300, Stacked (offset) SWVs, stride 10, offset 0.35, Overlaid response curves, no extra columns, panel letters OFF**. Set **SWV processing and filtering > SWV voltage window > Corrected peak region (between minima)**. All waveform panels use smoothed + corrected current; bounds come from the final correction pass. PNG exports at 600 DPI; constituent panels retain their selected raster DPI. Use **Download PNG** only for this preliminary round.
+Open **SWV > Paper Figures**. Common settings: **14 in width, 10 pt font, panel raster DPI 300, Overlaid SWVs, stride 1, plasma colorbar, Overlaid response curves, no extra columns, panel letters OFF**. Click **Use reference titration style**; keep **Corrected peak region (between minima)**, **Zero correction anchors ON**, **Accepted SWVs only ON**, and **Change from preceding buffer**. All waveform panels use smoothed + corrected current; bounds come from the final correction pass. PNG exports at 600 DPI; constituent panels retain their selected raster DPI. Use **Download PNG** only for this preliminary round.
 
 ### Kana ch3: recovered earlier channel, Type 3
 
@@ -254,7 +257,7 @@ For the sensitivity branch: **Remove extreme titration outliers ON > Apply Displ
 - Layout boxes include labels/legends; grid defaults to 1%, overlap is optional, export crops unused outer workspace. Workspace zoom does not alter export scale. Use the generated JSON for exact formatting.
 - This run fixed session restoration of button events/JSON identity keys, final-export invalidation, extracted-folder direction lookup, stale Paper Figures downloads, mislabeled response axes and inconsistent method colors. Added app-visible raw/corrected QC and fitted-branch/full-series R² exports. Correction/fitting algorithms were not replaced.
 - Refresh fixes: smoothed/corrected waveform clipping to final correction minima; one clearly labeled filter status; consistent extreme filtering in response plots and fits; selected-preset overwrite without name retyping. Full-analysis-crop display remains available explicitly.
-- Automated tests: **420 passed, 4 skipped** (one existing Matplotlib open-figure warning in tests). Real-input widget generation and saved-session reopening were exercised. Browser/print-size inspection and scientific validation remain separate checks.
+- Automated tests: **426 passed, 4 skipped** (one existing Matplotlib open-figure warning in tests). Checks cover anchor zeroing, local-buffer subtraction, preservation of buffer noise, missing-buffer gaps, negative OFF responses, unchanged model values under the display-baseline shift, and preservation of scatter legend entries. Real-input widget generation and saved-session reopening were exercised. Browser/print-size inspection and scientific validation remain separate checks.
 - Generated outputs/local caches remain Git-ignored; source changes and this guide are version-controlled. Committing the code does not upload raw data or these local PNGs.
 
 Still needed: notebook immobilization/cleaning details, chip morphology confirmation and equilibration rationale; independent concentration validation, specificity controls, reversibility assessment and the planned BO-versus-random simulations for stronger claims.
