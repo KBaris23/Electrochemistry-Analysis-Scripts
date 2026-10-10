@@ -6,6 +6,7 @@ Run with:  python -m streamlit run app.py
 import bisect
 from datetime import datetime, timedelta
 import io
+import hashlib
 import json
 import math
 import os
@@ -50,7 +51,7 @@ from core import (
     run_batch,
 )
 from core.analysis import analyze_swv_arrays
-from core.plotting import add_titration_on_off_difference
+from core.plotting import add_titration_on_off_difference, prepare_titration_swv_traces
 from core.processing import (
     detect_dominant_peak,
     rotate_offset_using_bracketing_minima,
@@ -150,17 +151,10 @@ def _render_workspace_manager() -> None:
                     ):
                         cached_results = None
                         cache_note = "; cached results skipped because source files changed"
-                preserved = {
-                    "workspace_session_choice": selected,
-                    "workspace_session_flash": f"Opened {selected}{cache_note}",
-                }
-                for key, value in payload["state"].items():
-                    st.session_state[key] = value
-                st.session_state.update(preserved)
-                if cached_results is not None:
-                    st.session_state.results = cached_results
-                    st.session_state.last_results = cached_results
-                    st.session_state.analysis_cache_results = cached_results
+                # Restore before widgets are instantiated on the next rerun.
+                st.session_state['_workspace_pending_restore'] = (
+                    payload['state'], cached_results, selected, cache_note,
+                )
                 st.rerun()
             except Exception as exc:
                 st.error(f"Could not open session: {exc}")
@@ -4406,6 +4400,29 @@ def _check_bo_analysis_match(snapshot_path: str) -> None:
     st.session_state["swv_bo_config_check"] = ("success" if not differences else "warning", message)
 
 
+pending_workspace = st.session_state.pop('_workspace_pending_restore', None)
+if pending_workspace is not None:
+    restored_state, restored_results, restored_name, restored_note = pending_workspace
+    _clear_loaded_analysis_state()
+    for restored_key, restored_value in restored_state.items():
+        st.session_state[restored_key] = restored_value
+    if restored_results is not None:
+        st.session_state.results = restored_results
+        st.session_state.last_results = restored_results
+        st.session_state.analysis_cache_results = restored_results
+        st.session_state.results_folder_key = _analysis_selection_key(
+            restored_state.get('analysis_mode', 'SWV'), restored_state.get('folders', []),
+        )
+    # JSON turns tuples into lists; these identity keys must retain their
+    # original tuple structure or the next rerun resets restored controls.
+    def _workspace_tuple(value):
+        return tuple(_workspace_tuple(x) for x in value) if isinstance(value, list) else value
+    for identity_key in ('swv_bo_auto_loaded_key', 'swv_crop_folder_key', 'analysis_cache_key'):
+        if identity_key in restored_state:
+            st.session_state[identity_key] = _workspace_tuple(restored_state[identity_key])
+    st.session_state.workspace_session_choice = restored_name
+    st.session_state.workspace_session_flash = f'Opened {restored_name}{restored_note}'
+
 _render_workspace_manager()
 
 with st.sidebar:
@@ -6521,7 +6538,11 @@ for palette_channel in response_palette_channels:
 # Resolve optimization provenance only from saved BO observations/configuration.
 # Response behavior is kept as separate metadata and is never used to guess BO
 # direction. Missing or conflicting BO matches remain unresolved.
-bo_settings_directions = bo_swv_optimization_direction_map(folders)
+direction_sources = list(folders)
+loaded_snapshot = st.session_state.get('swv_bo_config_loaded_path')
+if loaded_snapshot:
+    direction_sources.append(str(Path(loaded_snapshot).parent))
+bo_settings_directions = bo_swv_optimization_direction_map(direction_sources)
 for direction_rows in (plot_results, titration_results):
     for row in direction_rows:
         channel = row.get("channel")
@@ -6731,6 +6752,8 @@ if analysis_mode == "SWV":
 # 
 view_options = ["Overlays", "Metrics", "Paper Figures", "Drift", "Data Table", "Export"]
 view_options.insert(3, "Failures")
+if analysis_mode == "SWV":
+    view_options.insert(4, "Quality audit")
 view = st.radio(
     "View",
     view_options,
@@ -6738,6 +6761,57 @@ view = st.radio(
     key="analysis_view",
 )
 
+
+if view == "Quality audit":
+    from core.paper_audit import waveform_qc_table, plot_waveform_qc
+    st.subheader("Waveform quality audit")
+    st.caption(
+        "Audits every analysed scan before plot-level exclusions. A jump candidate has an "
+        "internal adjacent-current change above 10 robust derivative standard deviations "
+        "and 15% of the trace range. Sharp real peaks can also trigger this heuristic: "
+        "inspect the raw trace before deciding. This does not remove or fill measurements."
+    )
+    qc = waveform_qc_table(results)
+    if not qc.empty:
+        st.dataframe(qc, use_container_width=True)
+        st.download_button("Download waveform QC CSV", qc.to_csv(index=False).encode(),
+                           file_name="waveform_qc.csv", mime="text/csv")
+        flagged_only = st.checkbox("Show jump candidates only", value=True, key="swv_qc_flagged_only")
+        candidates = qc.index[qc['jump_candidate']].tolist() if flagged_only else qc.index.tolist()
+        if candidates:
+            selected_qc = st.selectbox(
+                "Inspect analysed waveform", candidates, key="swv_qc_selected_scan",
+                format_func=lambda i: f"Ch {qc.at[i, 'channel']} | scan {qc.at[i, 'scan_number']} | {qc.at[i, 'status']}",
+            )
+            st.caption(qc.at[selected_qc, 'source_file'])
+            if st.button("Preview waveform QC", key="swv_qc_render"):
+                jump = qc.at[selected_qc, 'jump_voltage_V'] if qc.at[selected_qc, 'jump_candidate'] else None
+                qc_figure = plot_waveform_qc(results[selected_qc], jump)
+                st.pyplot(qc_figure)
+                qc_png = io.BytesIO()
+                qc_figure.savefig(qc_png, format='png', dpi=200, bbox_inches='tight')
+                st.download_button("Download waveform QC preview", qc_png.getvalue(),
+                                   file_name=f"waveform_qc_ch{qc.at[selected_qc, 'channel']}_scan{qc.at[selected_qc, 'scan_number']}.png",
+                                   mime='image/png')
+                plt.close(qc_figure)
+        else:
+            st.info("No jump candidates. Uncheck the filter to inspect other scans.")
+    if titration_ready:
+        kept = filter_extreme_titration_outliers(
+            titration_results, 'peak_current_selected', titration_active_vlines,
+            channels=titration_channels, vlines_by_channel=titration_vlines_by_channel,
+        )
+        kept_ids = {id(row) for row in kept}
+        excluded = pd.DataFrame([
+            {key: row.get(key) for key in ('file_name', 'original_channel', 'channel',
+                                          'scan_number', 'original_scan_number', 'peak_current_selected')}
+            for row in titration_results if id(row) not in kept_ids
+        ])
+        st.caption(f'Extreme-filter candidates for the selected peak metric: {len(excluded)}. '
+                   'These are excluded only when Remove extreme titration outliers is enabled.')
+        st.dataframe(excluded, use_container_width=True)
+        st.download_button('Download extreme-filter candidates CSV', excluded.to_csv(index=False).encode(),
+                           file_name='extreme_filter_candidates.csv', mime='text/csv')
 
 if view == "Paper Figures":
     st.subheader("Paper Figure Studio - titration")
@@ -6785,6 +6859,24 @@ if view == "Paper Figures":
         ))
         st.checkbox("Show panel letters", value=False, key="paper_show_panel_letters")
         st.caption("Transparent, content-cropped exports. Scan range crops the display; fitting uses all included doses. PDF panels retain the selected raster DPI.")
+        with st.expander("SWV processing and filtering", expanded=True):
+            paper_trace_region = st.radio(
+                "SWV voltage window",
+                ["Corrected peak region (between minima)", "Full analysis crop"],
+                key="paper_titration_trace_region", horizontal=True,
+                help="Both use stored smoothed + corrected current within the analysis crop. "
+                     "Peak region additionally clips each trace to its final correction minima; "
+                     "traces without valid bounds are omitted, not replaced by raw data.",
+            )
+            st.caption(
+                f"Smoothed + corrected SWVs only. Extreme-value filter: "
+                f"{'ON' if remove_extreme_titration_outliers else 'OFF'}. "
+                "Change filtering under Display Controls > Remove extreme titration outliers, "
+                "then Apply Display Controls. Filtering excludes points; it does not smooth "
+                "the titration curve or fill missing measurements. No missing-data patching "
+                "or moving-average replacement is applied. Voltage clipping changes only "
+                "the displayed SWVs, not peak values or fits."
+            )
         display_cols = st.columns(4)
         paper_swv_display = display_cols[0].radio(
             "SWV traces", ["Stacked (offset)", "Overlaid"], horizontal=True,
@@ -6930,9 +7022,42 @@ if view == "Paper Figures":
                     ))
                     comparisons.append((physical, optimized, manual, (min(start, end), max(start, end))))
         can_generate = bool(directional_selection) if is_directional_type3 else bool(comparisons)
+        if not is_directional_type3:
+            # Match the blue optimized / orange reference SWV stacks throughout
+            # this composite, even when both methods have the same response sign.
+            consistent_channel_colors = dict(consistent_channel_colors)
+            for _physical, optimized, manual, _display_range in comparisons:
+                consistent_channel_colors[optimized] = "#1f77b4"
+                consistent_channel_colors[manual] = "#d95f02"
+        st.caption(
+            "Langmuir fitting currently uses selected target plateaus through the largest "
+            "absolute response; later plateaus remain visible. See Export for fit-point counts "
+            "and R² on both the fitted branch and all selected target concentrations. "
+            "Type 4 reuses this calibration; it is not independent validation."
+        )
+        paper_recipe = {
+            'controls': {key: value for key, value in st.session_state.items()
+                         if (key.startswith('paper_titration_') or key == 'paper_show_panel_letters')
+                         and not key.startswith('paper_titration_render')},
+            'analysis_key': st.session_state.get('analysis_cache_key'),
+            'folders': folders, 'metric': selected_peak_height_source,
+            'vlines': titration_active_vlines, 'channel_vlines': titration_vlines_by_channel,
+            'included_steps': titration_included_step_labels,
+            'baseline': titration_baseline_mode, 'trim': titration_edge_trim_fraction,
+            'filter_extremes': remove_extreme_titration_outliers,
+            'lod': show_titration_lod, 'uloq': show_titration_uloq,
+        }
+        paper_signature = hashlib.sha256(json.dumps(paper_recipe, sort_keys=True, default=str).encode()).hexdigest()
         if can_generate and st.button("Generate paper figure", type="primary", use_container_width=True):
             _PAPER_LEGEND_STORE.clear()
             panels: List[Optional[plt.Figure]] = []
+            paper_metric_results = (
+                filter_extreme_titration_outliers(
+                    titration_results, metric="peak_current_selected",
+                    vlines=titration_active_vlines,
+                    vlines_by_channel=titration_vlines_by_channel,
+                ) if remove_extreme_titration_outliers else titration_results
+            )
             if is_directional_type3:
                 physical, signal_on, signal_off, manual, display_range = directional_selection
                 directional_colors = {
@@ -6948,6 +7073,9 @@ if view == "Paper Figures":
                         and display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1]
                     ]
                     title = f"Ch {physical} {direction_label} SWVs"
+                    rows = prepare_titration_swv_traces(
+                        rows, peak_region=paper_trace_region.startswith("Corrected peak"),
+                    )
                     if paper_swv_display == "Stacked (offset)":
                         return _paper_stacked_traces(
                             rows, y_key="smoothed_corrected_current", title=title,
@@ -6961,11 +7089,11 @@ if view == "Paper Figures":
 
                 def directional_response(method, direction_label):
                     return plot_metric_vs_scan(
-                        titration_results,
+                        paper_metric_results,
                         metric="peak_current_selected",
                         channels=[manual, method],
                         title=f"Ch {physical} {direction_label} vs manual response",
-                        ylabel="Change in Peak Height (uA)",
+                        ylabel="Peak Height (uA)",
                         vlines=titration_active_vlines,
                         scan_range=display_range,
                         xlabel="SWV Measurement Number",
@@ -7033,6 +7161,10 @@ if view == "Paper Figures":
                         (manual, "manual/reference", "Oranges"),
                         (optimized, "optimized", "Blues"),
                     ):
+                        row_map[method_key] = prepare_titration_swv_traces(
+                            row_map[method_key],
+                            peak_region=paper_trace_region.startswith("Corrected peak"),
+                        )
                         if paper_swv_display == "Stacked (offset)":
                             panels.append(_paper_stacked_traces(
                                 row_map[method_key], y_key="smoothed_corrected_current",
@@ -7049,11 +7181,11 @@ if view == "Paper Figures":
 
                     def response_panel(method_channels, label):
                         return plot_metric_vs_scan(
-                            titration_results,
+                            paper_metric_results,
                             metric="peak_current_selected",
                             channels=method_channels,
                             title=label,
-                            ylabel="Change in Peak Height (uA)",
+                            ylabel="Peak Height (uA)",
                             vlines=titration_active_vlines,
                             scan_range=display_range,
                             xlabel="SWV Measurement Number",
@@ -7216,9 +7348,13 @@ if view == "Paper Figures":
                 st.session_state["paper_titration_render"] = (
                     "type4", composite, paper_rows, paper_width, paper_font
                 )
+            st.session_state['paper_titration_render_signature'] = paper_signature
         rendered = st.session_state.get("paper_titration_render")
         if rendered:
-            _paper_figure_downloads(rendered[1], f"paper_{rendered[0]}_titration")
+            if st.session_state.get('paper_titration_render_signature') == paper_signature:
+                _paper_figure_downloads(rendered[1], f"paper_{rendered[0]}_titration")
+            else:
+                st.info('Settings changed. Click Generate paper figure to refresh the preview and downloads.')
 
 
 

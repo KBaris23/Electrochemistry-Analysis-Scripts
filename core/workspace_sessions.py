@@ -19,11 +19,17 @@ SCHEMA_VERSION = 1
 DEFAULT_SESSION_DIR = Path("analysis_sessions")
 RECOVERY_STEM = "recovery"
 _EXCLUDED_PREFIXES = (
+    "FormSubmitter:", "_workspace_pending_",
+    "bo_composer_preset_", "bo_composer_final_export_button", "bo_composer_move_",
+    "bo_composer_import_",
+    "bo_history_download_", "build_bo_pdf_bytes_", "bo_history_scores_update_large_plots",
     "bo_composer_editor_",
     "bo_composer_render_", "bo_composer_captured_", "bo_composer_pending_",
     "bo_composer_capture_preview_", "bo_gif_", "bo_sim_",
 )
 _EXCLUDED_KEYS = {
+    "bo_snap_3d_perspective",
+    "swv_bo_config_load", "swv_bo_config_check_recommended", "swv_bo_config_reload_recommended",
     "results", "last_results", "analysis_cache_results", "swv_annotated_results",
     "mat_conversion_report",
     "bo_composer_source_editor_open",
@@ -50,9 +56,24 @@ def _json_value(value: Any) -> Any:
 
 def serializable_state(state: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    # Trigger widgets are events, not restorable settings. Streamlit forbids
+    # assigning their values through session_state, even when the value is False.
+    transient = set()
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx(suppress_warning=True)
+        if ctx is not None:
+            internal = ctx.session_state._state
+            for key, widget_id in internal._key_id_mapper._key_id_mapping.items():
+                metadata = internal._new_widget_state.widget_metadata.get(widget_id)
+                if metadata and metadata.value_type in ('trigger_value', 'string_trigger_value', 'chat_input_value', 'file_uploader_state_value'):
+                    transient.add(key)
+    except (AttributeError, ImportError):
+        pass
     for key, value in state.items():
         key = str(key)
-        if key in _EXCLUDED_KEYS or key.startswith(_EXCLUDED_PREFIXES):
+        if (key in _EXCLUDED_KEYS or key in transient or key.startswith(_EXCLUDED_PREFIXES)
+                or (key.startswith('bo_selected_session_folder_') and isinstance(value, bool))):
             continue
         try:
             encoded = _json_value(value)
@@ -118,6 +139,7 @@ def load_workspace(path: str | Path) -> tuple[dict[str, Any], Any | None]:
     payload = json.loads(recipe_path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != SCHEMA_VERSION or not isinstance(payload.get("state"), dict):
         raise ValueError("Unsupported or invalid analysis-session file.")
+    payload['state'] = serializable_state(payload['state'])
     results = None
     cache_name = payload.get("results_cache")
     if cache_name:

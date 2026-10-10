@@ -14,6 +14,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bo_session_viewer as viewer
 
 
+def test_final_export_click_is_not_a_figure_setting():
+    with patch.object(viewer.st, 'session_state', {
+        'bo_composer_font_size': 10, 'bo_composer_final_export_button': True,
+    }):
+        assert viewer._composer_widget_state(1) == {'bo_composer_font_size': 10}
+
+
+def test_preset_overwrite_controls_do_not_change_figure_signature():
+    with patch.object(viewer.st, 'session_state', {
+        'bo_composer_font_size': 10,
+        'bo_composer_preset_overwrite_target': 'My preset',
+        'bo_composer_preset_overwrite': True,
+    }):
+        assert viewer._composer_widget_state(1) == {'bo_composer_font_size': 10}
+
+
 def test_composer_normalize_rect_clamps_to_canvas():
     assert viewer._composer_normalize_rect([-.2, .9, .8, .5]) == (
         0.0,

@@ -53,3 +53,12 @@ def test_recovery_recipe_is_not_presented_as_a_named_workspace(tmp_path):
     saved, _ = save_workspace(tmp_path, "named", {"answer": 43}, cache_results=False)
 
     assert list_workspaces(tmp_path) == [saved]
+
+
+def test_button_events_are_not_saved_or_restored(tmp_path):
+    recipe, _ = save_workspace(tmp_path, 'buttons', {
+        'swv_bo_config_load': False, 'FormSubmitter:test-Apply': True,
+        'swv_double_correction': True,
+    })
+    payload, _ = load_workspace(recipe)
+    assert payload['state'] == {'swv_double_correction': True}

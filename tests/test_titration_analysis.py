@@ -376,6 +376,17 @@ def test_method_colors_are_fixed_across_physical_channels():
     assert np.mean(method_1_colors[0]) < np.mean(method_2_colors[0])
 
 
+def test_explicit_palette_overrides_default_method_blues():
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgba
+    channel = "3 group 2"
+    rows = [dict(channel=channel, scan_number=i, peak_current_selected=float(i)) for i in (1, 2, 3)]
+    fig = plot_metric_vs_scan(rows, metric="peak_current_selected", channels=[channel],
+                              channel_colors={channel: "#d62728"})
+    assert to_rgba(fig.axes[0].lines[0].get_color()) == to_rgba("#d62728")
+    plt.close(fig)
+
+
 def test_metric_y_axes_stay_black_for_response_colored_channels():
     rows = [
         {
@@ -1074,6 +1085,8 @@ def test_langmuir_summary_reports_kd_and_lod_for_buffer_baselined_targets():
 
     assert len(summary) == 1
     assert np.isclose(summary[0]["langmuir_kd"], kd, rtol=0.05)
+    assert summary[0]["langmuir_r2_all_selected_targets"] > 0.99
+    assert summary[0]["langmuir_r2_fitted_targets"] > 0.99
     assert np.isclose(summary[0]["langmuir_baseline"], 5.0)
     assert summary[0]["langmuir_baseline_fixed"] is True
     assert summary[0]["limit_of_detection"] is not None

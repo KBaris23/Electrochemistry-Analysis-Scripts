@@ -25,6 +25,15 @@ and plot types. Select the correct session before loading a preset.
 
 ### Analysis settings and scientific safeguards
 
+SWV **Quality audit** now exports a per-scan jump-screen table and the existing
+extreme-filter candidates. **Inspect analysed waveform > Preview waveform QC**
+compares the stored raw, corrected and smoothed arrays; screening does not remove
+or fill data. Paper Figures disables stale downloads after settings change;
+click **Generate paper figure** again. Its method colors are consistent across
+SWVs, responses and fits. Langmuir CSV exports distinguish R² on the fitted
+branch from R² across all selected accepted target doses: the existing fit stops
+at the largest absolute response, so these can differ substantially.
+
 BO corrected traces use the session's saved analysis snapshot by default. In
 SWV mode, the sidebar can automatically load a uniquely matched nearby snapshot
 when input folders change, including extracted titrations with provenance in
@@ -75,14 +84,24 @@ analysis filter and compare filtered/unfiltered results.
 - **Other plots:** generate them in their source tab, then use **Add to Composer**
   or **Replace selected Composer panel**. Captured/image panels have different
   editing capabilities from live generated panels. SWV Paper Figures are guided
-  composites, not arbitrary independently editable Composer panels.
+  composites, not arbitrary independently editable Composer panels. Under
+  **SWV processing and filtering**, titration waveform panels default to stored
+  **smoothed + corrected** current between the final correction minima (inside
+  the analysis crop). **Full analysis crop** is available explicitly. Neither
+  option changes fitted peak metrics. Missing waveforms/bounds are not filled.
+  The same extreme-value filter is honored by the Paper Figures response plots
+  and titration fits; its current status is shown next to the waveform controls.
 - **Exports:** use **Render figure (fast preview)** first, then **Create final
   PNG/PDF/SVG**. Titration Paper Figures contain rasterized subplots even in PDF;
   set their panel raster DPI before generation. Transparent export and optional
   panel letters are supported.
 - **Presets:** shared custom presets are in the visible, Git-tracked
-  `figure_composer_presets.json` under the app directory; saving the same name
-  replaces that saved preset. Commit and push this file after saving to share
+  `figure_composer_presets.json` under the app directory. Under **Reusable preset**,
+  choose **Saved preset to overwrite**, then click **Overwrite selected preset**;
+  no name retyping or rendering is needed. Apply pending panel/layout edits first.
+  For a built-in template, **Save preset** under your own name once, then overwrite
+  that saved copy as needed. Saving the same typed name also still replaces it.
+  Commit and push this file after saving to share
   new templates; saving in the app does not automatically push to Git. Built-in
   templates are defined in `bo_session_viewer.py`. Use your own preset name to
   preserve variants. Older `.figure_composer_presets.json` files remain readable;

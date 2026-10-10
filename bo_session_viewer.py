@@ -31146,6 +31146,7 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_capture_counter",
     "bo_composer_consumed_seq",
     "bo_composer_render_",
+    "bo_composer_final_export_button",
     "bo_composer_exports_",
     "bo_composer_preset_",
     "bo_composer_import_",
@@ -31587,17 +31588,70 @@ def _composer_save_preset(
     name: str,
     metadata: Mapping[str, Any],
     path: Path | None = None,
+    *,
+    require_existing: bool = False,
 ) -> None:
     path = Path(path) if path is not None else COMPOSER_PRESET_STORE
     cleaned_name = str(name or "").strip()
     if not cleaned_name:
         raise ValueError("Enter a preset name.")
     presets = _composer_load_presets(path)
+    if require_existing and cleaned_name not in presets:
+        raise ValueError("That saved preset no longer exists. Select another preset or save a new one.")
     presets[cleaned_name] = dict(metadata)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_bytes(_composer_json_bytes(presets, pretty=True))
     temporary.replace(path)
+
+
+def _composer_preset_save_controls(
+    session: Mapping[str, Any], config: Mapping[str, Any],
+    selected_preset_name: str = "",
+) -> str:
+    """Save a new name or explicitly replace a selected user-saved preset."""
+    st.markdown("**Reusable preset**")
+    save_cols = st.columns([2.2, 1])
+    name = save_cols[0].text_input(
+        "Preset name", value="", placeholder="e.g. Hyperparameter Sweep",
+        key="bo_composer_preset_name",
+    )
+    if save_cols[1].button("Save preset", key="bo_composer_preset_save", use_container_width=True):
+        try:
+            _composer_save_preset(name, _composer_metadata(session, config, preset_name=name))
+        except (OSError, ValueError) as exc:
+            st.error(f"Could not save preset: {exc}")
+        else:
+            st.success(f"Saved preset '{name.strip()}' to {COMPOSER_PRESET_STORE.name}. Commit and push that file to share the update.")
+            st.session_state["bo_composer_preset_overwrite_target"] = name.strip()
+
+    # Only persisted user presets are replaceable, not generated built-ins.
+    names = list(_composer_load_presets())
+    target_key = "bo_composer_preset_overwrite_target"
+    if target_key not in st.session_state or (st.session_state[target_key] and st.session_state[target_key] not in names):
+        st.session_state[target_key] = selected_preset_name if selected_preset_name in names else ""
+    overwrite_cols = st.columns([2.2, 1])
+    target = overwrite_cols[0].selectbox(
+        "Saved preset to overwrite", ["", *names], key=target_key,
+        format_func=lambda value: value or "Choose a saved preset",
+        disabled=not names,
+        help="Select the saved preset to replace with the current panels and formatting. No name typing or rendering is required.",
+    )
+    if overwrite_cols[1].button(
+        "Overwrite selected preset", key="bo_composer_preset_overwrite",
+        disabled=not target, use_container_width=True,
+    ):
+        try:
+            _composer_save_preset(
+                target, _composer_metadata(session, config, preset_name=target),
+                require_existing=True,
+            )
+        except (OSError, ValueError) as exc:
+            st.error(f"Could not overwrite preset: {exc}")
+        else:
+            st.success(f"Overwrote '{target}' in {COMPOSER_PRESET_STORE.name}. Other presets are unchanged.")
+    st.caption("Built-in templates stay unchanged. Save a named copy first, then overwrite that copy here. Apply pending panel/layout edits before saving.")
+    return name
 
 
 def _composer_hyperparameter_sweep_preset(
@@ -36946,28 +37000,7 @@ def _render_figure_composer(
     config = _composer_config(specs, panel_count)
     config_signature = _composer_config_signature(config)
 
-    st.markdown("**Reusable preset**")
-    preset_save_cols = st.columns([2.2, 1])
-    preset_name = preset_save_cols[0].text_input(
-        "Preset name",
-        value="",
-        placeholder="e.g. Hyperparameter Sweep",
-        key="bo_composer_preset_name",
-    )
-    if preset_save_cols[1].button(
-        "Save preset",
-        key="bo_composer_preset_save",
-        use_container_width=True,
-    ):
-        try:
-            _composer_save_preset(
-                preset_name,
-                _composer_metadata(session, config, preset_name=preset_name),
-            )
-        except (OSError, ValueError) as exc:
-            st.error(f"Could not save preset: {exc}")
-        else:
-            st.success(f"Saved preset '{preset_name.strip()}' to {COMPOSER_PRESET_STORE.name}. Commit and push that file to share the update.")
+    preset_name = _composer_preset_save_controls(session, config, selected_preset_name)
 
     render_identity = (
         f"{session['state'].get('session_id', session['root'].name)}::"

@@ -1663,10 +1663,20 @@ def build_titration_langmuir_summary_table(
             else:
                 fit_status = "guide_plus_post_sat_poly"
 
+        r2_all = r2_fit = None
+        if langmuir_params is not None:
+            prediction = _langmuir_isotherm(x, *langmuir_params)
+            def r_squared(observed, predicted):
+                total = float(np.sum((observed - np.mean(observed)) ** 2))
+                return float(1 - np.sum((observed - predicted) ** 2) / total) if total > 0 else None
+            r2_all = r_squared(y, prediction)
+            r2_fit = r_squared(y[:saturation_idx + 1], prediction[:saturation_idx + 1])
         rows.append({
             "channel": ch,
             "original_channel": ch_steps[0].get("original_channel", ch),
             "metric_key": metric,
+            "langmuir_r2_all_selected_targets": r2_all,
+            "langmuir_r2_fitted_targets": r2_fit,
             "fit_axis": "concentration" if fit_axis_kind == "concentration" else "titration_step_index",
             "fit_axis_unit": concentration_unit if fit_axis_kind == "concentration" else "",
             "fit_axis_note": "physical_concentration" if fit_axis_kind == "concentration" else "no_physical_kd",
@@ -2094,6 +2104,44 @@ def build_titration_measurement_accuracy_table(
 
 # ---- public plot functions
 
+
+
+def prepare_titration_swv_traces(results, *, peak_region=True):
+    """Display-only copies of stored smoothed/corrected traces; never refit or fill.
+
+    Analysis arrays already obey the voltage crop. The default additionally
+    restricts them to the final correction's bracketing minima, excluding tails
+    outside the region over which the peak was baseline-corrected.
+    """
+    prepared = []
+    for row in results:
+        voltage = row.get("voltage")
+        current = row.get("smoothed_corrected_current")
+        if voltage is None or current is None:
+            continue
+        voltage, current = np.asarray(voltage, float), np.asarray(current, float)
+        if voltage.ndim != 1 or current.shape != voltage.shape or len(voltage) < 2:
+            continue
+        start, end = 0, len(voltage) - 1
+        if peak_region:
+            try:
+                left, right = row.get("left_min_idx"), row.get("right_min_idx")
+                start, end = sorted((int(left), int(right)))
+                if int(left) != left or int(right) != right:
+                    continue
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not 0 <= start < end < len(voltage):
+                continue
+        cropped = dict(row)
+        cropped["voltage"] = voltage[start:end + 1].copy()
+        cropped["smoothed_corrected_current"] = current[start:end + 1].copy()
+        # Marker indices would otherwise refer to the uncropped arrays.
+        for key in ("left_min_idx", "right_min_idx", "peak_idx_corr", "peak_idx"):
+            value = row.get(key)
+            cropped[key] = int(value) - start if value is not None and start <= value <= end else None
+        prepared.append(cropped)
+    return prepared
 
 
 def plot_overlaid_traces(
@@ -2693,13 +2741,13 @@ def plot_metric_vs_scan(
         for channel, color in (channel_colors or {}).items()
         if channel in channels
     })
-    # Displayed SWV methods use method identity—not physical channel, signal
-    # direction, or a caller palette—for color. This keeps Method 1 and Method 2
-    # recognizable in every channel plot.
+    # Method shades are defaults; an explicit shared figure palette must win
+    # so the response trace and its Langmuir curve have the same legend color.
     colors.update({
         channel: method_color
         for channel in channels
-        if (method_color := _swv_method_blue(channel)) is not None
+        if channel not in (channel_colors or {})
+        and (method_color := _swv_method_blue(channel)) is not None
     })
 
 
