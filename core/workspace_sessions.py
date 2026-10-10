@@ -19,6 +19,7 @@ SCHEMA_VERSION = 1
 DEFAULT_SESSION_DIR = Path("analysis_sessions")
 RECOVERY_STEM = "recovery"
 _EXCLUDED_PREFIXES = (
+    "bo_composer_editor_",
     "bo_composer_render_", "bo_composer_captured_", "bo_composer_pending_",
     "bo_composer_capture_preview_", "bo_gif_", "bo_sim_",
 )
@@ -26,6 +27,7 @@ _EXCLUDED_KEYS = {
     "results", "last_results", "analysis_cache_results", "swv_annotated_results",
     "mat_conversion_report",
     "bo_composer_source_editor_open",
+    "bo_composer_source_route", "bo_composer_jump_tab",
 }
 
 

@@ -38,7 +38,7 @@ browser/print-size check or independent validation of fitted concentrations.
 - **Shared custom templates:** save with **Figure Composer → Save preset**. The visible `figure_composer_presets.json` in the app root is tracked by Git; commit/push it to share subsequent edits with Max. Built-ins remain in code and generated exports remain ignored. Old hidden preset files are still read for compatibility.
 
 - **Missing presets:** Types 1/1A/1B appear for survey sessions; Types 2/2A appear for optimization sessions. For kana validation, replace the `parameter_sweep...` path with the `planar_BO_kana...` BO path in Figure B below. Types 3/3B/4 are under **SWV → Paper Figures**.
-- **Edit source:** Preview renders just the selected plot. Update saves its source settings without rebuilding the whole composition; click **Render figure** afterward. Stack and parallel-coordinate source controls are supported too. In a stack, **Maximum displayed traces** controls display sampling and rendering cost, not scientific analysis.
+- **Edit panel:** one editor contains content, formatting, progress highlights, layout, and optional interactive 3D. Use **Preview panel**, **Apply changes**, or **Cancel panel edits**. For cubes: enable **Interactive 3D view → Cache view → Use cached camera → Apply changes**. No tab switching. In a stack, **Maximum displayed traces** controls display sampling and rendering cost, not scientific analysis.
 - See the [main README capability guide](../README.md#current-workflow-and-capabilities) for save/reopen limitations, outlier filtering versus display clipping, and missing-data handling. No missing measurements are synthesized.
 
 - **Canvas boxes now describe the whole panel**, including titles, labels, legends and colourbars. Rendering fits those elements inside the box with a small safety margin. Ordinary 2D charts use the available width/height; cubes, square maps and embedded images retain their proportions. Very small boxes can reduce text size, so enlarge the box if needed.
@@ -245,16 +245,70 @@ Other dataset claims (amp0 detectability rescue, vanco response strength, statio
 The app deliberately has two figure tools:
 
 **Editing content without losing layout:** select a panel (click its layout
-rectangle or use **Edit panel**), then use **Selected panel source → Edit source**.
-The dedicated source editor opens the panel's existing choices. **Preview source
-changes** previews just the draft panel; **Update panel** saves its settings.
-Click **Render figure** afterward to refresh the full composition;
-**Add as new panel** makes an independent copy; **Cancel / Back** discards the
-draft. This editor covers SWV overlays, measured cubes/maps, Q trends,
-buffer/target trends, chronological stacks and parallel coordinates. It uses the same plotting routines and BO settings as
-the final figure, without switching browser tabs. In linked sweeps, channel,
+rectangle or use **Edit panel**). Content and formatting live in that same panel
+editor; there is no separate Edit source button. **Preview panel** renders just
+the selected panel; **Apply changes** refreshes the composition. **Cancel panel
+edits** restores settings to the last Apply, or when the panel was selected.
+Switching panels keeps current settings; use Cancel first if you want to discard them.
+For cubes, enable **Interactive 3D view**, drag/scroll, then **Cache view → Use
+cached camera → Apply changes**. Orbit and zoom transfer to the publication cube;
+arbitrary Plotly pan/roll do not. The interactive view is opt-in to avoid unnecessary
+rendering latency. In linked sweeps, channel,
 trace iteration and slice edits also update their cube links. **Reset source
 iteration choices** returns to automatic example selection.
+
+For Type 2/2A, choose **Validation group / channel (all panels)** and
+**Validation channel** in Composer, plus the maximize/minimize optimizer.
+All validation panels follow that selection; Q_run is the saved group objective,
+not a concatenation of every channel's iterations.
+
+New Type 2 presets use unsmoothed, corrected SWVs with the saved BO analysis
+settings, thicker stack lines, and an iteration arrow that remains visible
+outside the trace bounds. Type 2/2A cubes start at camera X=1.65, Y=1.15,
+Z=1.10. Existing saved figures keep their processing/camera choices: use the
+stack's **Trace processing** control to choose `corrected_current`, or reload
+the preset after saving your current layout if you want the new defaults.
+
+**Validation progress controls:** select any supported panel and use its inline
+**Content and appearance · progress highlights** controls. These work in custom
+compositions as well as presets. Toggle the best-observed-Q marker and change
+its color; Q panels can add a best-so-far curve; cubes can fade early connections,
+change path width, and mark start/final observations. Stack controls include line
+width, oldest-trace opacity, and left/down offsets for the iteration arrow.
+Existing camera, marker-size, fonts, axes, border and layout controls remain available.
+Imported raster images cannot expose original data-generation settings.
+
+Validation presets default to **Peak prominence**. Peak height (µA) remains
+selectable, with optional recorded replicate SD (not SEM) for one channel.
+Saved prominence scores can be zero when peak detection fails; the connected
+line follows those recorded scores, not measured zero-current peaks. Peak height
+has gaps where detection produced no value; these are not filled or interpolated.
+Start and Final use distinct boxed callouts and marker shapes on the cube;
+their horizontal/vertical offsets are editable in the panel's progress controls.
+The magenta diamond identifies the same best
+recorded Q iteration throughout the figure, with minimum Q for signal-off and
+maximum Q for signal-on. Ambiguous multi-group/direction data are not assigned
+a common best iteration. Display sampling retains available traces of that best
+iteration in the chronological stack. No missing traces or responses are invented.
+
+The kana setup-5 snapshot uses pairwise repeat-scan SNR for paired Q, with a
+0.001 µA noise floor. Peak prominence, by contrast, is peak current divided by
+background RMS. The largest absolute peak or buffer–target difference need not
+maximize Q because repeat variability also matters. Neither a BO walk nor a
+best-so-far curve alone proves superiority over random search or performance on
+every aptamer; use the independent titration comparison and appropriate controls.
+
+**Kana example units:** the local `mini_bo_g7_i47` (BO channel 7, iteration 47)
+has raw target maxima about 0.239 µA (239 nA), and corrected target peaks
+about 0.078 µA using its saved analysis settings. The sweep channel 10,
+iteration 120 example has corrected target peaks about 0.036 µA. These are
+different channels/runs and raw versus corrected values must not be conflated.
+Do not substitute a BO trace into a sweep figure whose cube contains survey points.
+A larger sweep-only candidate is **channel 5, iteration 61**: rerunning its six
+CSVs with the saved settings gives corrected target peaks 0.1239–0.1245 µA
+and buffer peaks 0.0939–0.0970 µA. This is a candidate, not an automatic
+replacement: select examples by paired response and repeatability as well as
+peak height, and retain the matching channel/iteration on the cube.
 
 For plots made in other plotting tabs, **Add to Composer** retains its existing
 behavior. **Replace selected Composer panel A/B/...** replaces only the selected
@@ -298,7 +352,7 @@ maximize (ON) or minimize (OFF). It is appropriate for kana, amp0 and vanco;
 no parameter sweep is required. Type 2A retains only the cube, Q trend and
 buffer/target trend. A sweep session belongs in Type 1 instead.
 
-- **BO Session → Figure Composer** builds Types 1 and 2. Use **Edit panel** or click a layout rectangle to select a panel. The static rendered preview is not clickable. Use **Edit source** for content and the panel controls for formatting. Type 1 links channel/iteration/slice choices to its cube markers, SWVs, planes and maps.
+- **BO Session → Figure Composer** builds Types 1 and 2. Use **Edit panel** or click a layout rectangle to select a panel. The static rendered preview is not clickable. Content, appearance and layout are edited together in that panel. Type 1 links channel/iteration/slice choices to its cube markers, SWVs, planes and maps.
 - **SWV → Paper Figures** builds Types 3 and 4 from a selected physical channel and two methods. It is a guided, reproducible template rather than a fully free-form panel editor: the row, methods, scan range, stack/overlay choice, font, width, and raster resolution are adjustable, but individual generated subpanels are not yet independently restyled. For fully individual titration panels, create/capture the underlying plots and use the Figure Composer.
 
 | Template | Where to open it | Use it for |

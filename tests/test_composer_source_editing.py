@@ -1,6 +1,61 @@
 from core.composer_editing import apply_source_edit
 
 
+def test_unified_cancel_restores_formatting_source_and_linked_cube_without_touching_other_panel():
+    from core.composer_editing import panel_edit_values, restore_panel_edit, sync_panel_source_changes
+    state = {'bo_composer_count':6, 'bo_composer_type1_compact_linked_controls':True,
+             'bo_composer_kind_1':'SWV trace overlay', 'bo_composer_trace_channels_1':['10'],
+             'bo_composer_trace_iteration_1':120, 'bo_composer_width_1':.3,
+             'bo_composer_width_4':.25}
+    checkpoint = panel_edit_values(state, 1)
+    state['bo_composer_trace_iteration_1'] = 42
+    state['bo_composer_width_1'] = .4
+    assert sync_panel_source_changes(state, 1, checkpoint)
+    assert state['bo_composer_type1_compact_manual_iterations']['1']['iteration'] == 42
+    restore_panel_edit(state, 1, checkpoint)
+    assert state['bo_composer_trace_iteration_1'] == 120
+    assert state['bo_composer_width_1'] == .3
+    assert state['bo_composer_width_4'] == .25
+    assert state['bo_composer_type1_compact_manual_iterations']['1']['iteration'] == 120
+
+
+def test_unified_editor_transients_are_not_saved():
+    from core.workspace_sessions import serializable_state
+    from core.composer_editing import panel_edit_values
+    state = {'bo_composer_width_0':.4, 'bo_composer_editor_checkpoint':{'draft':1},
+             'bo_composer_editor_preview_0':True}
+    assert panel_edit_values(state, 0) == {'bo_composer_width_0':.4}
+    assert serializable_state(state) == {'bo_composer_width_0':.4}
+
+
+def test_registered_sources_have_destination_tabs():
+    from core.composer_editing import SOURCE_FIELDS, SOURCE_TABS
+    assert set(SOURCE_FIELDS) == set(SOURCE_TABS)
+
+
+def test_camera_update_is_panel_local_and_preserves_geometry():
+    state = {'bo_composer_count': 2, 'bo_composer_width_0': .6,
+             'bo_composer_camera_x_1': 2.0}
+    camera = {'eye': {'x': 4., 'y': -2., 'z': 1.},
+              'center': {'x': 0., 'y': 0., 'z': 0.}}
+    assert apply_source_edit(state, {'index': 0, 'spec': {
+        'kind': 'Measured 3D tensor', 'camera': camera}})
+    assert state['bo_composer_source_camera_0'] == camera
+    assert state['bo_composer_camera_x_0'] == 3.
+    assert state['bo_composer_camera_x_1'] == 2.
+    assert state['bo_composer_width_0'] == .6
+
+
+def test_group_scope_accepts_numeric_serialization_without_mixing_groups():
+    import pandas as pd
+    from bo_session_viewer import _composer_group_scope
+    observations = [{'group_id': 5}, {'group_id': 6}]
+    frame = pd.DataFrame({'group_id': [5., 6., 5.], 'Q_run': [1, 99, 2]})
+    selected, history = _composer_group_scope(observations, frame, '5')
+    assert selected == [{'group_id': 5}]
+    assert history.Q_run.tolist() == [1, 2]
+
+
 def test_source_update_retains_layout_and_updates_linked_iteration():
     state = {
         "bo_composer_count": 6,

@@ -61,13 +61,17 @@ analysis filter and compare filtered/unfiltered results.
   legends, borders and layout. Block bounds include labels and colorbars.
   **Allow overlap** deliberately permits overlapping rectangles. Exports crop
   unused outer workspace; workspace zoom is separate from physical figure size.
-- **Source:** **Edit source — panel …** opens a focused dialog for supported
-  traces, cubes/maps, trends, chronological stacks and parallel coordinates.
-  **Preview source changes** renders only that draft panel. **Update panel**
-  saves source settings without changing its placement/style; click **Render
-  figure** to update the whole figure. **Add as new panel** preserves the original.
-  Linked sweep channels, trace iterations and slice planes remain synchronized.
-  This dialog is not a general jump back to every original plotting tab.
+- **Unified editing:** select **Edit panel → A/B/…**. Its existing panel editor
+  contains source data, processing, appearance, progress highlights, and layout.
+  **Preview panel** renders only that panel; **Apply changes** refreshes the
+  composition; **Cancel panel edits** restores the last Apply (or selection).
+  Switching panels keeps the current settings. Linked sweep channels, trace
+  iterations and slice planes remain synchronized. No separate Edit source tab jump.
+  For cubes enable **Interactive 3D view**, rotate/zoom, then **Cache view →
+  Use cached camera → Apply changes**. Orbit and zoom transfer to the publication
+  cube; arbitrary Plotly pan/roll do not. The interactive view loads only on request.
+  Type 2/2A use one shared **Validation group / channel** and optimizer
+  direction, so the Q line cannot concatenate different optimizers.
 - **Other plots:** generate them in their source tab, then use **Add to Composer**
   or **Replace selected Composer panel**. Captured/image panels have different
   editing capabilities from live generated panels. SWV Paper Figures are guided

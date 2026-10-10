@@ -623,3 +623,39 @@ def test_composer_csv_cache_invalidates_when_file_changes(tmp_path):
 
     assert first["value"].tolist() == [1]
     assert second["value"].tolist() == [20, 30]
+def test_validation_presets_use_sweep_camera_and_unsmoothed_corrected_stack():
+    import bo_session_viewer as viewer
+    full = viewer._paper_bo_validation_preset()['config']['state']
+    focused = viewer._paper_bo_validation_focused_preset()['config']['state']
+    for state in (full, focused):
+        assert [state[f'bo_composer_camera_{axis}_0'] for axis in ('x', 'y', 'z')] == [1.65, 1.15, 1.1]
+    assert full['bo_composer_stack_corrected_3']
+    assert full['bo_composer_stack_snapshot_3']
+    assert full['bo_composer_stack_trace_key_3'] == 'corrected_current'
+
+
+def test_best_iteration_is_direction_aware_and_rejects_mixed_trajectories():
+    import pandas as pd
+    import bo_session_viewer as viewer
+    frame = pd.DataFrame({'iteration':[3,1,2], 'Q_run':[4.,-5.,2.],
+                          'group_id':[1,1,1], 'optimization_direction':['maximize']*3})
+    assert viewer._composer_best_iteration(frame) == 3
+    frame['optimization_direction'] = 'minimize'
+    assert viewer._composer_best_iteration(frame) == 1
+    frame.loc[0,'group_id'] = 2
+    assert viewer._composer_best_iteration(frame) is None
+
+
+def test_best_so_far_uses_minimum_for_signal_off():
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import bo_session_viewer as viewer
+    frame = pd.DataFrame({'iteration':[1,2,3], 'Q_run':[1.,-5.,2.],
+                          'group_id':[1]*3, 'optimization_direction':['minimize']*3})
+    fig, ax = plt.subplots()
+    try:
+        viewer._composer_draw_global(ax, frame, 'Q_run', 10, spec={'show_best_so_far':True})
+        line = next(line for line in ax.lines if line.get_label() == 'Best so far')
+        assert list(line.get_ydata()) == [1.,-5.,-5.]
+    finally:
+        plt.close(fig)

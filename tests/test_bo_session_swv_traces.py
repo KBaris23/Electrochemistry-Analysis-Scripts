@@ -2275,6 +2275,9 @@ def test_chronological_order_label_is_marked_for_plot_customization(monkeypatch)
     ]
     assert len(labels) == 1
     assert labels[0].get_text() == "Iteration number"
+    arrows = [text for text in figure.axes[0].texts if getattr(text, 'arrow_patch', None) is not None]
+    assert arrows
+    assert all(text.get_annotation_clip() is False for text in arrows)
     axis_start = labels[0]._bo_axis_start
     axis_end = labels[0]._bo_axis_end
     midpoint_display = figure.axes[0].transData.transform((

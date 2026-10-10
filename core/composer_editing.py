@@ -6,6 +6,61 @@ The UI queues an edit, and Composer applies it before creating its widgets.
 import copy
 
 
+def panel_edit_values(state, index):
+    """Small per-panel checkpoint; never copy renders, uploads or editor UI state."""
+    suffix = f'_{int(index)}'
+    excluded = ('bo_composer_editor_', 'bo_composer_move_', 'bo_composer_render_',
+                'bo_composer_capture_', 'bo_composer_import_')
+    return {k: copy.deepcopy(v) for k, v in state.items()
+            if str(k).startswith('bo_composer_') and str(k).endswith(suffix)
+            and not str(k).startswith(excluded)}
+
+
+def restore_panel_edit(state, index, checkpoint):
+    for key in panel_edit_values(state, index):
+        state.pop(key, None)
+    state.update(copy.deepcopy(checkpoint))
+    # Roll back dependent sweep markers/planes using the same source contract.
+    kind = state.get(f'bo_composer_kind_{index}')
+    if kind in SOURCE_FIELDS:
+        spec = {'kind': kind}
+        for field, widget in SOURCE_FIELDS[kind].items():
+            key = f'bo_composer_{widget}_{index}'
+            if key in state:
+                spec[field] = copy.deepcopy(state[key])
+        apply_source_edit(state, {'index': index, 'spec': spec})
+
+
+def sync_panel_source_changes(state, index, previous):
+    """Propagate inline content edits before linked-template defaults are rebuilt."""
+    kind = state.get(f'bo_composer_kind_{index}')
+    if not previous or kind not in SOURCE_FIELDS or previous.get(f'bo_composer_kind_{index}') != kind:
+        return False
+    spec = {'kind': kind}
+    changed = False
+    for field, widget in SOURCE_FIELDS[kind].items():
+        key = f'bo_composer_{widget}_{index}'
+        if key in state:
+            spec[field] = copy.deepcopy(state[key])
+            changed |= key in previous and state[key] != previous[key]
+    if changed:
+        return apply_source_edit(state, {'index': index, 'spec': spec})
+    return False
+
+
+SOURCE_TABS = {
+    'Global trend': 'History & scores', 'Channel trend': 'History & scores',
+    'Buffer/target trend': 'History & scores',
+    'Chronological buffer/target trend': 'History & scores',
+    'SWV trace overlay': 'SWV traces', 'Chronological SWV stack': 'SWV traces',
+    'Measured 1D slice': 'Real data landscapes',
+    'Measured 2D map': 'Real data landscapes',
+    'Measured 3D tensor': 'Real data landscapes',
+    'Measured parallel coordinates': 'Real data landscapes',
+    'Channel x iteration heatmap': 'Real data landscapes',
+}
+
+
 SOURCE_FIELDS = {
     "SWV trace overlay": {
         "channels": "trace_channels", "observation_iteration": "trace_iteration",
@@ -23,7 +78,8 @@ SOURCE_FIELDS = {
         "average_channels": "real_average", "x": "real_x", "y": "real_y",
         "slice_axis": "real_slice_axis", "slice_value": "real_slice_value",
     },
-    "Global trend": {"metric": "global_metric", "running_mean_window": "global_running_mean"},
+    "Global trend": {"metric": "global_metric", "running_mean_window": "global_running_mean", "group_id": "global_group"},
+    "Channel trend": {"metric": "channel_metric", "channels": "channel_channels"},
     "Buffer/target trend": {"metric": "paired_metric", "channels": "paired_channels"},
     "Chronological SWV stack": {
         "channels": "stack_channels", "phases": "stack_phases",
@@ -36,6 +92,14 @@ SOURCE_FIELDS = {
         "phase": "measured_phase", "average_channels": "measured_average",
         "parameters": "measured_parallel_params",
     },
+}
+
+SOURCE_FIELDS['Measured 1D slice'] = dict(SOURCE_FIELDS['Measured 3D tensor'])
+SOURCE_FIELDS['Channel x iteration heatmap'] = dict(SOURCE_FIELDS['Measured parallel coordinates'])
+SOURCE_FIELDS['Chronological buffer/target trend'] = {
+    'metric': 'chrono_metric', 'channels': 'chrono_channels', 'layout': 'chrono_layout',
+    'average_channels': 'chrono_average', 'show_fluid_exchange_lines': 'chrono_fluid_lines',
+    'show_iteration_lines': 'chrono_iteration_lines',
 }
 
 
@@ -61,6 +125,15 @@ def apply_source_edit(state, edit):
     for field, key in SOURCE_FIELDS[spec["kind"]].items():
         if field in spec:
             state[f"bo_composer_{key}_{index}"] = copy.deepcopy(spec[field])
+    if spec.get('camera') and spec['kind'] == 'Measured 3D tensor':
+        camera = copy.deepcopy(spec['camera'])
+        state[f'bo_composer_source_camera_{index}'] = camera
+        for axis in ('x', 'y', 'z'):
+            state[f'bo_composer_camera_{axis}_{index}'] = max(-3., min(3., float(camera['eye'][axis])))
+        state[f'bo_composer_camera_zoom_{index}'] = 1.0
+        state[f'bo_composer_source_camera_controls_{index}'] = [
+            state[f'bo_composer_camera_{axis}_{index}'] for axis in ('x','y','z')
+        ] + [1.0]
     # Preserve template dependencies. A channel edit updates the linked group;
     # a trace or slice edit changes that member and its cube highlight/plane.
     compact = state.get("bo_composer_type1_compact_linked_controls") and count == 6
