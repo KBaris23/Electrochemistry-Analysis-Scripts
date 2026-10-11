@@ -2,7 +2,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from core.plotting import (titration_measurement_changes, plot_titration_langmuir,
-                           add_titration_on_off_difference)
+                           add_titration_on_off_difference,
+                           plot_titration_concentration_accuracy)
 
 
 def rows(values):
@@ -59,3 +60,22 @@ def test_on_off_difference_uses_changes_not_unequal_absolute_baselines():
     assert add_titration_on_off_difference(fig, steps, 'on', 'off', offset_to_response_baseline=True)
     np.testing.assert_allclose(ax.lines[0].get_ydata(), [5])
     plt.close(fig)
+
+
+def test_concentration_validation_uses_optimized_role_labels_locally():
+    accuracy = [
+        dict(channel='optimized', known_concentration=1.0, predicted_concentration=1.1),
+        dict(channel='optimized', known_concentration=10.0, predicted_concentration=9.0),
+        dict(channel='manual', known_concentration=1.0, predicted_concentration=1.4),
+        dict(channel='manual', known_concentration=10.0, predicted_concentration=7.0),
+    ]
+    figure = plot_titration_concentration_accuracy(
+        accuracy,
+        channel_labels={'optimized': 'Optimized', 'manual': 'Unoptimized'},
+        show_lod=False,
+        show_uloq=False,
+    )
+    labels = figure.axes[0].get_legend_handles_labels()[1]
+    assert 'Optimized' in labels
+    assert 'Unoptimized' in labels
+    plt.close(figure)

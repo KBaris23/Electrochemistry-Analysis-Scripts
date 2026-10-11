@@ -735,6 +735,8 @@ def test_accuracy_plot_reports_color_coded_rms_fold_error_by_method():
             method_points.get_facecolors()[0, :3],
         )
     assert [text.get_text() for text in axis.get_legend().get_texts()] == [
+        "SWV Method 1",
+        "SWV Method 2",
         "Within ±20%",
         "1:1",
     ]

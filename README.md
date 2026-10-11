@@ -15,11 +15,11 @@ validation, then titration. These are different inputs, not interchangeable tabs
 | CV processing | CV; supported CV files | CV traces, analysis, plots and exports |
 | Parameter sweep | BO Session; **survey** session | Types 1 / 1A / 1B: measured landscape, example SWVs and slices |
 | BO validation | BO Session; **optimization** session | Type 2: cube, Q with running mean, buffer/target trend, chronological SWVs, parallel coordinates; Type 2A: cube and two trends |
-| Titration response | SWV → **Paper Figures**; titration and Langmuir enabled | Type 3: manual/optimized SWVs, response and fits; Type 3B: ON/OFF rows with a shared fit/difference panel |
+| Titration response | SWV → **Paper Figures**; titration and Langmuir enabled | Type 3: manual/optimized SWVs, response and fits; Type 3B: ON/OFF rows with a shared optimized-only fit/difference panel; Type 3C: ON/OFF rows with a separate optimized-vs-unoptimized Langmuir panel per row |
 | Concentration prediction | Same SWV channel/method/step selection | Type 4: concentration by measurement and predicted versus known; within-calibration assessment, not independent validation |
 
 **Why a preset is missing:** survey inputs offer the Type 1 family; optimization
-inputs offer the Type 2 family. Types 3/3B/4 are in SWV **Paper Figures**, not the
+inputs offer the Type 2 family. Types 3/3B/3C/4 are in SWV **Paper Figures**, not the
 BO preset menu. Saved custom presets additionally require compatible data fields
 and plot types. Select the correct session before loading a preset.
 
@@ -48,6 +48,7 @@ your choice. Settings stay editable; click **Run Analysis** to apply changes.
 | **Concentrations included in titration statistics** | Selects steps for plateau statistics, fits, SNR and prediction analysis | Not the same as cropping the displayed measurement range |
 | Plateau edge trim | Uses the middle of each interval for plateau estimation | Does not repair failed peak detection |
 | Immediately preceding buffer | Corrects each target plateau against its preceding buffer | Does not invent a missing baseline; fits need a valid anchor buffer |
+| Correct abrupt baseline jumps (Experimental) | Detects a persistent current step and subtracts its downstream offset before smoothing and peak extraction | Does not alter raw files, run by default, or prove an instrumental artifact is non-biological |
 | Landscape interpolation | Estimates a response surface between measured parameter points | Interpolated pixels are not additional experiments or repaired Q observations |
 
 Missing/unreadable scans and failed acceptance checks remain failures or omitted
@@ -101,7 +102,7 @@ analysis filter and compare filtered/unfiltered results.
   PNG/PDF/SVG**. Titration Paper Figures contain rasterized subplots even in PDF;
   set their panel raster DPI before generation. Transparent export and optional
   panel letters are supported.
-- **Presets:** shared custom presets are in the visible, Git-tracked
+- **Presets:** built-in and shared custom presets are in the visible, Git-tracked
   `figure_composer_presets.json` under the app directory. Under **Reusable preset**,
   choose **Saved preset to overwrite**, then click **Overwrite selected preset**;
   no name retyping or rendering is needed. Apply pending panel/layout edits first.
@@ -109,7 +110,9 @@ analysis filter and compare filtered/unfiltered results.
   that saved copy as needed. Saving the same typed name also still replaces it.
   Commit and push this file after saving to share
   new templates; saving in the app does not automatically push to Git. Built-in
-  templates are defined in `bo_session_viewer.py`. Use your own preset name to
+  templates live under the file's `builtins` section; user presets live under
+  `presets`. Python supplies loading, validation and compatibility fallbacks.
+  Use your own preset name to
   preserve variants. Older `.figure_composer_presets.json` files remain readable;
   Save carries their legacy-only entries into the visible file, with visible-file
   entries winning name conflicts. Generated figures and analysis sessions remain
@@ -131,6 +134,24 @@ caches (they use Python pickle). Recovery is saved on ordinary app reruns.
 There is no reliable save-on-browser-close prompt or built-in double-click
 association for session JSON files. Make a named save before leaving; use a
 portable figure package separately for captured figure assets.
+
+### Sharing a figure with a collaborator
+
+Every final Composer export has a compact **figure recipe**: it is embedded in
+the PNG and is also available as `<name>.figure.json` and `<name>.figure.zip`.
+The recipe records the final panel layout, typography, axis/panel choices,
+source session path, selected group/channel, and rendering audit. A collaborator
+can open **Figure Composer > Load a preset or saved figure** and upload the JSON,
+PNG, or ZIP to restore the layout, then point the app at their own compatible
+data/session if the original path is unavailable. This is the right file to send
+to Max for figure reproduction.
+
+An `analysis-session.json` is different: it restores sidebar settings,
+annotations, input paths, and optionally a derived-results cache. It does not
+copy raw data and its paths may be computer-specific. Send it only with the
+matching data location/instructions, and only load trusted caches because they
+use Python pickle. Do not use either recipe as a substitute for raw-data
+archiving.
 
 ## Setup
 

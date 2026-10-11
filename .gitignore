@@ -1,5 +1,6 @@
 # Local Python environments
 .venv*/
+.regen_venv/
 venv/
 env/
 

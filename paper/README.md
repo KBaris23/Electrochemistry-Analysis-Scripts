@@ -1,55 +1,57 @@
 # Paper figures: real-data runbook
 
-Updated 10 October 2026. Order: **sweep, BO validation, titration, concentration diagnostics**. These are preliminary figures, not publication approval. Raw data were not modified. The previous guide is retained in the generated run's `audit/paper_guide_before_run.md`.
+Updated 11 October 2026. Order: **sweep, BO validation, titration, concentration diagnostics**. These are preliminary figures, not publication approval. Raw data were not modified.
 
 ## 1. Open the generated figures
 
-Start with [titrations — preliminary PNGs only](generated/preliminary_journal_plots/titrations/). All refreshed titration comparisons and concentration diagnostics are together there, named by dataset/channel/type. No PDFs, SVGs or individual SWV exports are in this review folder. BO/sweep outputs remain in their dataset folders.
+Start with the per-dataset folders under [preliminary journal plots](generated/preliminary_journal_plots/). A dataset may contain only `maximize/` and/or `minimize/`; channel identity is kept in filenames, not folders. Mixed-direction Type 3B and direction-free sweep outputs stay at the dataset root.
 
 **Reference style:** Type 3/3B SWVs are **overlaid, not offset stacks**, using the standard SWV plotter and its purple-to-yellow (`plasma`) measurement colorbar. Only analysis-accepted **smoothed + corrected** traces are shown, clipped between final correction minima, with residual endpoint baseline removed using the existing anchor-offset method. Dashed zero line and anchor dots match the standard SWV view. These display operations do not recompute peak metrics or fit parameters.
 
 Response plots use **dark blue = Optimized Method**, **light blue = Manual Method**, with an in-panel legend. They show **Change in Peak Current**: each target measurement minus its immediately preceding buffer plateau; buffer measurements minus their own plateau (noise is retained). Langmuir curves/points have their anchor-buffer value subtracted for display only. Signal-off remains negative. In Type 3B, the shared fit distinguishes optimized ON (blue) and OFF (red); ON-minus-OFF now subtracts the two baseline-referenced changes, not unrelated absolute baselines.
 
+Type 3C keeps the two Type 3B directional rows but replaces the shared optimized-only final column with two row-specific Langmuir panels. Each compares that row's optimized method against the same unoptimized/manual reference.
+
 To make these again without starting over:
 
 1. Restart the app, then **Saved analysis sessions > Saved session > Open**: `preliminary_kana_ch3_titration`, `preliminary_amp0_analysis` or `preliminary_vanco_analysis`.
 2. Choose **View > Paper Figures** and the channel/type listed below. Click **Use reference titration style** (important when reopening older saved settings). This keeps your methods/range but selects **Overlaid**, stride **1**, **Zero correction anchors**, **Accepted SWVs only**, and **Change from preceding buffer**. Keep extreme filtering OFF for the main figures.
-3. Use **Generate paper figure > Download PNG**. Save into `paper/generated/preliminary_journal_plots/titrations/` with the dataset/channel/type in the filename. Detailed per-figure settings are in sections 6–7.
+3. Use **Generate paper figure > Download Package**. The ZIP already uses `dataset/maximize/` or `dataset/minimize/` when one direction applies, and otherwise the dataset root. Detailed per-figure settings are in sections 6–7.
 
 | Figure | Open PNG | Assessment |
 |---|---|---|
-| Kana sweep, ch3, Type 1A | [Sweep](generated/preliminary_journal_plots/kana_try/sweep/ch3/bo_111904_a0d8ad_multipanel.png) | Main landscape candidate |
-| Kana BO, ch3 maximize, Type 2 | [Validation](generated/preliminary_journal_plots/kana_try/bo/ch3_maximize/bo_113013_8dd581_multipanel.png) | Matches the recovered titration channel |
-| Kana ch3 ON/manual, Type 3 | [Titration](generated/preliminary_journal_plots/titrations/kana_try_ch3_type3.png) | Matches your earlier strong channel/segment |
-| Kana ch5 ON/OFF, Type 3B | [Two-direction comparison](generated/preliminary_journal_plots/titrations/kana_try_ch5_type3B.png) | Cleaner two-direction example |
-| Kana ch3 ON/OFF, Type 3B | [Alternative](generated/preliminary_journal_plots/titrations/kana_try_ch3_type3B.png) | OFF saturation less convincing than ch5 |
-| Kana ch5 ON, Type 4 | [Calibration diagnostic](generated/preliminary_journal_plots/titrations/kana_try_ch5_type4_calibration_diagnostic.png) | Not independent prediction validation |
-| Amp0 BO, ch6 minimize | [Validation](generated/preliminary_journal_plots/amp0/bo/ch6_minimize/bo_145633_9f5760_multipanel.png) | Alternative to the earlier ch10 choice |
-| Amp0 ch6 OFF/manual, Type 3 | [Titration](generated/preliminary_journal_plots/titrations/amp0_ch6_type3.png) | Detectability example; weak calibration |
-| Amp0 ch10 OFF/manual, Type 3 | [Original candidate](generated/preliminary_journal_plots/titrations/amp0_ch10_type3.png) | Retained, not a strong Langmuir result |
-| Amp0 ch6, Type 4 | [Diagnostic only](generated/preliminary_journal_plots/titrations/amp0_ch6_type4_calibration_diagnostic.png) | Not recommended as a paper prediction result |
-| Vanco BO, ch6 minimize | [Validation](generated/preliminary_journal_plots/vanco/bo/ch6_minimize/bo_142117_84662a_multipanel.png) | Physical ch6 is BO **Group 4** |
-| Vanco ch6 OFF/manual, Type 3 | [Titration](generated/preliminary_journal_plots/titrations/vanco_ch6_type3.png) | Modest response, usable fit |
-| Vanco ch2 OFF/manual, Type 3 | [Alternative](generated/preliminary_journal_plots/titrations/vanco_ch2_type3.png) | Higher full-series R² |
-| Vanco ch6, Type 4 | [Calibration diagnostic](generated/preliminary_journal_plots/titrations/vanco_ch6_type4_calibration_diagnostic.png) | Same-calibration inversion only |
-| Kana station 2 BO, ch10 maximize | [Replicate/SI](generated/preliminary_journal_plots/kana_st2/bo/ch10_maximize/bo_171120_dc5dbc_multipanel.png) | Separate run, not pooled with setup 5 |
+| Kana sweep, ch3, Type 1A | [Sweep](generated/preliminary_journal_plots/kana_try/sweep_ch3_bo_111904_a0d8ad_multipanel.png) | Main landscape candidate |
+| Kana BO, ch3 maximize, Type 2 | [Validation](generated/preliminary_journal_plots/kana_try/maximize/ch3_bo_113013_8dd581_multipanel.png) | Matches the recovered titration channel |
+| Kana ch3 ON/manual, Type 3 | [Titration](generated/preliminary_journal_plots/kana_try/maximize/ch3_type3.png) | Matches your earlier strong channel/segment |
+| Kana ch5 ON/OFF, Type 3B | [Two-direction comparison](generated/preliminary_journal_plots/kana_try/ch5_type3B.png) | Cleaner two-direction example |
+| Kana ch3 ON/OFF, Type 3B | [Alternative](generated/preliminary_journal_plots/kana_try/ch3_type3B.png) | OFF saturation less convincing than ch5 |
+| Kana ch5 ON, Type 4 | [Calibration diagnostic](generated/preliminary_journal_plots/kana_try/maximize/ch5_type4_calibration_diagnostic.png) | Not independent prediction validation |
+| Amp0 BO, ch6 minimize | [Validation](generated/preliminary_journal_plots/amp0/minimize/ch6_bo_145633_9f5760_multipanel.png) | Alternative to the earlier ch10 choice |
+| Amp0 ch6 OFF/manual, Type 3 | [Titration](generated/preliminary_journal_plots/amp0/minimize/ch6_type3.png) | Detectability example; weak calibration |
+| Amp0 ch10 OFF/manual, Type 3 | [Original candidate](generated/preliminary_journal_plots/amp0/minimize/ch10_type3.png) | Retained, not a strong Langmuir result |
+| Amp0 ch6, Type 4 | [Diagnostic only](generated/preliminary_journal_plots/amp0/minimize/ch6_type4_calibration_diagnostic.png) | Not recommended as a paper prediction result |
+| Vanco BO, ch6 minimize | [Validation](generated/preliminary_journal_plots/vanco/minimize/ch6_bo_142117_84662a_multipanel.png) | Physical ch6 is BO **Group 4** |
+| Vanco ch6 OFF/manual, Type 3 | [Titration](generated/preliminary_journal_plots/vanco/minimize/ch6_type3.png) | Modest response, usable fit |
+| Vanco ch2 OFF/manual, Type 3 | [Alternative](generated/preliminary_journal_plots/vanco/minimize/ch2_type3.png) | Higher full-series R² |
+| Vanco ch6, Type 4 | [Calibration diagnostic](generated/preliminary_journal_plots/vanco/minimize/ch6_type4_calibration_diagnostic.png) | Same-calibration inversion only |
+| Kana station 2 BO, ch10 maximize | [Replicate/SI](generated/preliminary_journal_plots/kana_st2/maximize/ch10_bo_171120_dc5dbc_multipanel.png) | Separate run, not pooled with setup 5 |
 
-Amp0 ch10 BO is also retained under `amp0/bo/ch10_minimize/`.
+Amp0 ch10 BO is also retained under `amp0/minimize/`.
 
-Refreshed titration settings and widget actions are in `audit/titration_png_refresh/`. Older titration exports, tables, markers and settings are preserved under `audit/previous_titration_exports/<dataset>/`; they are not the current PNGs. BO figure folders retain their `ui_settings.json`.
+Compact regeneration recipes and marker files are under `audit/recipes/`; current PNGs remain in the dataset/direction folders. BO figure folders retain their `ui_settings.json`. Superseded PNG/PDF/SVG copies and stale UI exports were removed.
 
 Filtering, simply:
 
 - **Main PNGs:** extreme filtering OFF; no interpolation, missing-dose patching or moving-average replacement.
-- **Separate sensitivity check:** `titrations/kana_try_filtered_sensitivity_ch3_type3.png`, extreme filtering ON. The response plot and fits now honor the same exclusions. Original measurements remain intact.
+- **Separate sensitivity check:** `kana_try/maximize/filtered_sensitivity_ch3_type3.png`, extreme filtering ON. The response plot and fits now honor the same exclusions. Original measurements remain intact.
 - **Smoothing:** applies to each voltage/current SWV, using the recorded analysis settings (15-point, order 2), not across concentration steps. Cropping never invents a missing waveform or baseline bracket.
 - **Accepted-only waveform previews:** failed scans are omitted just as in the standard SWV overlay, not repaired or counted as successful responses. The full failure counts remain in section 8 and the audit. Waveform colorbars follow the standard plotter's within-panel accepted-measurement sequence; sparse methods can have fewer displayed measurements.
 
-The original run's `audit/output_manifest.json` records its original paths/hashes; archived titration paths now map to `audit/previous_titration_exports/<dataset>/`. The refreshed PNG inventory is `audit/titration_png_refresh/manifest.json`. The previous offset-stack PNG set is preserved in `audit/pre_reference_style_pngs/`. Six older intermediate exports also remain in `audit/stale_ui_exports/`; use the figure links above, not those archives.
+The review folder is intentionally compact: current PNGs and Composer `.figure.json` sidecars live with each dataset, while `audit/recipes/` retains the small settings/marker inputs needed for regeneration. Large stale image archives were removed; use the figure links above.
 
 ### How these were made
 
-The actual `app.py` was operated through **Streamlit AppTest widgets**: folder controls, Run Analysis, preset loading, Generate/Render, and the app's download functions. No independent numerical pipeline or custom figure generator replaced the application. There was no browser-driving tool available: this was an automated application-widget run, not manual browser clicking. Initial actions are in `audit/widget_actions.jsonl`; the PNG refresh uses `regenerate_titration_pngs.py` to reopen the saved app sessions, select the settings below, click Generate, and collect the app's PNG download bytes. Refresh actions/settings are in `audit/titration_png_refresh/`. Reproduce the same operations below in your browser; still inspect final exports at publication size.
+The actual `app.py` was operated through **Streamlit AppTest widgets**: folder controls, Run Analysis, preset loading, Generate/Render, and the app's download functions. No independent numerical pipeline or custom figure generator replaced the application. There was no browser-driving tool available: this was an automated application-widget run, not manual browser clicking. The compact helper under `audit/tools/regenerate_titration_pngs.py` reopens saved app sessions, applies `audit/recipes/`, clicks Generate and collects the app's PNG bytes. Reproduce the same operations below in your browser; still inspect final exports at publication size.
 
 ## 2. Launch and save
 
@@ -76,7 +78,7 @@ Raw paths must remain accessible. Moving a recipe alone does not make its data p
 3. Open **Figure Composer > Load a preset or saved figure**. Select **Type 1A - Sweep comparison (cube left)**, wait for the selection rerun, then **Load preset**.
 4. Keep shared channel **3**, automatic ON/OFF examples and **two step slices: 4 and 7 mV**. This export uses ON iteration **174** (500 Hz, 40 mV amplitude, 2 mV step) and OFF **184** (108 Hz, 60 mV amplitude, 6 mV step). These are sweep examples, not the later titration methods.
 5. Keep preset layout/camera/fonts. Traces are **Raw / unsmoothed (corrected)**, with snapshot correction and the selected peak-bracket crop. No Q clipping or exclusions were applied.
-6. Click **Render figure (fast preview)**, inspect, then the final-export button. Download PNG/PDF/SVG and the recipe/package into `kana_try/sweep/ch3/`.
+6. Click **Render figure (fast preview)**, inspect, then the final-export button. For this preliminary round, save the PNG and its recipe/package at the dataset root as `kana_try/sweep_ch3_…`; do not create a channel/type subfolder.
 
 For exact formatting, upload the saved `.figure.json` or `.figure.zip` after loading this session. **Edit panel** changes content, camera, markers, text and layout; interactive camera changes must be cached/applied. Type 1B mirrors left/right. Type 1 is the larger four-slice layout. Sweep presets require a survey session, not an optimization session.
 
@@ -119,8 +121,8 @@ For each row:
 1. Paste its folder in **BO Session**, select its group, keep **Original recorded Q**.
 2. In **Figure Composer**, select **Type 2 - BO validation**, then **Load preset**.
 3. Set **Optimizer shown in BO panels** to the table's direction. Check linked group/channel across Q, paired metrics, cube, stack and parallel coordinates; do not leave Q on all groups.
-4. Keep the preset: all 50 iterations, dashed **5-point trailing mean**, best-so-far line and best-observed marker; buffer/target **Peak prominence**; snapshot-corrected unsmoothed chronological traces, no normalization; maximum displayed traces 120, line width 1.5, fading toward the back. Display sampling does not remove analysis observations.
-5. Render preview, final export, and save in `dataset/bo/channel_direction/`. Saved figure JSON records the exact camera and formatting.
+4. Keep the preset: all successful iterations, dashed **5-point trailing mean**, best-so-far line and best-observed marker in the metric panels; buffer/target **Peak prominence**; snapshot-corrected unsmoothed chronological traces, no normalization. The chronological panel does **not** mark the best iteration. Its shared-origin frame points voltage right, current up and iteration from the oldest foreground trace toward newer receding traces; arrow direction, ticks, current-axis length, font sizes and labels remain editable. Display sampling does not remove analysis observations.
+5. Render preview and final export. Save under `dataset/maximize/` or `dataset/minimize/`; keep channel and figure type in the filename, for example `amp0/minimize/ch6_bo_….png`. Saved figure JSON records the exact camera and formatting.
 
 Type **2A** is the focused alternative, omitting stack/parallel coordinates. Optimization inputs offer 2/2A; survey inputs offer 1/1A/1B. Types 3/3B/4 belong to SWV mode.
 
@@ -134,18 +136,18 @@ Peak prominence is noise-normalized, not current in microamps. Recorded `Q_run` 
 | Amp0 | `C:\TEMP\BO\titration_only\amp0` | 4,800 | 21-160 |
 | Vanco | `C:\TEMP\BO\titration_only\vanco` | 4,800 | 21-200 |
 
-1. Select **Analysis mode > SWV** and replace **Folders** with one input above, not all three. These inputs omit warm-up/BO scans.
+1. Select **Analysis mode > SWV** and replace **Folders** with one input above, not all three. These `titration_only` folders are deliberately narrowed copies that omit warm-up/BO scans; they are not a required software layout. The app can instead receive an ordinary experiment root or nested measurement folder, recursively discovers SWV CSVs, and looks for a matching BO snapshot beside/above it. For an extracted folder, retain its copied `session_log.txt` so provenance matching remains available.
 2. Leave automatic BO-settings loading enabled. Verify the snapshot path belongs to the corresponding BO session in section 4. For extracted inputs the app resolves the original run; normal experiment folders resolve their associated session. If ambiguous, explicitly select that session's `bo_config_snapshot.json` and load it. Use the settings-check control before overriding anything.
 3. Choose **Grouping > SWV settings**, **SWV peak height source > Corrected + smoothed**, all physical channels. Click **Run Analysis** once and wait.
-4. Enable **Treat vline intervals as titration steps** and **Fit Langmuir**. Check the queue-derived vlines. If absent, paste the matching app-exported [kana markers](generated/preliminary_journal_plots/audit/previous_titration_exports/kana_try/vlines.txt), [amp0 markers](generated/preliminary_journal_plots/audit/previous_titration_exports/amp0/vlines.txt) or [vanco markers](generated/preliminary_journal_plots/audit/previous_titration_exports/vanco/vlines.txt). These are preserved under `audit/previous_titration_exports/<dataset>/vlines.txt`; the old `C:\TEMP\BO\analysis_plan\vlines_*.txt` files are no longer present.
+4. Enable **Treat vline intervals as titration steps** and **Fit Langmuir**. Check the queue-derived vlines. If absent, paste the matching app-exported [kana markers](generated/preliminary_journal_plots/audit/recipes/kana_try/vlines.txt), [amp0 markers](generated/preliminary_journal_plots/audit/recipes/amp0/vlines.txt) or [vanco markers](generated/preliminary_journal_plots/audit/recipes/vanco/vlines.txt).
 5. Set **Titration baseline mode > Immediately preceding buffer**, units **uM**, **Plateau edge trim fraction = 0.15**.
 6. Under **Concentrations included in titration statistics**, deselect only `buffer_1` and the first duplicate low-dose block (`20 uM_1`, `1000 uM_1` or `0.2 uM_1`). Keep the second low-dose block and all later buffers/doses. This treats the first pair as equilibration per the supplied design; confirm the rationale in the notebook.
 7. Leave **Remove extreme titration outliers OFF**. LOD/ULOQ display annotations were OFF; numerical estimates still export. Click **Apply Display Controls**.
-8. Existing CSVs/quality checks are preserved under `audit/previous_titration_exports/<dataset>/unfiltered/` and `audit/`. You need not regenerate these to review the PNGs. For new analysis settings, use **Export** for updated CSVs and **Quality audit** for waveform flags/exclusion candidates; keep them outside the PNG review folder.
+8. Compact final-state recipes and focused Amp0 crop evidence are under `audit/`. For new analysis settings, use **Export** for updated CSVs and **Quality audit** for waveform flags/exclusion candidates; keep them outside the PNG review folder.
 
 ### Exact analysis settings
 
-Kana setup 5 and amp0 share these settings; vanco differs in minima requirements:
+Kana setup 5 and the non-manual Amp0 methods share these settings; vanco differs in minima requirements:
 
 | Control | Value |
 |---|---|
@@ -164,43 +166,45 @@ Kana setup 5 and amp0 share these settings; vanco differs in minima requirements
 
 Station 2 BO uses its own snapshot: crop -0.45 to +0.10 V, minimum start -0.50 V and different acceptance windows. Do not overwrite it with this table.
 
+Amp0 Channel 6 manual (200 Hz) is the audited exception: crop -0.48 to -0.12 V, peak -0.41 to -0.16 V, left minimum -0.48 to -0.25 V and right minimum -0.30 to -0.12 V. This accepts 135/160 raw manual traces versus 20/160 with the global crop. Applying it globally reduced the optimized 347 Hz method to 3/160 accepted, so the saved analysis session records a method-specific override and retains the original crop for every other method. No values were imputed; see `audit/amp0_method_specific_crop.json`.
+
 Vlines use **physical-channel acquisition scans**: `1,buffer; 31,lowest dose; 61,buffer; 91,lowest dose again; 121,buffer; 151,next dose; ...`. End markers: 601 kana/vanco, 481 amp0. Grouping maps these to method-local 1,11,21,31,...; **do not divide pasted vlines yourself**. Doses double: kana 20-5,120 uM, amp0 1,000-64,000 uM, vanco 0.2-51.2 uM.
 
 Display start 21 removes the first 20 **method** scans (initial buffer/target pair), not 20 raw files. A display crop does not alter fit inclusion. Selected doses feed the existing hybrid fit: Langmuir through the largest absolute response, with later points retained and potentially a polynomial guide. Export now distinguishes R² on that fitted branch from R² across all selected accepted targets. Do not report one as the other.
 
 ## 6. Figure C: generate Type 3 or 3B
 
-Open **SWV > Paper Figures**. Common settings: **14 in width, 10 pt font, panel raster DPI 300, Overlaid SWVs, stride 1, plasma colorbar, Overlaid response curves, no extra columns, panel letters OFF**. Click **Use reference titration style**; keep **Corrected peak region (between minima)**, **Zero correction anchors ON**, **Accepted SWVs only ON**, and **Change from preceding buffer**. All waveform panels use smoothed + corrected current; bounds come from the final correction pass. PNG exports at 600 DPI; constituent panels retain their selected raster DPI. Use **Download PNG** only for this preliminary round.
+Open **SWV > Paper Figures**. Common settings: **14 in width, 10 pt font, panel raster DPI 300, Overlaid SWVs, stride 1, plasma colorbar, Overlaid response curves, no extra columns, panel letters OFF**. Click **Use reference titration style**; keep **Corrected peak region (between minima)**, **Zero correction anchors ON**, **Accepted SWVs only ON**, and **Change from preceding buffer**. All waveform panels use smoothed + corrected current; bounds come from the final correction pass. PNG exports at 600 DPI; constituent panels retain their selected raster DPI. Use **Download PNG** only for this preliminary round. Save Type 3/4 under `dataset/maximize/` or `dataset/minimize/`; save mixed-direction Type 3B at `dataset/`. Never create a separate `titrations/` folder or a channel-named subfolder.
 
 ### Kana ch3: recovered earlier channel, Type 3
 
-Select **Type 3 - SWV and titration response**, one row, physical **ch3**, optimized **500 Hz / 50 mV / 1 mV (maximize)**, manual **200 Hz / 36 mV / 2 mV**, display **21-200**. Click **Generate paper figure > Download PNG**. Save as `titrations/kana_try_ch3_type3.png`.
+Select **Type 3 - SWV and titration response**, one row, physical **ch3**, optimized **500 Hz / 50 mV / 1 mV (maximize)**, manual **200 Hz / 36 mV / 2 mV**, display **21-200**. Click **Generate paper figure > Download Package**. The primary file belongs at `kana_try/maximize/ch3_type3.png`.
 
-Your older SVG under `C:\Users\Asus\Downloads\Figures materials for the paper\08_Q_scoring_scheme` matches this method/segment. Its 179 values match current app-export values essentially exactly (squared correlation approximately 1). It omits method scan **189**, physical scan **565**, which is currently accepted but flagged by the existing extreme filter. Primary figures retain it. A separate filtered Type 3 is in `titrations/kana_try_filtered_sensitivity_ch3_type3.png`; no replacement point was synthesized. The original exclusion rationale cannot be proved from the SVG alone.
+Your older SVG under `C:\Users\Asus\Downloads\Figures materials for the paper\08_Q_scoring_scheme` matches this method/segment. Its 179 values match current app-export values essentially exactly (squared correlation approximately 1). It omits method scan **189**, physical scan **565**, which is currently accepted but flagged by the existing extreme filter. Primary figures retain it. A separate filtered Type 3 is in `kana_try/maximize/filtered_sensitivity_ch3_type3.png`; no replacement point was synthesized. The original exclusion rationale cannot be proved from the SVG alone.
 
 The adjacent `resources/conceptual_titration.py` creates synthetic data and was **not** used as experimental evidence.
 
 ### Kana ON/OFF: Type 3B
 
-Select **Type 3B - Signal-on/off shared Langmuir**, physical **ch5**, ON **500/40/2**, OFF **138/90/3**, manual **200/36/2** (Hz/mV/mV), display **21-200**. Generate/download PNG as `titrations/kana_try_ch5_type3B.png`.
+Select **Type 3B - Signal-on/off shared Langmuir**, physical **ch5**, ON **500/40/2**, OFF **138/90/3**, manual **200/36/2** (Hz/mV/mV), display **21-200**. Generate/download the package as `kana_try/ch5_type3B.png`.
 
 Ch3 alternative: ON **500/50/1**, OFF **125/70/8**, same manual. Type 3B has two rows and one shared final column containing optimized ON, OFF and matched-dose ON-minus-OFF. The difference is descriptive, **not a third independently fitted binding curve**. Manual SWVs/time courses remain in the first three columns, not the shared Langmuir panel.
 
 ### Amp0: Type 3 detectability comparison
 
-Use **ch6**, optimized **347 Hz / 70 mV / 10 mV (minimize)** versus manual **200/36/2**, display **21-160**. Generate/download PNG as `titrations/amp0_ch6_type3.png`.
+Use **ch6**, optimized **347 Hz / 70 mV / 10 mV (minimize)** versus manual **200/36/2**, display **21-160**. The saved session applies the documented focused crop only to this manual method. Generate/download the package as `amp0/minimize/ch6_type3.png`.
 
-Earlier ch10 candidate: optimized **362/80/9 (minimize)** versus manual, same interval; retained as `titrations/amp0_ch10_type3.png`. Neither establishes robust full-range calibration. Many manual scans and some high-dose optimized blocks fail detection; these were not filled. Do not force an ON/OFF layout when both directions are not supported by the data.
+Earlier ch10 candidate: optimized **362/80/9 (minimize)** versus manual, same interval; retained as `amp0/minimize/ch10_type3.png`. Neither establishes robust full-range calibration. Many manual scans and some high-dose optimized blocks fail detection; these were not filled. Do not force an ON/OFF layout when both directions are not supported by the data.
 
 ### Vanco: Type 3
 
-Use **ch6**, optimized **401/70/5 (minimize)** versus manual **200/36/2**, display **21-200**. Save PNG as `titrations/vanco_ch6_type3.png`.
+Use **ch6**, optimized **401/70/5 (minimize)** versus manual **200/36/2**, display **21-200**. Save the package under `vanco/minimize/ch6_type3.png`.
 
-Alternative **ch2**: optimized **322/60/4 (minimize)** versus manual, same interval; `titrations/vanco_ch2_type3.png`. Chip `350_r_np_45_15` is recorded; confirm what `np` means before labeling it planar/nanoporous.
+Alternative **ch2**: optimized **322/60/4 (minimize)** versus manual, same interval; `vanco/minimize/ch2_type3.png`. Chip `350_r_np_45_15` is recorded; confirm what `np` means before labeling it planar/nanoporous.
 
 ## 7. Figure D: Type 4 diagnostics
 
-Keep the same channel/method/step selection, choose **Type 4 - Concentration validation**, Generate, download. Examples use kana **ch5 ON**, amp0 **ch6 OFF**, vanco **ch6 OFF**, each against same-channel manual with the intervals above. Save PNG as `titrations/<dataset>_ch<channel>_type4_calibration_diagnostic.png`.
+Keep the same channel/method/step selection, choose **Type 4 - Concentration validation**, Generate, download. Examples use kana **ch5 ON**, amp0 **ch6 OFF**, vanco **ch6 OFF**, each against same-channel manual with the intervals above. Save under `<dataset>/<maximize|minimize>/ch<channel>_type4_calibration_diagnostic.png`.
 
 These invert a calibration fitted to these data: **not held-out validation**. Inversion is unstable near saturation; unavailable predictions remain missing. Amp0 Type 4 is an audit output, not a recommended paper result. Do not hide failed predictions or insert averaged concentrations into accuracy statistics.
 
@@ -239,25 +243,26 @@ Entire inputs, all methods, before display crops/outlier filtering:
 Jump candidates are screening hints, not confirmed artifacts or exclusions: internal adjacent-current change above 10 robust derivative SD and 15% of waveform range. Sharp peaks, crop edges and gaps can trigger them. Use **Quality audit > Inspect analysed waveform > Preview waveform QC** to compare stored raw/corrected/smoothed arrays and download. Screening covers the analysis crop, not voltages outside it.
 
 - Kana ch3: ON/manual each 200/200 accepted, OFF 199/200; its one jump candidate is near the crop edge, physical scan 421. Ch5 ON 194/200, OFF/manual each 200/200. Ch9 failed 553/600, **not 100%** as previously summarized. Other strong ON candidates remain ch1,4,7,8,10; full-channel exports preserve the selection context.
-- Amp0 ch6: OFF 131/160 accepted, manual 20/160. Ch10: OFF 119/160, manual 15/160. These counts do not establish binding specificity. Raw changes near -0.43 to -0.44 V are visible in saved QC previews and less obvious after smoothing/correction. Some high-dose method blocks lack accepted plateaus.
+- Amp0 ch6: OFF 131/160 accepted with the original method settings; manual 135/160 with the audited focused crop (25 remain rejected). Ch10 retains its original method processing. These counts do not establish binding specificity. Raw changes near -0.43 to -0.44 V remain visible in the raw-trace audit, and some high-dose blocks lack accepted plateaus.
 - Vanco ch6: all 600 accepted; ch2 OFF/manual each 200/200. The sole jump candidate is ch10 physical scan 155. Its raw CSV jumps from -0.470662 to -0.343809 V (0.126853 V versus typical 0.001186 V increments). A connecting line spans missing voltage samples; no intermediate measurements were created. Cause unknown. This is not on chosen ch2/ch6 channels.
 - `C:\TEMP\BO\vanco_500um_planar_20260908_113415` currently contains metadata/logs but no local raw scans. Its earlier claimed poor response was not re-established, nor was it substituted for the available run.
 
 ### Exclusions and sensitivity analysis
 
-Primary figures: initial buffer/duplicate-dose pair omitted from titration statistics; original acceptance rules retained. **No new jump-based exclusions, Q clipping or moving-average gap filling.** BO's five-point mean is a trend line, not replacement observations. SWV stride 10 is display sampling.
+Primary figures: initial buffer/duplicate-dose pair omitted from titration statistics; original acceptance rules retained except for the explicit Amp0 Channel 6 manual crop above. **No new jump-based exclusions, Q clipping, imputation or moving-average gap filling.** BO's five-point mean is a trend line, not replacement observations. SWV stride 10 is display sampling.
 
-For the sensitivity branch: **Remove extreme titration outliers ON > Apply Display Controls**, regenerate and export separately. Candidate rows and retained statistics are preserved under `audit/previous_titration_exports/<dataset>/audit/` and `filtered_sensitivity/`. Do not silently switch primary analysis to that branch. Exclusions need not be printed inside the image, but rules/counts must remain available in Methods/SI and the audit.
+For a sensitivity branch: **Remove extreme titration outliers ON > Apply Display Controls**, regenerate and export separately. The retained settings are under `audit/recipes/<dataset>/filtered_sensitivity/`; create fresh CSV/audit exports if numerical sensitivity results are needed. Do not silently switch primary analysis to that branch. Exclusions need not be printed inside the image, but rules/counts must remain available in Methods/SI and the audit.
 
 ## 9. Templates, checks and remaining work
 
-- Built-ins: `bo_session_viewer.py` functions `_paper_parameter_sweep_*` and `_paper_bo_validation_*`; SWV Types 3/3B/4 are in `app.py` Paper Figures. Visible, tracked `figure_composer_presets.json` stores **custom saved presets**, not every built-in.
+- Composer built-ins and custom presets live in the visible, tracked `figure_composer_presets.json` (`builtins` and `presets` sections). SWV Types 3/3B/3C/4 are guided generators in `app.py` Paper Figures.
 - Composer **Save preset** saves a template; `.figure.json` saves a composition; analysis sessions restore inputs/settings/optional derived results. They are different objects.
+- Collaboration: send a Composer PNG plus its `.figure.json` or `.figure.zip` to reproduce a Composer figure on another machine; the app can load those directly in **Load a preset or saved figure**. A Paper Figure package contains the same final-state recipe as `*.metadata.json`, embedded in its PNG and ZIP, but currently serves as a transparent regeneration record rather than a one-click Paper-Figures importer. Send the matching named analysis session only when the recipient also has access to the raw folders or an equivalent compatible copy. Never send/load an untrusted derived-results cache.
 - To update a custom template: apply pending panel/layout edits, then **Reusable preset > Saved preset to overwrite > Overwrite selected preset**. No name retyping or rendering needed. Save a named copy of a built-in once before using overwrite; built-in definitions stay unchanged.
 - Layout boxes include labels/legends; grid defaults to 1%, overlap is optional, export crops unused outer workspace. Workspace zoom does not alter export scale. Use the generated JSON for exact formatting.
 - This run fixed session restoration of button events/JSON identity keys, final-export invalidation, extracted-folder direction lookup, stale Paper Figures downloads, mislabeled response axes and inconsistent method colors. Added app-visible raw/corrected QC and fitted-branch/full-series R² exports. Correction/fitting algorithms were not replaced.
 - Refresh fixes: smoothed/corrected waveform clipping to final correction minima; one clearly labeled filter status; consistent extreme filtering in response plots and fits; selected-preset overwrite without name retyping. Full-analysis-crop display remains available explicitly.
-- Automated tests: **426 passed, 4 skipped** (one existing Matplotlib open-figure warning in tests). Checks cover anchor zeroing, local-buffer subtraction, preservation of buffer noise, missing-buffer gaps, negative OFF responses, unchanged model values under the display-baseline shift, and preservation of scatter legend entries. Real-input widget generation and saved-session reopening were exercised. Browser/print-size inspection and scientific validation remain separate checks.
+- Automated tests: **434 passed, 4 skipped** (one existing Matplotlib open-figure warning in tests). Checks cover anchor zeroing, local-buffer subtraction, preservation of buffer noise, missing-buffer gaps, negative OFF responses, unchanged model values under the display-baseline shift, jump correction, chronological-frame geometry and preservation of scatter legend entries. Real-input widget generation and saved-session reopening were exercised. Browser/print-size inspection and scientific validation remain separate checks.
 - Generated outputs/local caches remain Git-ignored; source changes and this guide are version-controlled. Committing the code does not upload raw data or these local PNGs.
 
 Still needed: notebook immobilization/cleaning details, chip morphology confirmation and equilibration rationale; independent concentration validation, specificity controls, reversibility assessment and the planned BO-versus-random simulations for stronger claims.

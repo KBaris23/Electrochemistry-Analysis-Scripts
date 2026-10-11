@@ -41,6 +41,24 @@ def test_overwrite_requires_existing_preset_and_preserves_other_entries(tmp_path
     assert viewer._composer_load_presets(path) == {'Original': updated, 'Other': old}
 
 
+def test_saving_user_preset_preserves_file_owned_builtins(tmp_path):
+    path = tmp_path / 'presets.json'
+    builtin = {'schema': viewer.COMPOSER_METADATA_SCHEMA, 'name': 'Type 2'}
+    path.write_text(json.dumps({
+        '_schema': 'swv.figure-composer-presets/1',
+        'builtins': {'Type 2': builtin},
+        'presets': {},
+    }), encoding='utf-8')
+    user = {'schema': viewer.COMPOSER_METADATA_SCHEMA, 'name': 'My preset'}
+
+    viewer._composer_save_preset('My preset', user, path)
+
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    assert payload['builtins'] == {'Type 2': builtin}
+    assert payload['presets'] == {'My preset': user}
+    assert viewer._composer_load_presets(path) == {'My preset': user}
+
+
 def _preset_controls_app(tmp_path, monkeypatch):
     path = tmp_path / 'figure_composer_presets.json'
     monkeypatch.setattr(viewer, 'COMPOSER_PRESET_STORE', path)

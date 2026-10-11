@@ -96,8 +96,8 @@ def test_compact_stack_removes_display_gaps_without_changing_records(monkeypatch
                                                       x_offset_per_iteration=.01, y_offset_per_iteration=.1,
                                                       compact_stack=True)
     lines = fig.axes[0].lines
-    np.testing.assert_allclose(lines[1].get_xdata()-lines[0].get_xdata(), .01)
-    np.testing.assert_allclose(lines[1].get_ydata()-lines[0].get_ydata(), .1)
+    np.testing.assert_allclose(lines[1].get_xdata()-lines[0].get_xdata(), -.01)
+    np.testing.assert_allclose(lines[1].get_ydata()-lines[0].get_ydata(), -.1)
     assert [r["stack_index"] for r in loaded] == [0,4]
     assert not errors
     plt.close(fig)
@@ -108,11 +108,14 @@ def test_waterfall_default_spacing_and_endpoint_labels(monkeypatch):
                    voltage=np.array([-.5,-.4,-.3]), current=np.array([0.,1.,0.])) for i in (0,4)]
     entries = [({"iteration":r["iteration"]}, {"channel":"1"}) for r in loaded]
     monkeypatch.setattr(viewer, "_chronological_swv_stack_entries", lambda *a,**kw:(loaded,[],entries))
-    fig, _ = viewer._plot_chronological_swv_stack([],True,["1"],{}, {},"saved","selected",compact_stack=True)
+    fig, _ = viewer._plot_chronological_swv_stack(
+        [], True, ["1"], {}, {}, "saved", "selected",
+        compact_stack=True, highlight_iteration=5,
+    )
     x_step, y_step = viewer._chronological_swv_stack_steps(loaded)
     ax = fig.axes[0]
-    np.testing.assert_allclose(ax.lines[1].get_xdata()-ax.lines[0].get_xdata(), x_step*.55)
-    np.testing.assert_allclose(ax.lines[1].get_ydata()-ax.lines[0].get_ydata(), -y_step*.70)
+    np.testing.assert_allclose(ax.lines[1].get_xdata()-ax.lines[0].get_xdata(), -x_step*.45)
+    np.testing.assert_allclose(ax.lines[1].get_ydata()-ax.lines[0].get_ydata(), y_step*.62)
     assert ax.lines[0].get_alpha() == .18
     assert ax.lines[1].get_alpha() == 1.0
     # Offsets only: waveform shape, voltage order and cached records survive.
@@ -122,7 +125,17 @@ def test_waterfall_default_spacing_and_endpoint_labels(monkeypatch):
     assert [r['stack_index'] for r in loaded] == [0, 4]
     assert fig._bo_iteration_range == (1,5)
     label = next(t for t in ax.texts if getattr(t, '_bo_chronological_order_label', False))
-    assert label.get_text() == 'Iteration number'
-    assert label._bo_axis_end[0] > label._bo_axis_start[0]
-    assert label._bo_axis_end[1] < label._bo_axis_start[1]
+    assert label.get_text() == 'Iteration Number'
+    assert label._bo_axis_end[0] < label._bo_axis_start[0]
+    assert label._bo_axis_end[1] > label._bo_axis_start[1]
+    assert fig._bo_coordinate_frame_style == 'Shared-Origin Three-Axis Frame'
+    assert fig._bo_coordinate_origin == label._bo_axis_start
+    assert fig.patch.get_alpha() == 0
+    assert ax.get_facecolor()[-1] == 0
+    assert len([line for line in ax.lines if getattr(line, '_bo_iteration_tick', False)]) == 3
+    assert len([line for line in ax.lines if getattr(line, '_bo_voltage_tick', False)]) == 3
+    assert len([line for line in ax.lines if getattr(line, '_bo_current_tick', False)]) == 3
+    assert ax.lines[1].get_color() == '#c2188b'
+    assert any(getattr(line, '_bo_best_marker', False) for line in ax.lines)
+    assert any(getattr(text, '_bo_best_callout', False) for text in ax.texts)
     plt.close(fig)

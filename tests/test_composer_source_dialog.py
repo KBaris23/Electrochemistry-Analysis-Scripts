@@ -49,6 +49,7 @@ v._render_composer_source_route('SWV traces', {'root':'test','config':{}},
     pd.DataFrame(), [], {}, {}, True)
 ''', default_timeout=20).run()
     app.button[0].click().run()
+    next(c for c in app.checkbox if c.label == 'Show every successful trace').set_value(False).run()
     next(n for n in app.number_input if n.label == 'Maximum displayed traces').set_value(24).run()
     next(b for b in app.button if b.label == 'Update panel A').click().run()
     assert not app.exception
@@ -78,6 +79,7 @@ if st.session_state.get('bo_composer_source_editor_open') == 0:
     v._composer_source_editor(0,spec,{'config':{}},pd.DataFrame(),[],{}, {},True)
 ''', default_timeout=20).run()
     app.button[0].click().run()
+    next(c for c in app.checkbox if c.label == 'Show every successful trace').set_value(False).run()
     next(n for n in app.number_input if n.label == 'Maximum displayed traces').set_value(24).run()
     assert not app.exception
     next(b for b in app.button if b.label == 'Update panel A').click().run()

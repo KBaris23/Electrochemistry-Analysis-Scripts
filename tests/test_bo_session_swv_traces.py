@@ -2235,6 +2235,22 @@ def test_chronological_stack_axis_uses_the_exact_stack_offset_direction():
     assert axis_dx * 0.4 - axis_dy * 0.015 == pytest.approx(0.0)
 
 
+def test_cached_swv_arrays_drops_only_paired_nonfinite_instrument_rows(tmp_path):
+    source = tmp_path / "trace.csv"
+    pd.DataFrame({
+        "Potential (V)": [-.5, -.4, float("nan"), -.3, -.2, -.1],
+        "Current Diff (uA)": [0.0, .1, .2, float("nan"), .1, 0.0],
+    }).to_csv(source, index=False)
+    viewer._cached_swv_arrays.clear()
+
+    voltage, current = viewer._cached_swv_arrays(
+        str(source), source.stat().st_mtime_ns,
+    )
+
+    assert voltage.tolist() == [-.5, -.4, -.2, -.1]
+    assert current.tolist() == [0.0, .1, .1, 0.0]
+
+
 def test_chronological_order_label_is_marked_for_plot_customization(monkeypatch):
     loaded = [
         {
@@ -2274,7 +2290,7 @@ def test_chronological_order_label_is_marked_for_plot_customization(monkeypatch)
         if getattr(text, "_bo_chronological_order_label", False)
     ]
     assert len(labels) == 1
-    assert labels[0].get_text() == "Iteration number"
+    assert labels[0].get_text() == "Iteration Number"
     arrows = [text for text in figure.axes[0].texts if getattr(text, 'arrow_patch', None) is not None]
     assert arrows
     assert all(text.get_annotation_clip() is False for text in arrows)

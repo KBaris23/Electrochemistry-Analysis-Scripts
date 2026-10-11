@@ -223,6 +223,9 @@ def _process_file_cached(
     compute_wavelet_energy: bool,
     compute_wavelet_denoised_trace: bool,
     use_wavelet_for_correction: bool,
+    correct_baseline_jumps: bool,
+    jump_sensitivity: float,
+    jump_minimum_uA: float,
 ) -> dict:
     v_raw, i_raw = _load_filtered_arrays_cached(
         filepath=filepath,
@@ -231,6 +234,7 @@ def _process_file_cached(
         file_mtime_ns=file_mtime_ns,
         file_size=file_size,
     )
+    integrity = swv_trace_integrity(v_raw, i_raw)
     try:
         result = analyze_swv_arrays(
             v_raw=v_raw,
@@ -247,6 +251,9 @@ def _process_file_cached(
             compute_wavelet_energy=compute_wavelet_energy,
             compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
             use_wavelet_for_correction=use_wavelet_for_correction,
+            correct_baseline_jumps=correct_baseline_jumps,
+            jump_sensitivity=jump_sensitivity,
+            jump_minimum_uA=jump_minimum_uA,
             file_path=filepath,
         )
         return {"status": "OK", "result": result, "partial": None, "error": None}
@@ -264,12 +271,15 @@ def _process_file_cached(
             compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
             use_wavelet_for_correction=use_wavelet_for_correction,
         )
+        partial.update(integrity)
         return {
             "status": "FAILED",
             "result": None,
             "partial": partial,
             "error": (
-                None
+                integrity["qa_error"]
+                if integrity["qa_status"] != "OK"
+                else None
                 if is_peak_height_below_cutoff_error(exc)
                 else str(exc)
             ),
@@ -345,6 +355,77 @@ def _wavelet_denoise_trace(y: np.ndarray) -> np.ndarray:
     return trimmed
 
 
+def correct_abrupt_baseline_jumps(
+    current: np.ndarray,
+    *,
+    sensitivity: float = 8.0,
+    minimum_jump_uA: float = 0.001,
+    local_window: int = 7,
+) -> tuple[np.ndarray, dict]:
+    """Optionally remove persistent single-sample baseline steps from an SWV trace.
+
+    This is deliberately conservative: a candidate must be both an extreme first
+    difference relative to the trace's robust difference noise and a discontinuity
+    between independently extrapolated local lines.  The correction is a constant
+    offset applied only to subsequent points, so it preserves peak shape and slope.
+    It belongs before smoothing: otherwise Savitzky-Golay spreads a step into a
+    false shoulder that can move a bracketing minimum.
+    """
+    values = np.asarray(current, dtype=float)
+    corrected = values.copy()
+    audit = {
+        "jump_correction_applied": False,
+        "jump_correction_count": 0,
+        "jump_correction_indices": np.array([], dtype=int),
+        "jump_correction_amplitudes_uA": np.array([], dtype=float),
+        "jump_correction_sensitivity": float(sensitivity),
+        "jump_correction_minimum_uA": float(minimum_jump_uA),
+    }
+    if values.size < max(2 * int(local_window) + 2, 12):
+        return corrected, audit
+
+    window = max(3, int(local_window))
+    diffs = np.diff(values)
+    median_diff = float(np.median(diffs))
+    mad = float(np.median(np.abs(diffs - median_diff)))
+    robust_sigma = max(1.4826 * mad, np.finfo(float).eps)
+    threshold = max(float(minimum_jump_uA), float(sensitivity) * robust_sigma)
+    candidates = np.flatnonzero(np.abs(diffs - median_diff) >= threshold)
+    offsets: list[tuple[int, float]] = []
+    last_end = -1
+    x = np.arange(values.size, dtype=float)
+    for index in candidates:
+        # Adjacent candidates are normally the shoulders of one transient; a
+        # genuine step needs clean support on each side.
+        if index <= last_end or index < window or index + 1 + window > values.size:
+            continue
+        left_x = x[index - window + 1:index + 1]
+        right_x = x[index + 1:index + 1 + window]
+        left_y = corrected[index - window + 1:index + 1]
+        right_y = corrected[index + 1:index + 1 + window]
+        try:
+            left_fit = np.polyfit(left_x, left_y, 1)
+            right_fit = np.polyfit(right_x, right_y, 1)
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            continue
+        # Compare the two local trends at the midpoint of the putative step.
+        midpoint = float(index) + 0.5
+        step = float(np.polyval(right_fit, midpoint) - np.polyval(left_fit, midpoint))
+        if abs(step) < threshold:
+            continue
+        corrected[index + 1:] -= step
+        offsets.append((int(index), step))
+        last_end = index + window
+    if offsets:
+        audit.update(
+            jump_correction_applied=True,
+            jump_correction_count=len(offsets),
+            jump_correction_indices=np.asarray([item[0] for item in offsets], dtype=int),
+            jump_correction_amplitudes_uA=np.asarray([item[1] for item in offsets], dtype=float),
+        )
+    return corrected, audit
+
+
 def _compute_minima_bracket_rms_noise(current: np.ndarray, left_idx: int, right_idx: int) -> float:
     """Estimate white noise without treating the trace's DC level as noise."""
     signal = np.asarray(current, dtype=float)
@@ -373,6 +454,73 @@ def _compute_outside_crop_median(i_raw: np.ndarray, crop_mask: np.ndarray) -> fl
     return float(np.median(outside))
 
 
+def swv_trace_integrity(v_raw: np.ndarray, i_raw: np.ndarray) -> dict:
+    """Validate the instrument sweep before peak detection or interpolation.
+
+    SWV exports may repeat the first potential once, but the remaining sweep
+    must advance monotonically on an approximately uniform voltage grid.  A
+    missing block must not be rendered as a diagonal line or accepted as a
+    valid peak (the latter can strongly bias a titration plateau).
+    """
+    voltage = np.asarray(v_raw, dtype=float)
+    current = np.asarray(i_raw, dtype=float)
+    result = {
+        "qa_status": "OK",
+        "qa_voltage_gap_V": 0.0,
+        "qa_expected_step_V": np.nan,
+        "qa_estimated_missing_points": 0,
+        "qa_error": "",
+    }
+    if voltage.size != current.size or voltage.size < 5:
+        result.update(
+            qa_status="FAILED",
+            qa_error="Raw trace integrity: voltage/current arrays are incomplete.",
+        )
+        return result
+    if not np.isfinite(voltage).all() or not np.isfinite(current).all():
+        result.update(
+            qa_status="FAILED",
+            qa_error="Raw trace integrity: non-finite instrument values remain.",
+        )
+        return result
+
+    differences = np.diff(voltage)
+    nonzero = differences[np.abs(differences) > np.finfo(float).eps]
+    if nonzero.size == 0:
+        result.update(
+            qa_status="FAILED",
+            qa_error="Raw trace integrity: the voltage sweep does not advance.",
+        )
+        return result
+    expected_step = float(np.median(np.abs(nonzero)))
+    result["qa_expected_step_V"] = expected_step
+    dominant_direction = 1.0 if float(np.median(nonzero)) > 0 else -1.0
+    if np.any(nonzero * dominant_direction < -max(expected_step * 0.05, 1e-9)):
+        result.update(
+            qa_status="FAILED",
+            qa_error="Raw trace integrity: voltage ordering reverses inside the sweep.",
+        )
+        return result
+
+    largest_gap = float(np.max(np.abs(nonzero)))
+    result["qa_voltage_gap_V"] = largest_gap
+    # Instrument rounding introduces tiny step variations. A 60% allowance is
+    # comfortably above those variations while still detecting a missing
+    # sample (2x) and larger missing blocks.
+    if largest_gap > expected_step * 1.6:
+        missing = max(1, int(round(largest_gap / expected_step)) - 1)
+        result.update(
+            qa_status="FAILED",
+            qa_estimated_missing_points=missing,
+            qa_error=(
+                "Raw trace integrity: incomplete voltage sweep; "
+                f"{largest_gap:.6g} V gap (expected {expected_step:.6g} V, "
+                f"approximately {missing} missing points)."
+            ),
+        )
+    return result
+
+
 def analyze_swv_file(
     filepath: str,
     crop_range: Tuple[float, float] = (-0.6, -0.2),
@@ -389,6 +537,9 @@ def analyze_swv_file(
     compute_wavelet_energy: bool = True,
     compute_wavelet_denoised_trace: bool = False,
     use_wavelet_for_correction: bool = False,
+    correct_baseline_jumps: bool = False,
+    jump_sensitivity: float = 8.0,
+    jump_minimum_uA: float = 0.001,
 ) -> dict:
     file_mtime_ns, file_size = _file_signature(filepath)
     v_raw, i_raw = _load_filtered_arrays_cached(
@@ -414,6 +565,9 @@ def analyze_swv_file(
         compute_wavelet_energy=compute_wavelet_energy,
         compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
         use_wavelet_for_correction=use_wavelet_for_correction,
+        correct_baseline_jumps=correct_baseline_jumps,
+        jump_sensitivity=jump_sensitivity,
+        jump_minimum_uA=jump_minimum_uA,
         file_path=filepath,
     )
 
@@ -433,8 +587,14 @@ def analyze_swv_arrays(
     compute_wavelet_energy: bool = True,
     compute_wavelet_denoised_trace: bool = False,
     use_wavelet_for_correction: bool = False,
+    correct_baseline_jumps: bool = False,
+    jump_sensitivity: float = 8.0,
+    jump_minimum_uA: float = 0.001,
     file_path: Optional[str] = None,
 ) -> dict:
+    integrity = swv_trace_integrity(v_raw, i_raw)
+    if integrity["qa_status"] != "OK":
+        raise ValueError(integrity["qa_error"])
     mask = (v_raw >= crop_range[0]) & (v_raw <= crop_range[1])
     background_median = _compute_outside_crop_median(i_raw, mask)
     v, i = v_raw[mask], i_raw[mask]
@@ -442,7 +602,19 @@ def analyze_swv_arrays(
     if len(v) < 5:
         raise ValueError("Too few points after cropping.")
 
-    i_smooth = apply_smoothing(i, smooth_window, smooth_polyorder) if smooth_window > 0 else i.copy()
+    jump_corrected_current, jump_audit = (
+        correct_abrupt_baseline_jumps(
+            i, sensitivity=jump_sensitivity, minimum_jump_uA=jump_minimum_uA,
+        ) if correct_baseline_jumps else (i.copy(), {
+            "jump_correction_applied": False,
+            "jump_correction_count": 0,
+            "jump_correction_indices": np.array([], dtype=int),
+            "jump_correction_amplitudes_uA": np.array([], dtype=float),
+            "jump_correction_sensitivity": float(jump_sensitivity),
+            "jump_correction_minimum_uA": float(jump_minimum_uA),
+        })
+    )
+    i_smooth = apply_smoothing(jump_corrected_current, smooth_window, smooth_polyorder) if smooth_window > 0 else jump_corrected_current.copy()
     wavelet_denoised_current = (
         _wavelet_denoise_trace(i)
         if (compute_wavelet_denoised_trace or use_wavelet_for_correction)
@@ -521,16 +693,20 @@ def analyze_swv_arrays(
         peak_offset_norm = float((v[peak_idx_corr] - (v_left + v_right) / 2.0) / denom)
 
     return {
+        **integrity,
         "file_path": file_path,
         "background_current_rms": background_rms,
         "background_current_median": background_median,
         "voltage": v,
         "raw_current": i,
+        "jump_corrected_current": jump_corrected_current,
         "smoothed_current": i_smooth,
         "wavelet_denoised_current": wavelet_denoised_current,
         "corrected_current": y_corr,
         "smoothed_corrected_current": y_corr_smooth,
         "local_baseline": first_pass["local_baseline"],
+        "jump_correction_enabled": bool(correct_baseline_jumps),
+        **jump_audit,
         "first_pass_corrected_current": first_pass["corrected_current"] if second_pass_requested else None,
         "first_pass_smoothed_corrected_current": first_pass["smoothed_corrected_current"] if second_pass_requested else None,
         "first_pass_local_baseline": first_pass["local_baseline"] if second_pass_requested else None,
@@ -907,6 +1083,9 @@ def _process_swv_work_item(
     compute_wavelet_energy: bool,
     compute_wavelet_denoised_trace: bool,
     use_wavelet_for_correction: bool,
+    correct_baseline_jumps: bool,
+    jump_sensitivity: float,
+    jump_minimum_uA: float,
     validated_signature: Optional[Tuple[int, int]] = None,
 ) -> Optional[Tuple[dict, dict]]:
     """Validate and analyze one SWV without assigning its display scan number."""
@@ -940,6 +1119,9 @@ def _process_swv_work_item(
         compute_wavelet_energy=compute_wavelet_energy,
         compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
         use_wavelet_for_correction=use_wavelet_for_correction,
+        correct_baseline_jumps=correct_baseline_jumps,
+        jump_sensitivity=jump_sensitivity,
+        jump_minimum_uA=jump_minimum_uA,
     )
     return method_meta, processed
 
@@ -964,6 +1146,9 @@ def run_batch(
     compute_wavelet_energy: bool = True,
     compute_wavelet_denoised_trace: bool = False,
     use_wavelet_for_correction: bool = False,
+    correct_baseline_jumps: bool = False,
+    jump_sensitivity: float = 8.0,
+    jump_minimum_uA: float = 0.001,
     parallel_workers: int = 1,
     progress_callback=None,
     channels: Optional[List[int]] = None,
@@ -1104,6 +1289,8 @@ def run_batch(
                 "error": processed["error"],
                 **{k: partial.get(k) for k in (
                     "background_current_rms", "background_current_median",
+                    "qa_status", "qa_voltage_gap_V", "qa_expected_step_V",
+                    "qa_estimated_missing_points", "qa_error",
                     "voltage", "raw_current", "smoothed_current",
                     "wavelet_denoised_current",
                     "corrected_current", "smoothed_corrected_current",
@@ -1153,6 +1340,9 @@ def run_batch(
             compute_wavelet_energy=compute_wavelet_energy,
             compute_wavelet_denoised_trace=compute_wavelet_denoised_trace,
             use_wavelet_for_correction=use_wavelet_for_correction,
+            correct_baseline_jumps=correct_baseline_jumps,
+            jump_sensitivity=jump_sensitivity,
+            jump_minimum_uA=jump_minimum_uA,
         )
 
     analysis_indexes = (

@@ -4210,6 +4210,7 @@ def plot_titration_concentration_accuracy(
     acceptance_region_alpha: float = 0.10,
     channel_colors: Optional[Dict[Any, Any]] = None,
     response_directions: Optional[Dict[Any, str]] = None,
+    channel_labels: Optional[Dict[Any, str]] = None,
 ) -> Optional[plt.Figure]:
     usable_rows = [
         row for row in accuracy_rows
@@ -4267,7 +4268,7 @@ def plot_titration_concentration_accuracy(
         )
         color = colors[channel]
         _line_style, marker = styles[channel]
-        method_trace_label = _swv_method_trace_label(channel)
+        method_trace_label = (channel_labels or {}).get(channel) or _swv_method_trace_label(channel)
         annotation_label = method_trace_label or _compact_channel_label(channel)
         annotation_color_by_trace.setdefault(annotation_label, color)
         for row in channel_rows:
@@ -4446,6 +4447,12 @@ def plot_titration_concentration_accuracy(
         f"Within ±{percent_error_bound:g}%",
         "1:1",
     }
+    allowed_legend_labels.update(
+        (channel_labels or {}).get(channel)
+        or _swv_method_trace_label(channel)
+        or _compact_channel_label(channel)
+        for channel in channels
+    )
     limit_handles_and_labels = [
         (handle, label)
         for handle, label in zip(handles, labels)
@@ -4472,6 +4479,7 @@ def plot_titration_concentration_vs_measurement(
     response_directions: Optional[Dict[Any, str]] = None,
     vlines: Optional[List[Tuple[float, str]]] = None,
     vline_y_frac: float = 0.86,
+    channel_labels: Optional[Dict[Any, str]] = None,
 ) -> Optional[plt.Figure]:
     """Plot per-SWV Langmuir concentration predictions by measurement number.
 
@@ -4671,7 +4679,7 @@ def plot_titration_concentration_vs_measurement(
             label="_nolegend_",
             zorder=3,
         )
-        method_trace_label = _swv_method_trace_label(channel)
+        method_trace_label = (channel_labels or {}).get(channel) or _swv_method_trace_label(channel)
         ax.scatter(
             x_values,
             predicted_levels,

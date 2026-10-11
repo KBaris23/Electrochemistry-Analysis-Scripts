@@ -84,7 +84,7 @@ INTERPOLATION_CACHE_VERSION = "gp_smooth_fixed_length_scales_v2"
 RESCORE_CACHE_VERSION = 13
 
 from core.analysis import analyze_swv_arrays, is_peak_height_below_cutoff_error
-from core.io import load_swv_csv
+from core.io import filter_finite, load_swv_csv
 from core.composer_editing import (SOURCE_FIELDS, SOURCE_TABS, apply_source_edit,
     panel_edit_values, restore_panel_edit, sync_panel_source_changes)
 from bo_headless import (
@@ -17945,7 +17945,13 @@ def _cached_swv_arrays(
 ) -> tuple[np.ndarray, np.ndarray, int | None, int | None, int | None]:
     """Load an unchanged SWV file once per Streamlit process."""
     del modified_ns  # Included in the cache key to invalidate changed files.
-    return load_swv_csv(path_text)
+    voltage, current = load_swv_csv(path_text)
+    # Some potentiostat exports contain blank/non-numeric trailer rows.  The
+    # main SWV pipeline removes those paired rows before validating the sweep;
+    # the BO viewer must use the same ingestion rule or an otherwise valid
+    # chronological stack is rejected before it can be drawn.
+    voltage, current = filter_finite(voltage, current)
+    return np.asarray(voltage, dtype=float), np.asarray(current, dtype=float)
 
 
 @st.cache_data(show_spinner=False)
@@ -20824,6 +20830,10 @@ def _plot_chronological_swv_stack(
     fade_floor: float = .18,
     iteration_axis_left: float = .07,
     iteration_axis_down: float = .04,
+    coordinate_frame_style: str = "Shared-Origin Three-Axis Frame",
+    reverse_stack_order: bool = True,
+    show_axis_ticks: bool = True,
+    current_axis_scale: float = .72,
 ):
     """Render SWVs as a diagonal chronological stack."""
     fig, ax = plt.subplots(figsize=(9, 5.5))
@@ -20853,7 +20863,15 @@ def _plot_chronological_swv_stack(
     if compact_stack:
         # Display order, not elapsed time: omitted scans should not leave holes.
         # Copy rows so cached analysis/chronological metadata remain untouched.
-        loaded = [{**row, "stack_index": index} for index, row in enumerate(loaded)]
+        count = len(loaded)
+        loaded = [
+            {
+                **row,
+                "stack_index": (count - index - 1) if reverse_stack_order else index,
+                "chronological_index": index,
+            }
+            for index, row in enumerate(loaded)
+        ]
     iteration_values = [row["iteration"] for row in loaded]
     stack_indices = [int(row.get("stack_index", 0)) for row in loaded]
     stack_min = min(stack_indices)
@@ -20865,11 +20883,12 @@ def _plot_chronological_swv_stack(
     )
     if compact_stack:
         if x_offset_per_iteration is None:
-            x_step *= .55
+            x_step *= .45
         if y_offset_per_iteration is None:
-            # Paper view: earliest scans recede upper-left; later scans move
-            # toward the foreground at lower-right. Do not invert current.
-            y_step *= -.70
+            # The foreground is the shared origin. With the default reversed
+            # display order, later scans recede upper-left and the iteration
+            # arrow increases away from the origin. Do not invert current.
+            y_step *= -.62
     phase_colors = SWV_PHASE_COLORS
     use_phase_colors = any(
         str(row["phase"]).lower() in phase_colors for row in loaded
@@ -20890,32 +20909,71 @@ def _plot_chronological_swv_stack(
     }
     for row_index, row in enumerate(loaded):
         offset_index = int(row.get("stack_index", 0))
-        age = (offset_index - stack_min) / stack_span
+        age = float(row.get("chronological_index", row_index)) / max(1, len(loaded) - 1)
         age = min(1.0, max(0.0, float(age)))
         alpha = min(1.0, max(0.0, fade_floor + (1.0-fade_floor) * age))
         is_best = row['iteration'] == highlight_iteration
         phase = str(row.get("phase", "")).lower()
         if compact_stack and phase in ("buffer", "target"):
             phase_trace_colors[row_index] = plt.get_cmap("Blues" if phase == "buffer" else "Oranges")(.30 + .56*age)
-        ax.plot(
-            row["voltage"] + offset_index * x_step,
-            row["current"] + offset_index * y_step,
-            color=(
+        trace_color = (
+            highlight_color
+            if is_best
+            else (
                 phase_trace_colors[row_index]
                 if use_phase_colors
                 else None
-            ) or channel_colors.get(row["channel"], "#155e63"),
+            ) or channel_colors.get(row["channel"], "#155e63")
+        )
+        best_width = stack_line_width * 2.8
+        ax.plot(
+            row["voltage"] + offset_index * x_step,
+            row["current"] + offset_index * y_step,
+            color=trace_color,
             linestyle=_swv_trace_linestyle(
                 row.get("trace") or {"phase": row.get("phase")}
             ),
-            linewidth=stack_line_width * (1.8 if is_best else .7 + .3*age),
+            linewidth=best_width if is_best else stack_line_width * (.7 + .3*age),
             alpha=1.0 if is_best else alpha,
+            zorder=12 if is_best else 2 + age,
         )
         ax.lines[-1]._bo_best_trace = is_best
         if is_best:
-            ax.plot(row['voltage'][0] + offset_index*x_step,
-                    row['current'][0] + offset_index*y_step,
-                    marker='D', color=highlight_color, markersize=4, zorder=10)
+            import matplotlib.patheffects as path_effects
+
+            ax.lines[-1].set_path_effects([
+                path_effects.Stroke(linewidth=best_width + 1.8, foreground="white", alpha=.95),
+                path_effects.Normal(),
+            ])
+            marker_index = int(np.nanargmax(row["current"]))
+            marker_x = float(row["voltage"][marker_index] + offset_index * x_step)
+            marker_y = float(row["current"][marker_index] + offset_index * y_step)
+            marker = ax.plot(
+                marker_x,
+                marker_y,
+                marker="D",
+                markerfacecolor=highlight_color,
+                markeredgecolor="white",
+                markeredgewidth=1.1,
+                markersize=7,
+                linestyle="none",
+                zorder=15,
+            )[0]
+            marker._bo_best_marker = True
+            if not any(getattr(text, "_bo_best_callout", False) for text in ax.texts):
+                callout = ax.annotate(
+                    f"Best Iteration {highlight_iteration}",
+                    (marker_x, marker_y),
+                    xytext=(8, 9),
+                    textcoords="offset points",
+                    color=highlight_color,
+                    fontsize=8,
+                    fontweight="bold",
+                    bbox={"facecolor": "white", "edgecolor": highlight_color, "alpha": .9, "pad": 2},
+                    arrowprops={"arrowstyle": "-", "color": highlight_color, "linewidth": .9},
+                    zorder=16,
+                )
+                callout._bo_best_callout = True
 
     display_bounds = _chronological_swv_stack_display_bounds(
         loaded,
@@ -20941,14 +20999,32 @@ def _plot_chronological_swv_stack(
             float(np.nanmean([point[1] for point in edge_points])),
         )
 
-    oldest_stack_index = min(stack_indices)
+    oldest_iteration = min(iteration_values)
+    newest_iteration = max(iteration_values)
+    oldest_candidates = [
+        int(row.get("stack_index", 0)) for row in loaded
+        if int(row["iteration"]) == int(oldest_iteration)
+    ]
+    newest_candidates = [
+        int(row.get("stack_index", 0)) for row in loaded
+        if int(row["iteration"]) == int(newest_iteration)
+    ]
+    oldest_stack_index = (
+        max(oldest_candidates) if reverse_stack_order else min(oldest_candidates)
+    )
+    newest_stack_index = (
+        min(newest_candidates) if reverse_stack_order else max(newest_candidates)
+    )
     oldest_edge = stack_left_edge(oldest_stack_index)
     axis_dx, axis_dy = _chronological_swv_stack_axis_vector(
-        stack_indices,
+        [oldest_stack_index, newest_stack_index],
         x_step,
         y_step,
         plotted_x_span,
     )
+    if reverse_stack_order:
+        axis_dx *= -1.0
+        axis_dy *= -1.0
     axis_length = math.hypot(axis_dx, axis_dy)
     normal_x = -axis_dy / axis_length if axis_length > 0 else -1.0
     normal_y = axis_dx / axis_length if axis_length > 0 else 0.0
@@ -20986,21 +21062,17 @@ def _plot_chronological_swv_stack(
         label_angle -= 180
     elif label_angle < -90:
         label_angle += 180
+    arrow_style = {
+        "arrowstyle": "-|>",
+        "color": "#222222",
+        "linewidth": 1.8,
+        "shrinkA": 0,
+        "shrinkB": 0,
+        "mutation_scale": 12,
+    }
     ax.annotate(
-        "",
-        xy=axis_end,
-        xytext=axis_start,
-        arrowprops={
-            "arrowstyle": "-|>",
-            "color": "#222222",
-            "linewidth": 1.8,
-            "shrinkA": 0,
-            "shrinkB": 0,
-            "mutation_scale": 12,
-        },
-        annotation_clip=False,
-        clip_on=False,
-        zorder=8,
+        "", xy=axis_end, xytext=axis_start, arrowprops=arrow_style,
+        annotation_clip=False, clip_on=False, zorder=8,
     )
     midpoint = (
         (axis_start[0] + axis_end[0]) / 2,
@@ -21026,7 +21098,7 @@ def _plot_chronological_swv_stack(
     chronological_order_label = ax.text(
         label_position[0],
         label_position[1],
-        "Iteration number",
+        "Iteration Number",
         fontsize=9,
         color="#222222",
         ha="center",
@@ -21034,7 +21106,7 @@ def _plot_chronological_swv_stack(
         rotation=label_angle,
         rotation_mode="anchor",
         transform_rotates_text=True,
-        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 1.0},
+        bbox={"facecolor": "none", "edgecolor": "none", "alpha": 0.0, "pad": 1.0},
         zorder=8,
     )
     chronological_order_label._bo_chronological_order_label = True
@@ -21044,9 +21116,33 @@ def _plot_chronological_swv_stack(
     if compact_stack:
         # Keep iteration IDs available without adding labels over crowded traces.
         fig._bo_iteration_range = (oldest_iteration, newest_iteration)
-        for position, value in ((axis_start, oldest_iteration), (axis_end, newest_iteration)):
-            ax.annotate(str(value), position, xytext=(-5, -3), textcoords='offset points',
-                        fontsize=8, ha='right', annotation_clip=False)
+        unique_iterations = sorted(set(iteration_values))
+        iteration_ticks = [
+            (0.0, unique_iterations[0]),
+            (.5, unique_iterations[len(unique_iterations) // 2]),
+            (1.0, unique_iterations[-1]),
+        ]
+        if show_axis_ticks:
+            tick_x = normal_x * plotted_x_span * .012
+            tick_y = normal_y * plotted_y_span * .012
+            for fraction, value in iteration_ticks:
+                position = (
+                    axis_start[0] + fraction * (axis_end[0] - axis_start[0]),
+                    axis_start[1] + fraction * (axis_end[1] - axis_start[1]),
+                )
+                tick_line = ax.plot(
+                    [position[0] - tick_x, position[0] + tick_x],
+                    [position[1] - tick_y, position[1] + tick_y],
+                    color="#222222", linewidth=.9, clip_on=False, zorder=9,
+                )[0]
+                tick_line._bo_iteration_tick = True
+                # Tick values live above the diagonal; the axis title lives
+                # below it. This keeps the oldest value clear of the shared O.
+                tick_label = ax.annotate(
+                    str(value), position, xytext=(-4, 7), textcoords="offset points",
+                    fontsize=7.5, ha="right", va="bottom", annotation_clip=False,
+                )
+                tick_label._bo_iteration_tick_label = True
     channel_handles = [
         Line2D(
             [0],
@@ -21079,7 +21175,7 @@ def _plot_chronological_swv_stack(
     legend_handles = ([] if use_phase_colors else channel_handles) + phase_handles
     if highlight_iteration is not None:
         legend_handles.append(Line2D([], [], color=highlight_color, marker='D', linestyle='none',
-                                     label=f'Best Q: {highlight_iteration}'))
+                                     label=f'Best Iteration {highlight_iteration}'))
     if legend_handles:
         ax.legend(
             handles=legend_handles,
@@ -21108,29 +21204,110 @@ def _plot_chronological_swv_stack(
     ax.grid(False)
     for spine in ax.spines.values():
         spine.set_visible(False)
-    ax.set_facecolor("white")
-    fig.patch.set_alpha(1)
-    fig.add_artist(Line2D([.22, .91], [.055, .055], transform=fig.transFigure, color="#222222", linewidth=1.1))
-    chronological_x_label = fig.text(
-        .50,
-        .025,
-        "Voltage (V)",
-        ha="center",
-        va="center",
-        fontsize=9,
-    )
-    chronological_x_label._bo_customizable_xlabel = True
-    fig.add_artist(Line2D([.955, .955], [.18, .78], transform=fig.transFigure, color="#222222", linewidth=1.1))
-    chronological_y_label = fig.text(
-        .985,
-        .46,
-        "z: Normalized current (peak = 1)" if normalize_to_peak else "z: Current (uA)",
-        ha="center",
-        va="center",
-        rotation=90,
-        fontsize=9,
-    )
-    chronological_y_label._bo_customizable_ylabel = True
+    ax.set_facecolor("none")
+    fig.patch.set_facecolor("none")
+    fig.patch.set_alpha(0)
+    shared_frame = coordinate_frame_style != "Legacy Separated Guides"
+    fig._bo_coordinate_frame_style = coordinate_frame_style
+    fig._bo_iteration_axis_endpoints = (axis_start, axis_end)
+    fig._bo_successful_iterations = tuple(sorted(set(iteration_values)))
+    if shared_frame:
+        # The foreground/oldest end is the shared origin. All three positive
+        # axes point away from it: voltage right, current up, and iteration
+        # toward the later traces at upper-left.
+        origin = axis_start
+        voltage_end = (origin[0] + plotted_x_span * .50, origin[1])
+        current_end = (
+            origin[0],
+            origin[1] + plotted_y_span * max(.35, float(current_axis_scale)),
+        )
+        for endpoint in (voltage_end, current_end):
+            ax.annotate(
+                "", xy=endpoint, xytext=origin, arrowprops=arrow_style,
+                annotation_clip=False, clip_on=False, zorder=8,
+            )
+        voltage_label = ax.annotate(
+            "Voltage (V)", voltage_end, xytext=(-2, -15), textcoords="offset points",
+            ha="right", va="top", fontsize=9, annotation_clip=False,
+        )
+        voltage_label._bo_customizable_xlabel = True
+        current_label = ax.annotate(
+            "Normalized Current" if normalize_to_peak else "Current (\N{MICRO SIGN}A)",
+            current_end, xytext=(7, -1), textcoords="offset points",
+            ha="left", va="top", rotation=90, fontsize=9, annotation_clip=False,
+        )
+        current_label._bo_customizable_ylabel = True
+        origin_label = ax.annotate(
+            "O", origin, xytext=(-6, -5), textcoords="offset points",
+            ha="right", va="top", fontsize=8, fontstyle="italic", annotation_clip=False,
+        )
+        origin_label._bo_coordinate_origin = True
+        fig._bo_coordinate_origin = origin
+        if show_axis_ticks:
+            raw_voltage = np.concatenate([row["voltage"] for row in loaded])
+            raw_current = np.concatenate([row["current"] for row in loaded])
+            voltage_low = float(np.nanmin(raw_voltage))
+            voltage_high = float(np.nanmax(raw_voltage))
+            current_low = float(np.nanmin(raw_current))
+            current_high = float(np.nanmax(raw_current))
+            for fraction in (.33, .67, 1.0):
+                position = (
+                    origin[0] + fraction * (voltage_end[0] - origin[0]),
+                    origin[1],
+                )
+                tick_height = plotted_y_span * .012
+                tick_line = ax.plot(
+                    [position[0], position[0]],
+                    [position[1] - tick_height, position[1] + tick_height],
+                    color="#222222", linewidth=.9, clip_on=False, zorder=9,
+                )[0]
+                tick_line._bo_voltage_tick = True
+                value = voltage_low + fraction * (voltage_high - voltage_low)
+                tick_label = ax.annotate(
+                    f"{value:.2f}", position, xytext=(0, -7), textcoords="offset points",
+                    ha="center", va="top", fontsize=7, annotation_clip=False,
+                )
+                tick_label._bo_voltage_tick_label = True
+            for fraction in (.33, .67, 1.0):
+                position = (
+                    origin[0],
+                    origin[1] + fraction * (current_end[1] - origin[1]),
+                )
+                tick_width = plotted_x_span * .010
+                tick_line = ax.plot(
+                    [position[0] - tick_width, position[0] + tick_width],
+                    [position[1], position[1]],
+                    color="#222222", linewidth=.9, clip_on=False, zorder=9,
+                )[0]
+                tick_line._bo_current_tick = True
+                value = current_low + fraction * (current_high - current_low)
+                tick_label = ax.annotate(
+                    f"{value:.2g}", position, xytext=(-6, 0), textcoords="offset points",
+                    ha="right", va="center", fontsize=7, annotation_clip=False,
+                )
+                tick_label._bo_current_tick_label = True
+        frame_x = [plotted_x_min, plotted_x_max, axis_start[0], axis_end[0], voltage_end[0], current_end[0]]
+        frame_y = [plotted_y_min, plotted_y_max, axis_start[1], axis_end[1], voltage_end[1], current_end[1]]
+        frame_x_span = max(frame_x) - min(frame_x)
+        frame_y_span = max(frame_y) - min(frame_y)
+        ax.set_xlim(min(frame_x) - .035 * frame_x_span, max(frame_x) + .035 * frame_x_span)
+        ax.set_ylim(min(frame_y) - .055 * frame_y_span, max(frame_y) + .04 * frame_y_span)
+        # Limits change the data-to-display transform, so restore the intended
+        # fixed pixel gap after the complete coordinate frame is in view.
+        _position_chronological_order_label(ax, chronological_order_label)
+    else:
+        fig.add_artist(Line2D([.22, .91], [.055, .055], transform=fig.transFigure, color="#222222", linewidth=1.1))
+        chronological_x_label = fig.text(
+            .50, .025, "Voltage (V)", ha="center", va="center", fontsize=9,
+        )
+        chronological_x_label._bo_customizable_xlabel = True
+        fig.add_artist(Line2D([.955, .955], [.18, .78], transform=fig.transFigure, color="#222222", linewidth=1.1))
+        chronological_y_label = fig.text(
+            .985, .46,
+            "Normalized Current" if normalize_to_peak else "Current (\N{MICRO SIGN}A)",
+            ha="center", va="center", rotation=90, fontsize=9,
+        )
+        chronological_y_label._bo_customizable_ylabel = True
     return fig, errors
 
 
@@ -31575,6 +31752,8 @@ def _composer_load_presets(path: Path | None = None) -> dict[str, dict]:
         except (OSError, ValueError):
             continue
         if isinstance(payload, dict):
+            payload = payload.get("presets", payload)
+        if isinstance(payload, dict):
             presets.update({
                 str(name): metadata
                 for name, metadata in payload.items()
@@ -31582,6 +31761,25 @@ def _composer_load_presets(path: Path | None = None) -> dict[str, dict]:
                 and metadata.get("schema") == COMPOSER_METADATA_SCHEMA
             })
     return presets
+
+
+def _composer_load_builtin_preset(
+    name: str,
+    path: Path | None = None,
+) -> dict[str, Any] | None:
+    """Load an application template from the dedicated preset store."""
+    path = Path(path) if path is not None else COMPOSER_PRESET_STORE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    builtins = payload.get("builtins") if isinstance(payload, Mapping) else None
+    template = builtins.get(name) if isinstance(builtins, Mapping) else None
+    if not isinstance(template, Mapping):
+        return None
+    if template.get("schema") != COMPOSER_METADATA_SCHEMA:
+        raise ValueError(f"Built-in preset '{name}' has an unsupported schema.")
+    return copy.deepcopy(dict(template))
 
 
 def _composer_save_preset(
@@ -31601,7 +31799,19 @@ def _composer_save_preset(
     presets[cleaned_name] = dict(metadata)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_bytes(_composer_json_bytes(presets, pretty=True))
+    existing_payload: dict[str, Any] = {}
+    try:
+        loaded_payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded_payload, dict):
+            existing_payload = loaded_payload
+    except (OSError, ValueError):
+        pass
+    if "builtins" in existing_payload or "presets" in existing_payload:
+        existing_payload["presets"] = presets
+        payload_to_save = existing_payload
+    else:
+        payload_to_save = presets
+    temporary.write_bytes(_composer_json_bytes(payload_to_save, pretty=True))
     temporary.replace(path)
 
 
@@ -31779,6 +31989,14 @@ def _composer_builtin_preset(
     extra_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a journal preset: 7.0 in canvas, Arial 7 pt, 9 pt letters, 600 DPI."""
+    stored = _composer_load_builtin_preset(name)
+    if stored is not None:
+        stored_state = stored.setdefault("config", {}).setdefault("state", {})
+        # Runtime-derived channel/iteration/slice values are layered over the
+        # file-owned template. Layout, panel kinds, and default formatting
+        # remain authoritative in figure_composer_presets.json.
+        stored_state.update(copy.deepcopy(dict(extra_state or {})))
+        return stored
     state: dict[str, Any] = {
         **_PUBLICATION_STYLE,
         "bo_composer_aspect": aspect,
@@ -32086,20 +32304,6 @@ def _paper_parameter_sweep_comparison_preset(
     # panels do not visually run into one another when printed side by side.
     # There are deliberately only two map planes, not a disguised four-slice
     # version of the full Type 1 template.
-    if mirrored:
-        rects = [
-            (.365, .535, .600, .420), (.035, .775, .290, .170), (.035, .535, .290, .170),
-            (.365, .045, .600, .420), (.035, .285, .290, .210), (.035, .035, .290, .210),
-        ]
-    else:
-        rects = [
-            (.035, .535, .600, .420), (.675, .775, .290, .170), (.675, .535, .290, .170),
-            (.035, .045, .600, .420), (.675, .285, .290, .210), (.675, .035, .290, .210),
-        ]
-    kinds = (
-        "Measured 3D tensor", "SWV trace overlay", "SWV trace overlay",
-        "Measured 3D tensor", "Measured 2D map", "Measured 2D map",
-    )
     extra: dict[str, Any] = {
         "bo_composer_type1_compact_linked_controls": True,
         "bo_composer_font_size": 10,
@@ -32111,7 +32315,7 @@ def _paper_parameter_sweep_comparison_preset(
         "bo_composer_real_highlight_labels_0": ["ON (max Q)", "OFF (min Q)"],
         "bo_composer_real_slice_values_3": slices[:2],
     }
-    for index in range(len(kinds)):
+    for index in range(6):
         # A–F wastes the already-limited print area and communicates nothing
         # in this linked mini-layout.  Keep the value editable in the panel
         # controls, but suppress it by default for both mirror variants.
@@ -32177,55 +32381,17 @@ def _paper_parameter_sweep_comparison_preset(
     return _composer_builtin_preset(
         name,
         layout="Manual",
-        kinds=kinds,
-        rects=rects,
-        aspect="Sweep workspace (9 x 10 in)",
+        kinds=(),
         extra_state=extra,
     )
 
 
 def _paper_bo_validation_preset() -> dict[str, Any]:
     """Five-panel BO validation/progression figure with linked optimizer data."""
-    rects = [
-        (.53, .49, .44, .48), (.07, .78, .39, .17), (.07, .54, .39, .17),
-        (.025, .025, .48, .45), (.56, .07, .40, .32),
-    ]
     return _composer_builtin_preset(
         "Type 2 - BO validation",
         layout="Manual",
-        kinds=(
-            "Measured 3D tensor", "Global trend", "Buffer/target trend",
-            "Chronological SWV stack", "Measured parallel coordinates",
-        ),
-        rects=rects,
-        aspect="4:3",
-        extra_state={
-            "bo_composer_validation_linked": True,
-            "bo_composer_font_size": 10,
-            **{f"bo_composer_show_label_{i}": False for i in range(5)},
-            "bo_composer_camera_x_0": 1.65,
-            "bo_composer_camera_y_0": 1.15,
-            "bo_composer_camera_z_0": 1.1,
-            "bo_composer_stack_corrected_3": True,
-            "bo_composer_stack_snapshot_3": True,
-            "bo_composer_stack_trace_key_3": "corrected_current",
-            "bo_composer_direction": "maximize",
-            "bo_composer_measured_metric_0": "Paired Q",
-            "bo_composer_measured_x_0": "amplitude",
-            "bo_composer_measured_y_0": "step_potential",
-            "bo_composer_measured_z_0": "frequency",
-            "bo_composer_measured_iteration_path_0": True,
-            "bo_composer_global_metric_1": "Q_run",
-            "bo_composer_global_running_mean_1": 5,
-            "bo_composer_measured_metric_4": "Paired Q",
-            "bo_composer_measured_dot_size_0": 10,
-            "bo_composer_camera_zoom_0": 1.0,
-            "bo_composer_paired_metric_2": "Peak prominence",
-            # "Iteration" is always the plot's first axis.
-            "bo_composer_measured_parallel_params_4": [
-                "frequency", "amplitude", "step_potential"
-            ],
-        },
+        kinds=(),
     )
 
 
@@ -32234,29 +32400,7 @@ def _paper_bo_validation_focused_preset() -> dict[str, Any]:
     return _composer_builtin_preset(
         "Type 2A - BO validation (focused)",
         layout="Manual",
-        kinds=("Measured 3D tensor", "Global trend", "Buffer/target trend"),
-        # One large BO path cube, then the two essential quantitative checks.
-        rects=[(.53, .12, .44, .78), (.07, .60, .39, .25), (.07, .18, .39, .25)],
-        aspect="16:9",
-        extra_state={
-            "bo_composer_validation_linked": True,
-            "bo_composer_font_size": 10,
-            **{f"bo_composer_show_label_{i}": False for i in range(3)},
-            "bo_composer_camera_x_0": 1.65,
-            "bo_composer_camera_y_0": 1.15,
-            "bo_composer_camera_z_0": 1.1,
-            "bo_composer_direction": "maximize",
-            "bo_composer_measured_metric_0": "Paired Q",
-            "bo_composer_measured_x_0": "amplitude",
-            "bo_composer_measured_y_0": "step_potential",
-            "bo_composer_measured_z_0": "frequency",
-            "bo_composer_measured_iteration_path_0": True,
-            "bo_composer_measured_dot_size_0": 10,
-            "bo_composer_camera_zoom_0": 1.0,
-            "bo_composer_global_metric_1": "Q_run",
-            "bo_composer_global_running_mean_1": 5,
-            "bo_composer_paired_metric_2": "Peak prominence",
-        },
+        kinds=(),
     )
     selected = st.session_state.get("bo_composer_active_panel")
     count = int(st.session_state.get("bo_composer_count", 0))
@@ -32583,7 +32727,7 @@ def _composer_draw_global(
                 color=spec.get('best_color', '#c2188b'), lw=1.4, label='Best so far')
     if len(ax.lines) > 1:
         ax.legend(fontsize=max(6, font_size - 2))
-    ax.set(xlabel="Iteration number", ylabel=_metric_label(metric),
+    ax.set(xlabel="Iteration Number", ylabel=_metric_label(metric),
            title="Iteration Quality Score" if metric == "Q_run" else _metric_label(metric))
     ax.grid(alpha=.25)
 
@@ -32614,7 +32758,7 @@ def _composer_draw_channel(
             color=line_override if line_override else None,
             label=_trace_channel_label(channel),
         )
-    ax.set(xlabel="BO iteration", ylabel=_metric_label(metric), title=f"{_metric_label(metric)} by channel")
+    ax.set(xlabel="BO Iteration", ylabel=_metric_label(metric), title=f"{_metric_label(metric)} by Channel")
     if len(channels) <= 10:
         ax.legend(fontsize=max(6, font_size - 2))
     ax.grid(alpha=.25)
@@ -32660,7 +32804,7 @@ def _composer_draw_paired(
                 if mean is not None and sd is not None and metrics.get('ok_scan_count', 0) > 1:
                     ax.errorbar(recorded['iteration'], mean, yerr=sd, fmt='none',
                                 ecolor=color, elinewidth=.8, capsize=2)
-    ax.set(xlabel="BO iteration", ylabel=metric, title=f"Buffer vs target {metric}")
+    ax.set(xlabel="BO Iteration", ylabel=metric, title=f"Buffer vs Target {metric}")
     ax.legend(fontsize=max(6, font_size - 2))
     ax.grid(alpha=.25)
 
@@ -33241,10 +33385,14 @@ def _composer_apply_plotly_text_size(
     canvas_width_px: float | None = None,
 ) -> go.Figure:
     """Apply one panel-local text size after global export styling."""
+    typography = _COMPOSER_PANEL_TYPOGRAPHY.get()
     text_size = max(4.0, float(size))
-    tick_size = max(4.0, text_size * .88)
+    title_size = max(4.0, float(typography.get("title_size", text_size * 1.25)))
+    label_size = max(4.0, float(typography.get("axis_label_size", text_size)))
+    tick_size = max(4.0, float(typography.get("tick_size", text_size * .88)))
+    legend_size = max(4.0, float(typography.get("legend_size", text_size * .9)))
     axis_update = {
-        "title": {"font": {"size": text_size}},
+        "title": {"font": {"size": label_size}},
         "tickfont": {"size": tick_size},
     }
     layout_json = fig.layout.to_plotly_json()
@@ -33283,10 +33431,10 @@ def _composer_apply_plotly_text_size(
             }
     fig.update_layout(
         font={"size": text_size},
-        title={"font": {"size": text_size * 1.25}},
+        title={"font": {"size": title_size}},
         legend={
-            "font": {"size": text_size * .9},
-            "title": {"font": {"size": text_size}},
+            "font": {"size": legend_size},
+            "title": {"font": {"size": legend_size}},
         },
         # Leave room for the (larger) title so it is not clipped at the top.
         margin=(
@@ -33454,9 +33602,12 @@ def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
     every panel (titles 1.1x, labels 1.0x, ticks 0.9x, legends and
     annotations 0.85x), regardless of how the source plot was styled.
     """
+    typography = _COMPOSER_PANEL_TYPOGRAPHY.get()
     size = max(4.0, float(size))
-    title_size, label_size = size * 1.1, size
-    tick_size, note_size = size * 0.9, size * 0.85
+    title_size = max(4.0, float(typography.get("title_size", size * 1.1)))
+    label_size = max(4.0, float(typography.get("axis_label_size", size)))
+    tick_size = max(4.0, float(typography.get("tick_size", size * .9)))
+    note_size = max(4.0, float(typography.get("legend_size", size * .85)))
     for axis in fig.axes:
         axis.title.set_fontsize(title_size)
         axis.xaxis.label.set_fontsize(label_size)
@@ -33504,6 +33655,16 @@ def _composer_draw_embedded_figure(
     from PIL import Image
 
     width_px, height_px = _composer_panel_pixel_size(target_fig, rect, render_dpi)
+    if isinstance(panel_figure, plt.Figure):
+        panel_audit = {
+            "successful_iterations": list(getattr(panel_figure, "_bo_successful_iterations", ())),
+            "trace_failures": list(getattr(panel_figure, "_composer_trace_failures", ())),
+            "coordinate_frame_style": getattr(panel_figure, "_bo_coordinate_frame_style", None),
+        }
+        if any(panel_audit.values()):
+            audits = list(getattr(target_fig, "_composer_panel_audit", ()))
+            audits.append(panel_audit)
+            target_fig._composer_panel_audit = audits
     try:
         if _COMPOSER_CLIP_EXTREMES.get():
             if isinstance(panel_figure, go.Figure):
@@ -34101,13 +34262,15 @@ def _composer_build_chronological_swv(
         fig, ax = plt.subplots(figsize=(8, 4.8))
         _composer_error_panel(ax, "Choose at least one channel.")
         return fig
+    show_all_successful = bool(spec.get("show_all_successful", True))
     representative_observations = _composer_trace_observations_for_channels(
         observations,
         spec["channels"],
-        # Each paired observation usually contributes several replicates. This
-        # bounded sample is enough for a readable stack before the final trace
-        # thinning below, and avoids resolving thousands of archive records.
-        maximum=max(24, min(72, int(spec.get("max_traces", 120) or 120) // 2)),
+        maximum=(
+            max(1, len(observations))
+            if show_all_successful
+            else max(24, min(72, int(spec.get("max_traces", 120) or 120) // 2))
+        ),
     )
     if spec.get('best_iteration') is not None:
         representative_observations = list(representative_observations)
@@ -34128,11 +34291,12 @@ def _composer_build_chronological_swv(
         qualified_entries.append((recorded, trace))
     entries = qualified_entries
     best_entries = [pair for pair in entries if pair[0].get('iteration') == spec.get('best_iteration')]
-    entries = _composer_thin_trace_entries(
-        entries,
-        spec["channels"],
-        int(spec.get("max_traces", 120) or 0),
-    )
+    if not show_all_successful:
+        entries = _composer_thin_trace_entries(
+            entries,
+            spec["channels"],
+            int(spec.get("max_traces", 120) or 0),
+        )
     entries += [pair for pair in best_entries if not any(pair is existing for existing in entries)]
     figure, errors = _plot_chronological_swv_stack(
         entries,
@@ -34141,26 +34305,40 @@ def _composer_build_chronological_swv(
         _bo_analysis_settings(session["config"]) if spec.get("use_bo_snapshot", True) else trace_analysis,
         session["config"],
         "corrected" if spec["corrected"] else "raw",
-        "Channel " + ", ".join(str(channel) for channel in spec["channels"]),
+        "Channel " + ", ".join(
+            str(channel).replace("_min", " Minimize").replace("_max", " Maximize")
+            for channel in spec["channels"]
+        ),
         spec.get("normalize_to_peak", False),
         spec.get("corrected_trace_key", "smoothed_corrected_current"),
         spec.get("offset_to_baseline", False),
         trace_height_scale=spec.get("trace_height_scale", 1.0),
         selected_phases=tuple(spec.get("phases", [])) or None,
         compact_stack=True,
-        highlight_iteration=spec.get('best_iteration'),
+        highlight_iteration=(
+            spec.get('best_iteration')
+            if spec.get('highlight_best_iteration', False)
+            else None
+        ),
         highlight_color=spec.get('best_color', '#c2188b'),
         stack_line_width=spec.get('stack_line_width', 1.5),
         fade_floor=spec.get('stack_fade_floor', .18),
         iteration_axis_left=spec.get('iteration_axis_left', .07),
         iteration_axis_down=spec.get('iteration_axis_down', .04),
+        coordinate_frame_style=spec.get(
+            "coordinate_frame_style", "Shared-Origin Three-Axis Frame"
+        ),
+        reverse_stack_order=spec.get("reverse_stack_order", True),
+        show_axis_ticks=spec.get("show_axis_ticks", True),
+        current_axis_scale=spec.get("current_axis_scale", .72),
     )
     if errors:
         figure._composer_trace_failures = list(errors)
-    iteration_range = getattr(figure, "_bo_iteration_range", None)
-    stack_title = (f"Chronological SWVs · iterations {iteration_range[0]}–{iteration_range[1]}"
-                   if iteration_range else "Chronological SWV scans")
-    figure.suptitle(stack_title, fontsize=spec.get("text_size", 10), y=.99)
+    figure.suptitle(
+        str(spec.get("custom_title") or "Chronological SWVs"),
+        fontsize=spec.get("title_size", spec.get("text_size", 10)),
+        y=.99,
+    )
     if figure.axes:
         # The source tab reserves half its height for waveform metadata. In a
         # composite that metadata is redundant; let the stack fill its panel.
@@ -34170,14 +34348,14 @@ def _composer_build_chronological_swv(
         axis.margins(x=.025, y=.04)
         for line in axis.lines:
             if len(line.get_xdata()) > 10:
-                line.set_linewidth(spec.get('stack_line_width', 1.5) * (1.8 if getattr(line, '_bo_best_trace', False) else 1.0))
+                line.set_linewidth(spec.get('stack_line_width', 1.5) * (2.8 if getattr(line, '_bo_best_trace', False) else 1.0))
                 # A subtle white separation keeps crossing traces legible.
                 import matplotlib.patheffects as path_effects
                 line.set_path_effects([path_effects.Stroke(linewidth=line.get_linewidth()+.6, foreground="white", alpha=.7 * (line.get_alpha() or 0.0)),
                                        path_effects.Normal()])
         for label in figure.texts:
             if getattr(label, "_bo_customizable_ylabel", False):
-                label.set_text("Normalized current" if spec.get("normalize_to_peak") else "Current (uA)")
+                label.set_text("Normalized Current" if spec.get("normalize_to_peak") else "Current (\N{MICRO SIGN}A)")
     if _COMPOSER_JOURNAL_STYLE.get() and figure.axes:
         axis = figure.axes[0]
         legend = axis.get_legend()
@@ -34248,6 +34426,9 @@ COMPOSER_CANVAS_SIZES = {
 
 _COMPOSER_JOURNAL_STYLE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "composer_journal_style", default=False
+)
+_COMPOSER_PANEL_TYPOGRAPHY: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "composer_panel_typography", default={}
 )
 
 
@@ -34408,7 +34589,15 @@ def _composer_swv_header(observation: Mapping[str, Any], role: str = "") -> str:
 def _composer_landscape_header(spec: Mapping[str, Any]) -> str:
     """Name linked compact cubes/maps by their selected channel and slice."""
     channels = [str(channel) for channel in (spec.get("channels") or [])]
-    channel_text = ", ".join(f"Ch {channel}" for channel in channels)
+    def readable_channel(channel: str) -> str:
+        direction = ""
+        if channel.endswith("_min"):
+            channel, direction = channel[:-4], " Minimize"
+        elif channel.endswith("_max"):
+            channel, direction = channel[:-4], " Maximize"
+        return f"Channel {channel}{direction}"
+
+    channel_text = ", ".join(readable_channel(channel) for channel in channels)
     if spec.get("kind") == "Measured 2D map":
         slice_value = _finite_float(spec.get("slice_value"))
         if slice_value is not None:
@@ -34742,6 +34931,12 @@ def _build_composer_figure_inner(
         panel_snapshots = []
         for index, spec in enumerate(specs):
             spec = dict(spec)
+            direction = str(spec.get("optimization_direction") or "").strip()
+            if spec.get("custom_title") and "{direction}" in str(spec["custom_title"]):
+                spec["custom_title"] = str(spec["custom_title"]).replace(
+                    "{direction}", direction.title() or "Optimization"
+                )
+            _COMPOSER_PANEL_TYPOGRAPHY.set(spec)
             selection_history = history
             if spec.get('group_id') is not None:
                 _, selection_history = _composer_group_scope(observations, history, spec['group_id'])
@@ -34749,7 +34944,7 @@ def _build_composer_figure_inner(
             panel_snapshots.append((set(fig.axes), set(fig.texts), set(fig.artists)))
             ax = fig.add_axes(spec["rect"])
             kind = spec["kind"]
-            panel_header = str(spec.get("header") or "")
+            panel_header = str(spec.get("custom_title") or spec.get("header") or "")
             _COMPOSER_CLIP_EXTREMES.set(bool(spec.get("clip_extremes")))
             if kind == "Global trend":
                 trend_history = history
@@ -34850,6 +35045,14 @@ def _build_composer_figure_inner(
                     spec.get("text_size", font_size),
                 )
             elif kind == "Chronological SWV stack":
+                # Best-Q emphasis belongs in the metric and parameter-space
+                # panels; the stack treats every accepted waveform equally.
+                spec = {
+                    **spec,
+                    "best_iteration": None,
+                    "show_best": False,
+                    "highlight_best_iteration": False,
+                }
                 _composer_draw_embedded_figure(
                     fig,
                     ax,
@@ -34863,6 +35066,8 @@ def _build_composer_figure_inner(
                     render_dpi,
                     spec.get("text_size", font_size),
                 )
+                # The embedded stack already carries its editable title.
+                panel_header = ""
             elif kind.startswith("Hyperparameter "):
                 _composer_draw_embedded_figure(
                     fig,
@@ -34917,15 +35122,19 @@ def _build_composer_figure_inner(
             }:
                 _composer_clip_axes_y(ax)
             panel_text_size = max(4.0, float(spec.get("text_size", font_size)))
-            ax.title.set_fontsize(panel_text_size * 1.2)
-            ax.xaxis.label.set_fontsize(panel_text_size)
-            ax.yaxis.label.set_fontsize(panel_text_size)
-            ax.tick_params(labelsize=max(4.0, panel_text_size * .88))
+            title_text_size = max(4.0, float(spec.get("title_size", panel_text_size * 1.2)))
+            axis_label_size = max(4.0, float(spec.get("axis_label_size", panel_text_size)))
+            tick_text_size = max(4.0, float(spec.get("tick_size", panel_text_size * .88)))
+            legend_text_size = max(4.0, float(spec.get("legend_size", panel_text_size * .85)))
+            ax.title.set_fontsize(title_text_size)
+            ax.xaxis.label.set_fontsize(axis_label_size)
+            ax.yaxis.label.set_fontsize(axis_label_size)
+            ax.tick_params(labelsize=tick_text_size)
             legend = ax.get_legend()
             if legend is not None:
                 for legend_text in legend.get_texts():
-                    legend_text.set_fontsize(max(4.0, panel_text_size * .85))
-                legend.get_title().set_fontsize(panel_text_size)
+                    legend_text.set_fontsize(legend_text_size)
+                legend.get_title().set_fontsize(legend_text_size)
             if panel_border:
                 fig.add_artist(Rectangle(
                     (spec["rect"][0], spec["rect"][1]),
@@ -35305,8 +35514,38 @@ def _composer_source_controls(index, source_spec, session, history, observations
         old_key = draft.get("corrected_trace_key", keys[1])
         draft["corrected_trace_key"] = st.selectbox("Trace processing", keys,
             index=keys.index(old_key) if old_key in keys else 1, disabled=not draft["corrected"])
-        draft["max_traces"] = st.number_input("Maximum displayed traces", 2, 500, int(draft.get("max_traces", 120)),
-            help="Representative displayed traces, not invented scans. Lower values render faster. Analysis results are unchanged.")
+        draft["show_all_successful"] = st.checkbox(
+            "Show every successful trace",
+            value=bool(draft.get("show_all_successful", True)),
+            help="Failed or incomplete raw traces remain excluded and are listed in the figure metadata.",
+        )
+        draft["max_traces"] = st.number_input(
+            "Maximum displayed traces", 2, 500, int(draft.get("max_traces", 120)),
+            disabled=draft["show_all_successful"],
+            help="Used only when every successful trace is turned off.",
+        )
+        frame_styles = ["Shared-Origin Three-Axis Frame", "Legacy Separated Guides"]
+        current_frame = draft.get("coordinate_frame_style", frame_styles[0])
+        draft["coordinate_frame_style"] = st.selectbox(
+            "Coordinate frame",
+            frame_styles,
+            index=frame_styles.index(current_frame) if current_frame in frame_styles else 0,
+        )
+        frame_columns = st.columns(3)
+        draft["reverse_stack_order"] = frame_columns[0].checkbox(
+            "Newest traces recede",
+            value=bool(draft.get("reverse_stack_order", True)),
+        )
+        draft["show_axis_ticks"] = frame_columns[1].checkbox(
+            "Axis ticks", value=bool(draft.get("show_axis_ticks", True))
+        )
+        draft["current_axis_scale"] = float(frame_columns[2].slider(
+            "Current-axis length", .35, 1.20,
+            float(draft.get("current_axis_scale", .72)), .05,
+        ))
+        draft["custom_title"] = st.text_input(
+            "Panel title", value=str(draft.get("custom_title") or "Chronological SWVs")
+        )
         draft["normalize_to_peak"] = st.checkbox("Normalize to peak", value=bool(draft.get("normalize_to_peak", False)))
         draft["offset_to_baseline"] = st.checkbox("Offset baseline", value=bool(draft.get("offset_to_baseline", False)))
     if embedded and kind == 'Measured 3D tensor':
@@ -36105,14 +36344,46 @@ def _render_figure_composer(
                 "show_label": show_label,
                 "text_size": panel_text_size,
                 "rect": rect,
+                "optimization_direction": st.session_state.get("bo_composer_direction", ""),
             }
+            with st.expander("Title and typography", expanded=False):
+                spec["custom_title"] = st.text_input(
+                    "Custom panel title",
+                    value="",
+                    key=f"bo_composer_custom_title_{index}",
+                    help="Leave blank to use the automatic title. Use {direction} to insert the selected Maximize/Minimize direction, or type any wording you prefer.",
+                ).strip()
+                type_cols = st.columns(4)
+                spec["title_size"] = float(type_cols[0].number_input(
+                    "Title pt", 4.0, 40.0, float(panel_text_size * 1.2), .5,
+                    key=f"bo_composer_title_size_{index}",
+                ))
+                spec["axis_label_size"] = float(type_cols[1].number_input(
+                    "Axis-label pt", 4.0, 40.0, float(panel_text_size), .5,
+                    key=f"bo_composer_axis_label_size_{index}",
+                ))
+                spec["tick_size"] = float(type_cols[2].number_input(
+                    "Tick pt", 4.0, 40.0, float(max(4.0, panel_text_size * .88)), .5,
+                    key=f"bo_composer_tick_size_{index}",
+                ))
+                spec["legend_size"] = float(type_cols[3].number_input(
+                    "Legend pt", 4.0, 40.0, float(max(4.0, panel_text_size * .85)), .5,
+                    key=f"bo_composer_legend_size_{index}",
+                ))
             if kind in {'Global trend', 'Channel trend', 'Buffer/target trend', 'Measured 3D tensor', 'Measured parallel coordinates', 'Chronological SWV stack'}:
                 with st.container():
                     st.caption('Content and appearance · progress highlights')
                     linked_validation = bool(st.session_state.get('bo_composer_validation_linked'))
-                    spec['show_best'] = st.checkbox('Mark best observed Q', value=linked_validation,
-                        key=f'bo_composer_show_best_{index}', help='Requires one optimizer group and direction. Uses recorded Q, not peak height.')
-                    spec['best_color'] = st.color_picker('Best-iteration color', '#c2188b', key=f'bo_composer_best_color_{index}')
+                    if kind == 'Chronological SWV stack':
+                        # Best-Q emphasis belongs in the Q/cube panels. Keeping
+                        # the chronological stack neutral makes every accepted
+                        # waveform comparable and avoids a duplicate claim.
+                        spec['show_best'] = False
+                        spec['highlight_best_iteration'] = False
+                    else:
+                        spec['show_best'] = st.checkbox('Mark best observed Q', value=linked_validation,
+                            key=f'bo_composer_show_best_{index}', help='Requires one optimizer group and direction. Uses recorded Q, not peak height.')
+                        spec['best_color'] = st.color_picker('Best-iteration color', '#c2188b', key=f'bo_composer_best_color_{index}')
                     if kind == 'Global trend':
                         spec['show_best_so_far'] = st.checkbox('Show best-so-far Q', value=linked_validation, key=f'bo_composer_best_so_far_{index}')
                     if kind == 'Buffer/target trend':
@@ -36133,6 +36404,26 @@ def _render_figure_composer(
                         spec['stack_fade_floor'] = st.slider('Oldest trace opacity', .05, 1., .18, .01, key=f'bo_composer_stack_fade_{index}')
                         spec['iteration_axis_left'] = st.slider('Iteration arrow left offset', 0., .25, .07, .01, key=f'bo_composer_stack_arrow_left_{index}')
                         spec['iteration_axis_down'] = st.slider('Iteration arrow down offset', 0., .25, .04, .01, key=f'bo_composer_stack_arrow_down_{index}')
+                        spec['coordinate_frame_style'] = st.selectbox(
+                            'Coordinate frame',
+                            ['Shared-Origin Three-Axis Frame', 'Legacy Separated Guides'],
+                            key=f'bo_composer_stack_axis_style_{index}',
+                            help='The legacy separated guides remain available; the shared-origin frame is the default.',
+                        )
+                        stack_frame_cols = st.columns(3)
+                        spec['reverse_stack_order'] = stack_frame_cols[0].checkbox(
+                            'Newest traces recede', value=True,
+                            key=f'bo_composer_stack_reverse_order_{index}',
+                            help='Places the earliest accepted trace at the shared origin and later traces along the iteration arrow.',
+                        )
+                        spec['show_axis_ticks'] = stack_frame_cols[1].checkbox(
+                            'Axis ticks', value=True,
+                            key=f'bo_composer_stack_axis_ticks_{index}',
+                        )
+                        spec['current_axis_scale'] = float(stack_frame_cols[2].slider(
+                            'Current-axis length', .35, 1.20, .72, .05,
+                            key=f'bo_composer_stack_current_axis_scale_{index}',
+                        ))
             if kind in {"Measured 3D tensor", "SWV trace overlay"}:
                 spec["show_example_markers"] = st.checkbox(
                     "Show SWV example markers", value=True,
@@ -36634,9 +36925,16 @@ def _render_figure_composer(
                 # controls makes a 2,000-point survey appear frozen.  The
                 # renderer resolves a bounded representative sample instead.
                 available = chronological_trace_channels or real_channels
+                spec["show_all_successful"] = st.checkbox(
+                    "Show every successful trace",
+                    value=True,
+                    key=f"bo_composer_stack_show_all_{index}",
+                    help="Plots all traces that pass analysis and raw-sweep integrity checks.",
+                )
                 spec["max_traces"] = int(st.number_input("Maximum displayed traces", 2, 500, 120,
                     key=f"bo_composer_stack_max_traces_{index}",
-                    help="Representative display sample only. Fewer traces render faster; no missing scans are synthesized."))
+                    disabled=spec["show_all_successful"],
+                    help="Used only when 'Show every successful trace' is off."))
                 spec["use_bo_snapshot"] = st.checkbox("Use saved BO analysis settings", value=True,
                     key=f"bo_composer_stack_snapshot_{index}")
                 phases = ["buffer", "target"] if paired_objective else ["measurement"]
@@ -37054,8 +37352,6 @@ def _render_figure_composer(
                     config,
                     preset_name=preset_name or title,
                 )
-                metadata_bytes = _composer_json_bytes(metadata)
-                metadata_json = metadata_bytes.decode("utf-8")
                 figure = _build_composer_figure(
                     session,
                     history,
@@ -37075,6 +37371,11 @@ def _render_figure_composer(
                     panel_border_width,
                     journal_style=journal_style,
                 )
+                metadata["render_audit"] = {
+                    "panels": list(getattr(figure, "_composer_panel_audit", ())),
+                }
+                metadata_bytes = _composer_json_bytes(metadata)
+                metadata_json = metadata_bytes.decode("utf-8")
                 png_bytes = _composer_figure_bytes(
                     figure,
                     "png",
