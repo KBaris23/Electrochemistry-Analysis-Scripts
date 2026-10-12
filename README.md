@@ -168,22 +168,26 @@ streamlit run app.py
 
 Or launch it by double-clicking the file for your operating system:
 
-- Windows: `launch_app_windows.bat`
-- Windows alternate launcher: `Open_SWV_App.cmd`
+- Windows: `Open_SWV_App.cmd` or `launch_app_windows.bat` (both use the same
+  validated launcher)
 - macOS: `launch_app_mac.command`
 
-The macOS launcher creates its virtual environment under
-`~/Library/Application Support/Electrochemistry Analysis Scripts/venv`, so
-generated environment files are kept outside the GitHub checkout. It installs
-all packages from `requirements.txt` before starting the app.
+The launchers keep their managed virtual environments outside the GitHub
+checkout. Windows uses
+`%LOCALAPPDATA%\Electrochemistry Analysis Scripts\venv`; macOS uses
+`~/Library/Application Support/Electrochemistry Analysis Scripts/venv`. The
+Windows launcher rejects 32-bit or unsupported Python environments and prefers
+64-bit Python 3.10-3.13, then installs the compatible ranges in
+`requirements.txt` before starting the app.
 
 On macOS, if the launcher is not executable after downloading it, run
 `chmod +x launch_app_mac.command` once.
 
-If `streamlit` is installed globally on Windows instead of in the active virtualenv, you can also run:
+If Streamlit is installed in a known 64-bit Python on Windows, you can also run
+it directly, for example:
 
 ```bash
-py -m streamlit run app.py
+py -3.11-64 -m streamlit run app.py
 ```
 
 The app opens automatically at http://localhost:8501

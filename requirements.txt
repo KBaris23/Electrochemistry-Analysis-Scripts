@@ -1,8 +1,8 @@
-streamlit>=1.40
-numpy
-pandas
-scipy
-matplotlib
+streamlit>=1.40,<2
+numpy>=1.26,<3
+pandas>=2.2,<3
+scipy>=1.11,<2
+matplotlib>=3.8,<4
 # Kaleido 0.2.1 is self-contained (no separate Chrome install), but newer
 # Plotly releases have removed support for it. Keep this pair compatible.
 plotly==5.24.1
