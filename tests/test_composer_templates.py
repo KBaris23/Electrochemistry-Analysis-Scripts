@@ -531,8 +531,9 @@ def test_paper_figure_types_have_requested_linked_layouts():
     assert sweep["bo_composer_type1_linked_controls"] is True
     validation = viewer._paper_bo_validation_preset()["config"]["state"]
     assert validation["bo_composer_count"] == 5
-    assert validation["bo_composer_global_running_mean_1"] == 5
-    assert validation["bo_composer_paired_metric_2"] == "Peak prominence"
+    kinds = [validation[f'bo_composer_kind_{i}'] for i in range(5)]
+    assert validation[f"bo_composer_global_running_mean_{kinds.index('Global trend')}"] == 5
+    assert validation[f"bo_composer_paired_metric_{kinds.index('Buffer/target trend')}"] == "Peak prominence"
     focused = viewer._paper_bo_validation_focused_preset()["config"]["state"]
     assert focused["bo_composer_count"] == 3
     assert [focused[f"bo_composer_kind_{i}"] for i in range(3)] == [

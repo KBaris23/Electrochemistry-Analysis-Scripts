@@ -90,15 +90,93 @@ def test_overwrite_button_uses_dropdown_not_typed_name(tmp_path, monkeypatch):
     assert 'Overwrote' in app.success[0].value
 
 
-def test_empty_store_disables_overwrite_and_new_save_selects_copy(tmp_path, monkeypatch):
+def test_empty_store_explains_first_save_and_submits_name_with_button(tmp_path, monkeypatch):
     app, path = _preset_controls_app(tmp_path, monkeypatch)
     app.run()
     assert not app.exception
-    assert app.button(key='bo_composer_preset_overwrite').disabled
-    assert app.selectbox(key='bo_composer_preset_overwrite_target').options == ['Choose a saved preset']
+    assert not any(button.key == 'bo_composer_preset_overwrite' for button in app.button)
+    assert 'No presets available yet' in app.info[0].value
     assert not path.exists()  # Built-ins are not copied or changed by opening controls.
-    app.text_input(key='bo_composer_preset_name').set_value('My copy').run()
+    # No intermediate run/Enter: the name and submit arrive together.
+    app.text_input(key='bo_composer_preset_name').set_value('My copy')
     app.button(key='bo_composer_preset_save').click().run()
     assert not app.exception
     assert app.selectbox(key='bo_composer_preset_overwrite_target').value == 'My copy'
     assert not app.button(key='bo_composer_preset_overwrite').disabled
+
+
+def test_save_update_same_name_preserves_other_presets(tmp_path, monkeypatch):
+    app, path = _preset_controls_app(tmp_path, monkeypatch)
+    original = {'schema': viewer.COMPOSER_METADATA_SCHEMA, 'name': 'Original'}
+    viewer._composer_save_preset('My copy', original)
+    viewer._composer_save_preset('Untouched', original)
+    app.run()
+    app.text_input(key='bo_composer_preset_name').set_value('My copy')
+    app.button(key='bo_composer_preset_save').click().run()
+    assert not app.exception
+    stored = viewer._composer_load_presets(path)
+    assert stored['Untouched'] == original
+    assert stored['My copy']['config']['panels'] == [{'title': 'Edited panel'}]
+    assert 'Updated' in app.success[0].value
+
+
+def test_loading_preset_prefills_save_name_without_writing(tmp_path, monkeypatch):
+    path = tmp_path / 'presets.json'
+    monkeypatch.setattr(viewer, 'COMPOSER_PRESET_STORE', path)
+    app = AppTest.from_string(f'''
+import streamlit as st
+from bo_session_viewer import _composer_load_named_preset, _composer_preset_save_controls
+st.button('Load', on_click=_composer_load_named_preset,
+          args=({{'state': {{}}}}, 'Example'))
+_composer_preset_save_controls({{}}, {{'state': {{}}}})
+''').run()
+    app.button[0].click().run()
+    assert not app.exception
+    assert app.text_input(key='bo_composer_preset_name').value == 'Example'
+    assert not path.exists()
+
+
+def test_template_overwrite_updates_file_and_future_builder(tmp_path, monkeypatch):
+    path = tmp_path / 'figure_composer_presets.json'
+    monkeypatch.setattr(viewer, 'COMPOSER_PRESET_STORE', path)
+    monkeypatch.setattr(viewer, 'LEGACY_COMPOSER_PRESET_STORE', tmp_path / 'legacy.json')
+    original = {'schema': viewer.COMPOSER_METADATA_SCHEMA, 'config': {'state': {}}}
+    path.write_text(json.dumps({'builtins': {'Type 1A': original, 'Other': original}, 'presets': {}}))
+    updated = {**original, 'config': {'state': {'bo_composer_font_size': 17,
+                                             'bo_composer_show_highlight_labels_0': False}}}
+    viewer._composer_save_preset('Type 1A', updated, require_existing=True)
+    stored = json.loads(path.read_text())
+    assert stored['builtins']['Other'] == original
+    assert 'Type 1A' not in stored['presets']  # no duplicate shadow preset
+    future = viewer._composer_builtin_preset('Type 1A', layout='Manual', kinds=(),
+                                            extra_state={'bo_composer_font_size': 7})
+    assert future['config'] == updated['config']  # runtime defaults cannot undo edits
+    assert viewer._composer_load_presets(include_templates=True)['Type 1A'] == future
+
+
+def test_original_template_is_overwritable_without_saving_copy(tmp_path, monkeypatch):
+    app, path = _preset_controls_app(tmp_path, monkeypatch)
+    original = {'schema': viewer.COMPOSER_METADATA_SCHEMA, 'name': 'Saved long name'}
+    path.write_text(json.dumps({'builtins': {'Saved long name': original}, 'presets': {}}))
+    app.run()
+    assert not app.button(key='bo_composer_preset_overwrite').disabled
+    assert app.text_input(key='bo_composer_preset_name').value == 'Saved long name'
+    app.button(key='bo_composer_preset_overwrite').click().run()
+    assert not app.exception
+    stored = json.loads(path.read_text())
+    assert stored['builtins']['Saved long name']['config']['panels'] == [{'title': 'Edited panel'}]
+    assert stored['presets'] == {}
+
+
+def test_generated_menu_preset_can_be_overwritten(tmp_path, monkeypatch):
+    path = tmp_path / 'presets.json'
+    monkeypatch.setattr(viewer, 'COMPOSER_PRESET_STORE', path)
+    monkeypatch.setattr(viewer, 'LEGACY_COMPOSER_PRESET_STORE', tmp_path / 'legacy.json')
+    app = AppTest.from_string('''
+from bo_session_viewer import _composer_preset_save_controls
+_composer_preset_save_controls({}, {'state': {}}, 'Type 1', {'Type 1': {}})
+''').run()
+    assert not app.button(key='bo_composer_preset_overwrite').disabled
+    app.button(key='bo_composer_preset_overwrite').click().run()
+    assert not app.exception
+    assert 'Type 1' in viewer._composer_load_presets(path)

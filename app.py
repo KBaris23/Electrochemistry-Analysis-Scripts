@@ -71,6 +71,8 @@ from core.mat_conversion import convert_mat_folders_to_swv_csv
 from core.io import collect_measurement_csvs_from_folders, parse_measurement_time_from_filename
 from core.workspace_sessions import (
     RECOVERY_STEM,
+    local_session_directory,
+    available_workspaces,
     list_workspaces,
     load_workspace,
     save_workspace,
@@ -124,11 +126,11 @@ def _clear_loaded_analysis_state() -> None:
 def _render_workspace_manager() -> None:
     """Save/reopen a compact analysis recipe, with an optional derived-data cache."""
     with st.sidebar.expander("Saved analysis sessions", expanded=False):
-        session_dir = Path.cwd() / "analysis_sessions"
-        saved = list_workspaces(session_dir)
-        labels = {path.name.removesuffix(".analysis-session.json"): path for path in saved}
+        session_dir = local_session_directory()
+        show_extra = st.checkbox("Show older/extra sessions", key="workspace_show_extra", value=False)
+        labels = available_workspaces(session_dir, Path.cwd() / "analysis_sessions", include_hidden=show_extra)
         recovery = session_dir / f"{RECOVERY_STEM}.analysis-session.json"
-        if recovery.is_file():
+        if show_extra and recovery.is_file():
             labels = {"Autosaved recovery": recovery, **labels}
         selected = st.selectbox(
             "Saved session",
@@ -198,6 +200,8 @@ def _render_workspace_manager() -> None:
             "Recipes store paths, analysis choices, figure settings, and annotations. "
             "Cached results are optional; source data remain in their original folders."
         )
+        st.caption(f"New saves and recovery are local to this computer: {session_dir}")
+        st.caption("Older analysis_sessions recipes in this checkout remain available; those old files may still be synchronized by OneDrive. They are not moved or deleted automatically.")
     # Browser close events cannot reliably run Python.  Persist the compact
     # recipe on every ordinary Streamlit rerun instead; named saves remain the
     # durable checkpoints and may optionally include computed results.
@@ -2059,6 +2063,8 @@ def _paper_composite_figure(
     font_size: float = 8.0,
     restyle: bool = True,
     raster_dpi: int = 300,
+    width_ratios: Optional[List[float]] = None,
+    column_gap: float = .16,
 ) -> plt.Figure:
     """Arrange existing analysis figures into a consistently labelled paper grid.
 
@@ -2068,10 +2074,9 @@ def _paper_composite_figure(
     total_height = max(row_height, rows * row_height)
     output = plt.figure(figsize=(width, total_height), facecolor="white")
     grid = output.add_gridspec(
-        rows, columns, wspace=.16, hspace=.18,
+        rows, columns, wspace=column_gap, hspace=.18, width_ratios=width_ratios,
         top=.98, bottom=0.04, left=0.04, right=0.99,
     )
-    cell_w, cell_h = width / columns * 0.92, row_height * 0.92
     for index in range(rows * columns):
         axis = output.add_subplot(grid[index // columns, index % columns])
         axis.set_axis_off()
@@ -2080,6 +2085,11 @@ def _paper_composite_figure(
             axis.text(.5, .5, "No data", ha="center", va="center", fontsize=font_size)
         else:
             if restyle and not getattr(source, "_paper_prestyled", False):
+                if width_ratios is None:
+                    cell_w, cell_h = width / columns * .92, row_height * .92
+                else:
+                    box = grid[index // columns, index % columns].get_position(output)
+                    cell_w, cell_h = box.width * width, box.height * total_height
                 _paper_style_source(source, font_size, cell_w, cell_h)
             axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
             plt.close(source)
@@ -2152,6 +2162,7 @@ def _paper_figure_downloads(
     metadata_bytes = json.dumps(metadata, indent=2, sort_keys=True, default=str).encode("utf-8")
     png = io.BytesIO()
     pdf = io.BytesIO()
+    svg = io.BytesIO()
     figure.savefig(png, format="png", dpi=600, bbox_inches="tight", transparent=True)
     try:
         from PIL import Image, PngImagePlugin
@@ -2167,17 +2178,20 @@ def _paper_figure_downloads(
         png.seek(0)
     figure.savefig(
         pdf, format="pdf", bbox_inches="tight", transparent=True,
-        metadata={"Title": stem, "Subject": "See companion JSON for complete SWV figure state."},
+        metadata={"Title": stem, "Subject": metadata_bytes.decode("utf-8")},
     )
+    figure.savefig(svg, format="svg", bbox_inches="tight", transparent=True,
+                   metadata={"Description": metadata_bytes.decode("utf-8")})
     package = io.BytesIO()
     archive_folder = str(metadata.get("output_subfolder") or "").strip("/\\")
     archive_prefix = f"{archive_folder}/" if archive_folder else ""
     with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(f"{archive_prefix}{stem}.png", png.getvalue())
         archive.writestr(f"{archive_prefix}{stem}.pdf", pdf.getvalue())
+        archive.writestr(f"{archive_prefix}{stem}.svg", svg.getvalue())
         archive.writestr(f"{archive_prefix}{stem}.metadata.json", metadata_bytes)
     st.pyplot(figure, use_container_width=True)
-    left, middle, meta_column, package_column = st.columns(4)
+    left, middle, svg_column, meta_column, package_column = st.columns(5)
     left.download_button(
         "Download PNG", png.getvalue(), file_name=f"{stem}.png", mime="image/png",
         key=f"{stem}_png", use_container_width=True,
@@ -2185,6 +2199,10 @@ def _paper_figure_downloads(
     middle.download_button(
         "Download PDF", pdf.getvalue(), file_name=f"{stem}.pdf", mime="application/pdf",
         key=f"{stem}_pdf", use_container_width=True,
+    )
+    svg_column.download_button(
+        "Download SVG", svg.getvalue(), file_name=f"{stem}.svg", mime="image/svg+xml",
+        key=f"{stem}_svg", use_container_width=True,
     )
     meta_column.download_button(
         "Download Metadata", metadata_bytes, file_name=f"{stem}.metadata.json",
@@ -7035,6 +7053,17 @@ if view == "Paper Figures":
         )
         is_directional_type3 = figure_type.startswith(("Type 3B", "Type 3C"))
         has_paired_directional_langmuirs = figure_type.startswith("Type 3C")
+        if figure_type.startswith("Type 4"):
+            with st.expander("Concentration validation layout", expanded=True):
+                st.slider("Predicted-vs-known width (%)", 30, 60, 45,
+                          key="paper_validation_width_percent")
+                st.slider("Validation panel gap", 0., .25, .04, .01,
+                          key="paper_validation_column_gap")
+                st.selectbox("RMS fold error position", ["Above plot", "Below plot", "Inside plot"],
+                             key="paper_validation_error_position")
+                st.checkbox("Square predicted-vs-known axes", value=False,
+                            key="paper_validation_square_axes",
+                            help="Off uses the available panel width. Both axes stay logarithmic with identical numeric limits; the 1:1 line need not be 45 degrees on screen.")
         st.button('Use reference titration style', on_click=_paper_reference_style,
                   help='Overlaid plasma SWVs, every trace, zero correction anchors, and buffer-referenced response. Keeps your channel, methods and scan range.')
         control_cols = st.columns(4)
@@ -7688,11 +7717,16 @@ if view == "Paper Figures":
                         channel_colors=consistent_channel_colors,
                         response_directions=consistent_response_directions,
                         channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
+                        square_axes=bool(st.session_state.get("paper_validation_square_axes", False)),
+                        error_summary_position=str(st.session_state.get("paper_validation_error_position", "Above plot")).split()[0].lower(),
                     ))
                 composite = _paper_composite_figure(
                     panels, len(comparisons), 2, width=paper_width,
                     row_height=3.1, font_size=paper_font,
                     raster_dpi=paper_raster_dpi,
+                    width_ratios=[100 - st.session_state.get("paper_validation_width_percent", 45),
+                                  st.session_state.get("paper_validation_width_percent", 45)],
+                    column_gap=float(st.session_state.get("paper_validation_column_gap", .04)),
                 )
                 st.session_state["paper_titration_render"] = (
                     "type4", composite, paper_rows, paper_width, paper_font

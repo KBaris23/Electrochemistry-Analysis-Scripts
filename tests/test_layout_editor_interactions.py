@@ -41,6 +41,10 @@ selected = new Set([0]);
 // Width can be entered exactly, even when it requires moving inward.
 document.getElementById('pos-w').onchange({target:{valueAsNumber:95}});
 assert.deepEqual(rects, [[.05,.1,.95,.3]]);
+assert.deepEqual(messages.filter(m => m.type === 'streamlit:setComponentValue').at(-1).value.rects, rects);
+document.getElementById('edit-content').onclick();
+assert.equal(messages.filter(m => m.type === 'streamlit:setComponentValue').at(-1).value.action, 'edit_panel');
+assert.equal(messages.filter(m => m.type === 'streamlit:setComponentValue').at(-1).value.active_index, 0);
 render(initial); // stale parent frame must not revert the local edit
 assert.deepEqual(rects, [[.05,.1,.95,.3]]);
 undoLayout(); assert.deepEqual(rects, initial);

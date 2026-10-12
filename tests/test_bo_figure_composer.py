@@ -644,10 +644,13 @@ def test_validation_presets_use_sweep_camera_and_unsmoothed_corrected_stack():
     full = viewer._paper_bo_validation_preset()['config']['state']
     focused = viewer._paper_bo_validation_focused_preset()['config']['state']
     for state in (full, focused):
-        assert [state[f'bo_composer_camera_{axis}_0'] for axis in ('x', 'y', 'z')] == [1.65, 1.15, 1.1]
+        cube = next(i for i in range(state['bo_composer_count']) if state[f'bo_composer_kind_{i}'] == 'Measured 3D tensor')
+        assert [state[f'bo_composer_camera_{axis}_{cube}'] for axis in ('x', 'y', 'z')] == [1.65, 1.15, 1.1]
     assert full['bo_composer_stack_corrected_3']
     assert full['bo_composer_stack_snapshot_3']
     assert full['bo_composer_stack_trace_key_3'] == 'corrected_current'
+    assert full['bo_composer_stack_voltage_range_3'] == 'Shared correction window (union)'
+    assert full['bo_composer_hide_title_3']
 
 
 def test_best_iteration_is_direction_aware_and_rejects_mixed_trajectories():

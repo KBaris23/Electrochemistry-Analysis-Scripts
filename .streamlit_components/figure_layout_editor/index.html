@@ -179,7 +179,7 @@
     <label>Y % <input id="pos-y" type="number" min="0" max="95" step=".5" style="width:55px"></label>
     <label>Width % <input id="pos-w" type="number" min="5" max="100" step=".5" style="width:55px"></label>
     <label>Height % <input id="pos-h" type="number" min="5" max="100" step=".5" style="width:55px"></label>
-    <span>Enter a value, then Tab or click outside. Y starts at the bottom. Apply layout to save.</span>
+    <span>Enter a value, then Tab or click outside. Y starts at the bottom. Changes stage automatically; Render previews them.</span>
     </div>
   </div>
   <div id="context-menu">
@@ -239,7 +239,10 @@
       draw(); status.textContent = "Saved layout restored";
     };
     document.getElementById("edit-content").onclick = () => {
-      if (selected.size === 1) publishLayout("opening plot settings", [...selected][0]);
+      if (selected.size === 1) {
+        setComponentValue({event_id: `${Date.now()}-${Math.random()}`,
+          active_index: [...selected][0], action: "edit_panel"});
+      }
     };
     const snapped = value => document.getElementById("snap").checked
       ? Math.round(value / Number(document.getElementById("grid").value)) * Number(document.getElementById("grid").value)
@@ -293,7 +296,7 @@
       streamlitMessage("streamlit:setFrameHeight", {height});
     }
     function publishLayout(message, activeIndex = null) {
-      if (!args.allow_overlap) {
+      if (!args.allow_overlap && message !== "draft saved; click Render to preview") {
         for (let i = 0; i < rects.length; i++) {
           for (let j = i + 1; j < rects.length; j++) {
             const a = rects[i], b = rects[j];
@@ -318,7 +321,7 @@
     function markDirty(message) {
       dirty = true;
       applyButton.disabled = false;
-      status.textContent = `— ${message}; click Apply layout`;
+      publishLayout("draft saved; click Render to preview");
     }
     function setComponentValue(value) {
       streamlitMessage("streamlit:setComponentValue", {value});

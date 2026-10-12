@@ -1,4 +1,48 @@
 from core.composer_editing import apply_source_edit
+import pytest
+
+
+@pytest.mark.parametrize('count, link, shared', [
+    (8, 'bo_composer_type1_linked_controls', 'bo_composer_type1_channel'),
+    (6, 'bo_composer_type1_compact_linked_controls', 'bo_composer_type1_compact_channel'),
+    (5, 'bo_composer_validation_linked', 'bo_composer_validation_channel'),
+])
+def test_unrelated_source_edit_cannot_restore_stale_channel(count, link, shared):
+    from core.composer_editing import panel_edit_values, sync_panel_source_changes
+    state = {'bo_composer_count': count, link: True, shared: '5',
+             'bo_composer_kind_0': 'Measured 3D tensor',
+             'bo_composer_measured_channels_0': ['3'],
+             'bo_composer_measured_metric_0': 'old metric'}
+    previous = panel_edit_values(state, 0)
+    state['bo_composer_measured_metric_0'] = 'new metric'
+    assert sync_panel_source_changes(state, 0, previous)
+    assert state[shared] == '5'
+
+
+def test_partial_map_edit_does_not_require_or_change_slice():
+    state = {'bo_composer_count': 6, 'bo_composer_type1_compact_linked_controls': True,
+             'bo_composer_type1_compact_slice_values': [.004, .007]}
+    assert apply_source_edit(state, {'index': 4, 'spec': {
+        'kind': 'Measured 2D map', 'metric': 'Peak current'}})
+    assert state['bo_composer_type1_compact_slice_values'] == [.004, .007]
+
+
+def test_classic_linked_iteration_preserves_other_example():
+    from core.composer_editing import set_linked_trace_iteration
+    state = {'bo_composer_count': 8, 'bo_composer_type1_linked_controls': True,
+             'bo_composer_type1_iterations': [174, 184]}
+    set_linked_trace_iteration(state, 1, 98, '3')
+    assert state['bo_composer_type1_iterations'] == [98, 184]
+    set_linked_trace_iteration(state, 2, 174, '3')
+    assert state['bo_composer_type1_iterations'] == [98, 174]
+
+
+def test_non_extreme_examples_are_not_labelled_max_or_min():
+    from core.composer_editing import compact_example_roles
+    assert compact_example_roles(98, 184, 174, 100) == (
+        'Selected signal-on example', 'Selected signal-off example')
+    assert compact_example_roles(174, 100, 174, 100) == (
+        'Signal-on (max paired Q)', 'Signal-off (min paired Q)')
 
 
 def test_unified_cancel_restores_formatting_source_and_linked_cube_without_touching_other_panel():

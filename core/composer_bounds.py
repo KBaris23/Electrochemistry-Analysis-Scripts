@@ -62,14 +62,14 @@ def fit_panel_bounds(fig, groups, pad_points=2):
                 ax.set_position([*lo, *(hi-lo)])
                 for text in ax.findobj(Text):
                     if id(text) not in seen_text:
-                        text.set_fontsize(text.get_fontsize()*scale)
+                        text.set_fontsize(getattr(text, '_composer_fixed_fontsize', text.get_fontsize()*scale))
                         seen_text.add(id(text))
                 for axis in (ax.xaxis, ax.yaxis, *([ax.zaxis] if hasattr(ax,'zaxis') else [])):
                     axis.labelpad *= scale
                     for tick in axis.get_major_ticks():
                         tick.set_pad(tick.get_pad()*scale)
                 for line in ax.lines:
-                    line.set_linewidth(line.get_linewidth()*scale)
+                    line.set_linewidth(getattr(line, '_composer_fixed_linewidth', line.get_linewidth()*scale))
                     line.set_markersize(line.get_markersize()*scale)
             for text in texts:
                 text.set_position(point(text.get_position()))

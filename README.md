@@ -9,6 +9,11 @@ For the manuscript's exact dataset paths, channels and analysis settings, use
 [the per-figure paper guide](paper/README.md). Start with the sweep, then BO
 validation, then titration. These are different inputs, not interchangeable tabs.
 
+Current exports are together in [journal plots](paper/generated/journal_plots/) and
+[one ZIP](paper/generated/journal_plots.zip): dataset folders with maximize/minimize
+subfolders, PNG/PDF/SVG and one metadata JSON per newly rendered plot. Older
+drafts are outside the active output folder in ignored `paper/.local_archive/`.
+
 | Task | Mode / input | Output |
 |---|---|---|
 | SWV processing | SWV; measurement CSVs or converted MAT files | Raw/smoothed/corrected overlays, peak metrics, failures, tables and export bundles |
@@ -52,8 +57,9 @@ your choice. Settings stay editable; click **Run Analysis** to apply changes.
 | Landscape interpolation | Estimates a response surface between measured parameter points | Interpolated pixels are not additional experiments or repaired Q observations |
 
 Missing/unreadable scans and failed acceptance checks remain failures or omitted
-values. The chronological stack packs accepted displayed traces together; its
-spacing represents order, not elapsed time. There is **no automatic scientific
+values. The shared-frame chronological stack packs accepted iterations together;
+buffer and target replicates share each iteration's depth. Spacing represents
+order, not elapsed time (missing iteration IDs are not renumbered). There is **no automatic scientific
 data imputation** for missing SWV scans, titration doses or Q observations.
 Restore genuine missing source files and rerun analysis, or report omissions.
 Do not use visual clipping to conceal exclusions in the paper; document every
@@ -61,20 +67,105 @@ analysis filter and compare filtered/unfiltered results.
 
 ### Composer editing, rendering and reuse
 
+For a chronological stack or SWV overlay, open **Edit panel → Experimental trace
+processing** and enable **Correct abrupt baseline jumps (experimental)** with
+**Corrected trace** enabled. It is off by default; sensitivity and minimum jump
+size are editable. Processing is crop → jump correction → smoothing/optional
+wavelet → baseline correction. Settings are saved in presets, sessions and
+export metadata. This changes displayed/reprocessed traces and may change their
+acceptance, but never rewrites source files or recorded BO Q scores.
+
+For Q/prominence titles, use **Title and typography → Custom panel title** and
+**Title pt**. Custom titles replace automatic titles rather than adding a second
+line. For Q, prominence, channel trends and SWV overlays, use **Legend position →
+Legend corner**. Enable **Custom legend anchor** for precise X/Y placement
+(0 = left/bottom, 1 = right/top); select a corner other than Automatic first.
+These are saved formatting settings, not draggable legends in the exported PNG.
+
+For linked Type 1A/1B examples, edit the first cube and choose **Signal-on example
+iteration** or **Signal-off example iteration** directly (for example, change
+174 to 98). These replace the old resetting highlight chips. The corresponding
+SWV panel and cube marker change together; the other example is unchanged.
+**Observation iteration** in the SWV panel works too. Manual choices persist
+in presets/sessions for that channel. **Reset source iteration choices** returns
+to automatic selection. Non-extreme examples are not labelled max/min paired Q.
+
+To hide the cube's **Iter …** callouts without removing its highlighted dots,
+select the cube → **Edit panel** → uncheck **Show highlighted iteration labels**,
+then render again. This also hides best-iteration callouts, but leaves the title,
+markers, and start/final labels unchanged. The choice is saved in presets,
+local sessions, and figure metadata; existing recipes keep labels on by default.
+
+To change a preset's data without losing its formatting:
+
+1. Open the desired experiment/session. Presets do not contain raw measurements.
+   Figure Composer always receives the full loaded BO session, even when the sidebar's **Channel groups** is set to a single group. That sidebar filter still applies to the other BO tabs; Composer has its own channel controls.
+2. For linked Type 2/2A, choose **Validation channel** directly from all channels/directions in the session (for example `5_min` or `5_max`). The matching optimizer group and Q direction follow automatically. If that channel exists in multiple groups, choose **Validation group / channel (all panels)**. A panel's **Channels** picker can also change the linked channel; it is not limited to the previously selected group.
+3. For independent panel sources, uncheck **Link validation panel sources**. Choose **Both** optimizer directions to expose both minimize and maximize channels, then edit each panel's channels. Set the Q panel's optimizer group explicitly; independently chosen panels need not describe the same objective.
+4. For Type 1/1A/1B, **Shared channel** uses the session's measured channels, not just the currently selected trace. Uncheck **Link sweep panel sources** to choose each panel independently. Linked mode keeps example traces, cube markers, and slice maps matched.
+5. Render/export, then **Save / update preset** if you want these choices on future loads. Save your local session separately to retain experiment paths. Only channels present in the active data can be selected.
+
+Changing a shared channel takes precedence over old panel checkpoints. In linked mode, choosing a new channel in a panel's **Channels** box replaces the old linked selection and updates the group. Changing a metric, crop, or formatting does not restore an unchanged channel from a preset. An explicit **Load preset** or **Load session** still restores that saved configuration by design. Imported raster/captured plots are not channel-selectable measurements; regenerate their source plot for a different channel.
+
+Corrected chronological stacks skip traces that fail processing or array-integrity checks; export metadata records failures and included/excluded counts. Secondary peaks alone do not establish failure and are not silently removed for appearance.
+
+Experimental jump correction runs after the saved analysis crop, **before smoothing/wavelet denoising and baseline/peak extraction**. It removes isolated persistent offsets, not arbitrary extra peaks. Local support checks reject ambiguous steps; repeated closely spaced opposite transitions (pulse-like corruption) fail analysis when this option is enabled and are excluded from the stack with an audit reason. The option remains off by default; raw files and recorded BO scores are unchanged. `scripts/check_stack_jump_correction.py` generates separate, timestamped on/off comparisons for the local recovery session, including raw examples and JSON audits.
+
+To adjust the chronological stack (Type 2), select its block and open **Edit panel**:
+
+1. Use **Shared-Origin Three-Axis Frame** for calibrated ticks; **Legacy Separated Guides** retains the older view.
+2. The default is now **Newest traces recede OFF**: newest iterations in front, oldest at the back, with labels following the actual traces. The calibrated frame has plain axis ends without arrowheads. **Axis-to-trace gap** (default 0.08) separates the guides from the waveforms; **Iteration spacing** (default 1.18) spreads the depth positions slightly. These are display coordinates, not current or voltage changes. For an older saved session, click **Use reversed, spaced stack** and render again. **Rear trace opacity** controls the faintest traces; fading follows depth even if you reverse the order. Buffer is solid blue; target is solid orange. **Stack legend corner** defaults to **Upper Right**, with a compact, white-backed legend styled like the metric legends (no best-observed entry).
+3. Use **Corrected trace → corrected_current** for unsmoothed, baseline-corrected traces. Choose **Chronological voltage range → Corrected peak bracket** to crop to the final correction minima, or **Full analyzed voltage range** to display everything retained by the saved BO analysis crop. Full does not reintroduce raw acquisition points outside that analysis crop. **Offset baseline** aligns corrected baselines for comparison. These choices are stored in presets/session/figure metadata; they do not re-fit data or change recorded Q.
+4. Leave **Current-axis maximum (0 = detected peak)** at zero for peak-based scaling, or enter a maximum in µA (normalized units if normalization is enabled). **Current-axis length** changes visual height with matching tick calibration. Voltage ticks use the displayed voltage range. The iteration guide follows the buffer depth direction at a fixed voltage reference; different crop endpoints do not distort the voltage scale.
+5. Edit the panel title and individual title/axis/tick/legend font sizes in formatting, then **Render** again. Exports retain transparent panel backgrounds; a white image viewer backdrop is not evidence of an opaque PNG.
+6. For Type 1A/1B SWV overlays, set **SWV trace thickness (pt; 0 = automatic)** per panel. Zero preserves the existing automatic appearance; positive values specify final thickness in points. Presets and figure metadata retain this setting, including values thinner than the journal-style default. Save/overwrite your named preset after editing; an already exported image is not updated until regenerated.
+
+- **Shared stack crop:** in the chronological panel choose **Chronological voltage
+  range → Shared correction window (union)**. This uses the lowest left/right
+  correction-window voltage and the highest across accepted stack traces, applying
+  that same display window to every trace. Failed traces do not define the window.
+  It does not extrapolate unavailable samples, change the saved analysis crop,
+  or recalculate Q. The option is retained in presets and figure metadata.
+  This is now the default for new stacks and the Type 2 preset, whose stack
+  title is hidden. A union window can expose large tails outside an individual
+  trace's own correction bracket; it does not guarantee artifact-free traces.
+  Use **Corrected peak bracket** for per-trace support, or Type 2A for a focused
+  optimization summary without a stack. Existing saved sessions keep their
+  settings until you load the updated preset or edit the panel.
+  Type 2/2A legend text sizes are independent of Plot text and remain at their
+  requested point size during panel fitting.
 - **Layout:** select blocks locally without a full app rerun. Drag any handle,
   or enter X/Y/Width/Height percentages in **Selected block**. The default grid
   is 1%; **Fit width** fills the editor without changing export proportions.
   **Square**, Ctrl/Cmd+C/V, and geometry undo/redo (Ctrl/Cmd+Z, Ctrl+Y or
   Ctrl/Cmd+Shift+Z) are available. Undo does not restore deleted panels or source
-  changes. **Apply layout** saves the draft; **Reset edits** discards it.
+  changes. Layout changes stage automatically on mouse release or leaving a numeric
+  field; no separate **Apply layout** is needed. Use Undo to reverse geometry edits.
 - **Formatting:** use **Edit panel** for camera, marker size, fonts, axes,
   legends, borders and layout. Block bounds include labels and colorbars.
   **Allow overlap** deliberately permits overlapping rectangles. Exports crop
   unused outer workspace; workspace zoom is separate from physical figure size.
 - **Unified editing:** select **Edit panel → A/B/…**. Its existing panel editor
   contains source data, processing, appearance, progress highlights, and layout.
-  **Preview panel** renders only that panel; **Apply changes** refreshes the
-  composition; **Cancel panel edits** restores the last Apply (or selection).
+  **Preview panel** renders only that panel; **Apply changes** checkpoints edits
+  without rendering; **Cancel panel edits** restores the last Apply (or selection).
+  **Render figure** or an export button uses the staged settings and layout.
+  No panel opens by default. Choose one with **Edit panel** or select a canvas
+  block and click **Edit plot settings**. The **Title & Text Sizes** and
+  **Axis Names & Spacing** subtabs expose separate X/Y/Z labels and point sizes.
+  In **Title & Text Sizes**, enter a **Custom panel title** to replace the
+  automatic wording, or check **Hide panel title** to remove it entirely.
+  Blank custom text means automatic title, not hidden. These choices persist
+  in presets and exported metadata; baked-in titles in raster-only images
+  cannot be removed without replacing the image.
+  For the chronological stack X is voltage, Y is current, Z is iteration;
+  **Iteration title offset (pt)** separates its title from tick numbers.
+  **Zoom/link source panel** only draws a source-region box and connector lines;
+  it does not synchronize data (the separate **Link sweep/validation panel sources**
+  controls do). Raster-only captures cannot have their baked-in labels edited.
+  Normal Streamlit controls still rerun the UI, but editing does not automatically
+  render a figure. **Find / refresh peak-aligned example** explicitly runs the
+  candidate trace analysis; rerun that check after changing analysis settings/data.
   Switching panels keeps the current settings. Linked sweep channels, trace
   iterations and slice planes remain synchronized. No separate Edit source tab jump.
   For cubes enable **Interactive 3D view**, rotate/zoom, then **Cache view →
@@ -98,20 +189,30 @@ analysis filter and compare filtered/unfiltered results.
   is retained; missing references remain missing. Langmuir display subtracts
   its anchor buffer without changing fitted parameters. Offset stacks and
   absolute-current display remain selectable; saved choices are not silently reset.
-- **Exports:** use **Render figure (fast preview)** first, then **Create final
-  PNG/PDF/SVG**. Titration Paper Figures contain rasterized subplots even in PDF;
+- **Composer exports:** click **Export PNG**, **Export PDF**, **Export SVG**, or
+  **Export all (ZIP)** directly. Each generates current applied settings at final
+  DPI on demand; **Render figure (fast preview)** is optional. A stale preview
+  does not block exports. Unchanged downloads share one final render; changed
+  settings create a new export request. PNG/PDF/SVG always embed the recipe;
+  Export all includes all three plus `figure-metadata.json`. Older Streamlit
+  versions without deferred downloads show a Download button after preparation.
+  Titration Paper Figures contain rasterized subplots even in PDF;
   set their panel raster DPI before generation. Transparent export and optional
   panel letters are supported.
-- **Presets:** built-in and shared custom presets are in the visible, Git-tracked
+- **Presets:** all named presets are editable, including Types 1/1A/1B/2/2A.
+  File-backed presets are in the visible, Git-tracked
   `figure_composer_presets.json` under the app directory. Under **Reusable preset**,
-  choose **Saved preset to overwrite**, then click **Overwrite selected preset**;
-  no name retyping or rendering is needed. Apply pending panel/layout edits first.
-  For a built-in template, **Save preset** under your own name once, then overwrite
-  that saved copy as needed. Saving the same typed name also still replaces it.
+  enter a name and click **Save / update preset**. A new name creates a copy;
+  the same name updates it. No Enter key or rendering is needed. Apply pending
+  panel/layout edits first. **Load preset** fills in that preset's exact name.
+  You can overwrite any preset directly; saving a copy first is not required.
+  Alternatively, choose **Saved preset to overwrite** and click **Overwrite
+  selected preset**. This includes the supplied Type presets, not just new names.
   Commit and push this file after saving to share
-  new templates; saving in the app does not automatically push to Git. Built-in
-  templates live under the file's `builtins` section; user presets live under
-  `presets`. Python supplies loading, validation and compatibility fallbacks.
+  new templates; saving in the app does not automatically push to Git. The
+  historical `builtins` and `presets` JSON sections are both writable through
+  the app. Python supplies loading, validation and compatibility fallbacks.
+  Overwriting updates future preset loads, not existing session files or PNGs.
   Use your own preset name to
   preserve variants. Older `.figure_composer_presets.json` files remain readable;
   Save carries their legacy-only entries into the visible file, with visible-file
@@ -123,9 +224,18 @@ analysis filter and compare filtered/unfiltered results.
 
 Open the sidebar's **Saved analysis sessions**, enter **Save as**, then click
 **Save**. Choose the saved entry and **Open** to return later. Recipes are stored
-in `analysis_sessions/` relative to the app's launch working directory. Paths
-inside them are retained as recorded and are **not automatically portable** to
-another computer. Start the app from its repository folder for consistent storage.
+outside the checkout, in local application data:
+
+- Windows: `%LOCALAPPDATA%\Electrochemistry Analysis Scripts\analysis_sessions`
+- macOS: `~/Library/Application Support/Electrochemistry Analysis Scripts/analysis_sessions`
+- Linux: `$XDG_STATE_HOME/Electrochemistry Analysis Scripts/analysis_sessions` (or `~/.local/state/...`).
+
+The sidebar shows the exact path. New named saves and autosaved recovery no
+longer go into a potentially OneDrive-synced checkout. Older app-relative
+`analysis_sessions/` files remain discoverable; they are not deleted or moved,
+and may still be synchronized by OneDrive. Local entries win same-name conflicts.
+Session recipes and result caches are Git-ignored even if copied into the repo.
+Paths inside recipes remain as recorded and are **not automatically portable**.
 
 Recipes contain settings, annotations and paths; raw data are not copied. The
 optional derived-results cache speeds up reopening but uses more space and is
@@ -135,10 +245,50 @@ There is no reliable save-on-browser-close prompt or built-in double-click
 association for session JSON files. Make a named save before leaving; use a
 portable figure package separately for captured figure assets.
 
+### Reopen the prepared paper figures without entering paths
+
+1. Restart the app. Expand **Saved analysis sessions**, select one of the seven
+   prepared sessions below, and click **Open**. Source folders, analysis settings
+   and figure controls are already filled in; titration caches are shared locally.
+   **Show older/extra sessions** reveals the previous per-figure variants, Kana
+   ST2, legacy sessions and autosaved recovery. None were deleted.
+2. Choose `kana_try_sweep` for the parameter sweep, or `amp0_validation`,
+   `vanco_validation`, or `kana_try_validation` for the BO/chronological-stack
+   workspace. Open **Figure Composer**, select a panel, and **Edit panel**.
+3. Choose `amp0_titration`, `vanco_titration`, or `kana_try_titration` for
+   **SWV → Paper Figures**. You may switch
+   between **Type 3** and **Type 4 — Concentration validation** in this same session.
+   No additional session is needed for that concentration diagnostic. The
+   `_validation` sessions above refer to BO experiments, not held-out concentration data.
+4. For Type 4, open **Concentration validation layout**: adjust
+   **Predicted-vs-known width (%)** (default 45), **Validation panel gap** (0.04),
+   and **RMS fold error position** (Above plot; Below/Inside are available).
+   Leave **Square predicted-vs-known axes** off to use the available width.
+   Both log axes retain the same numeric limits; a rectangular plot's 1:1 line
+   is not necessarily 45 degrees on screen. The canvas stays at 3.1 inches per row.
+5. Adjust **Titles, labels, and typography**, then **Generate paper figure →
+   Download PNG**; for BO click **Export PNG** (or PDF/SVG/**Export all**).
+   Preview is optional. Reopening a recipe restores settings, not an already rendered preview.
+6. Save your edits through sidebar **Save as → Save**. Reuse the session name to
+   update it or choose a new name to preserve a variant. Use these local sessions,
+   not the Git-tracked shared preset file, for private paths/settings.
+
+The seven starting setups select Amp0 ch6, Vanco ch6, and Kana Try ch3; channel
+selection remains editable. They live only on the prepared computer, not in Git.
+For local reconstruction from existing generated recipes, run
+`scripts/prepare_figure_workspaces.py` then `scripts/simplify_local_workspaces.py`
+with the app's Python. Existing same-name saves are preserved.
+Kana ST2 is retained among the extra sessions, not promoted as a strong dataset. A genuinely independent
+validation acquisition needs its own source-data session. The current Type 4
+diagnostic back-calculates the titration data using its own fitted calibration.
+No fits, uncertainty values or acceptance rules are changed by the layout controls.
+
 ### Sharing a figure with a collaborator
 
-Every final Composer export has a compact **figure recipe**: it is embedded in
-the PNG and is also available as `<name>.figure.json` and `<name>.figure.zip`.
+Every final Composer export automatically includes a **figure recipe**: it is
+embedded in PNG metadata, the PDF Subject field, and the SVG description.
+**Export all** downloads `<name>.figure.zip` with PNG, PDF, SVG and
+`figure-metadata.json`. Metadata is not an optional download.
 The recipe records the final panel layout, typography, axis/panel choices,
 source session path, selected group/channel, and rendering audit. A collaborator
 can open **Figure Composer > Load a preset or saved figure** and upload the JSON,

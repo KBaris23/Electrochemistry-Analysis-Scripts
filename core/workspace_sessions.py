@@ -9,14 +9,43 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import gzip
 import json
+import os
 from pathlib import Path
 import pickle
 import re
+import sys
 from typing import Any, Mapping
 
 
 SCHEMA_VERSION = 1
 DEFAULT_SESSION_DIR = Path("analysis_sessions")
+
+
+def local_session_directory() -> Path:
+    """Machine-local app data, outside a potentially synced source checkout."""
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+    else:
+        root = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return root / "Electrochemistry Analysis Scripts" / "analysis_sessions"
+
+
+def available_workspaces(local_directory: str | Path, legacy_directory: str | Path, *, include_hidden: bool = False) -> dict[str, Path]:
+    """Keep old recipes discoverable; same-name local saves take precedence."""
+    result = {}
+    for directory in (legacy_directory, local_directory):
+        result.update({path.name.removesuffix(".analysis-session.json"): path
+                       for path in list_workspaces(directory)})
+    if not include_hidden:
+        try:
+            hidden = json.loads((Path(local_directory) / "hidden-workspaces.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            hidden = []
+        if isinstance(hidden, list):
+            result = {name: path for name, path in result.items() if name not in hidden}
+    return dict(sorted(result.items()))
 RECOVERY_STEM = "recovery"
 _EXCLUDED_PREFIXES = (
     "FormSubmitter:", "_workspace_pending_",
@@ -25,6 +54,7 @@ _EXCLUDED_PREFIXES = (
     "bo_history_download_", "build_bo_pdf_bytes_", "bo_history_scores_update_large_plots",
     "bo_composer_editor_",
     "bo_composer_render_", "bo_composer_captured_", "bo_composer_pending_",
+    "bo_composer_exports_", "bo_composer_download_",
     "bo_composer_capture_preview_", "bo_gif_", "bo_sim_",
 )
 _EXCLUDED_KEYS = {
@@ -140,6 +170,17 @@ def load_workspace(path: str | Path) -> tuple[dict[str, Any], Any | None]:
     if payload.get("schema_version") != SCHEMA_VERSION or not isinstance(payload.get("state"), dict):
         raise ValueError("Unsupported or invalid analysis-session file.")
     payload['state'] = serializable_state(payload['state'])
+    # Older recipes stored this choice as a checkbox. Explicitly restore the
+    # new radio too, so a previous live workspace cannot leak its range choice.
+    for key, value in list(payload['state'].items()):
+        if key.startswith('bo_composer_kind_') and value == 'Chronological SWV stack':
+            index = key.removeprefix('bo_composer_kind_')
+            payload['state'].setdefault(
+                f'bo_composer_stack_voltage_range_{index}',
+                'Corrected peak bracket' if payload['state'].get(f'bo_composer_stack_bracket_{index}', True)
+                else 'Full analyzed voltage range',
+            )
+            payload['state'].setdefault(f'bo_composer_stack_legend_location_{index}', 'upper right')
     results = None
     cache_name = payload.get("results_cache")
     if cache_name:

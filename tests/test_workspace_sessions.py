@@ -62,3 +62,70 @@ def test_button_events_are_not_saved_or_restored(tmp_path):
     })
     payload, _ = load_workspace(recipe)
     assert payload['state'] == {'swv_double_correction': True}
+
+
+def test_local_directory_is_not_the_synced_checkout(tmp_path, monkeypatch):
+    import core.workspace_sessions as sessions
+    monkeypatch.setattr(sessions.sys, 'platform', 'win32')
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path / 'local'))
+    assert sessions.local_session_directory() == tmp_path / 'local' / 'Electrochemistry Analysis Scripts' / 'analysis_sessions'
+
+
+def test_local_workspace_precedes_legacy_without_deleting_it(tmp_path):
+    from core.workspace_sessions import available_workspaces
+    old, _ = save_workspace(tmp_path / 'old', 'same', {'a': 1})
+    new, _ = save_workspace(tmp_path / 'local', 'same', {'a': 2})
+    extra, _ = save_workspace(tmp_path / 'old', 'legacy', {'a': 3})
+    assert available_workspaces(tmp_path / 'local', tmp_path / 'old') == {'same': new, 'legacy': extra}
+    assert old.is_file()
+
+
+def test_legacy_stack_range_is_restored_explicitly(tmp_path):
+    recipe, _ = save_workspace(tmp_path, 'legacy-stack', {
+        'bo_composer_kind_3': 'Chronological SWV stack',
+        'bo_composer_stack_bracket_3': False,
+    })
+    payload, _ = load_workspace(recipe)
+    assert payload['state']['bo_composer_stack_voltage_range_3'] == 'Full analyzed voltage range'
+
+
+def test_hidden_workspaces_are_recoverable_and_new_saves_visible(tmp_path):
+    import json
+    from core.workspace_sessions import available_workspaces
+    old, _ = save_workspace(tmp_path / 'old', 'legacy', {'a': 1})
+    new, _ = save_workspace(tmp_path / 'local', 'new', {'a': 2})
+    (tmp_path / 'local' / 'hidden-workspaces.json').write_text(json.dumps(['legacy']))
+    assert available_workspaces(tmp_path / 'local', tmp_path / 'old') == {'new': new}
+    assert available_workspaces(tmp_path / 'local', tmp_path / 'old', include_hidden=True) == {'legacy': old, 'new': new}
+    assert old.is_file()
+
+
+def test_cube_label_choice_survives_source_edit_and_session(tmp_path):
+    from core.composer_editing import apply_source_edit
+    state = {'bo_composer_count': 1}
+    assert apply_source_edit(state, {'index': 0, 'spec': {
+        'kind': 'Measured 3D tensor', 'show_highlight_labels': False}})
+    path, _ = save_workspace(tmp_path, 'labels_off', state)
+    payload, _ = load_workspace(path)
+    assert payload['state']['bo_composer_show_highlight_labels_0'] is False
+
+
+def test_simplify_preserves_caches_and_existing_edits(tmp_path):
+    import json
+    from scripts.simplify_local_workspaces import SELECTION, simplify
+    from core.workspace_sessions import available_workspaces
+    root = tmp_path / 'local'
+    for source in SELECTION.values():
+        save_workspace(root, source, {'value': 1}, results=[42], cache_results=True)
+    save_workspace(tmp_path / 'old', 'legacy', {'value': 0})
+    simplify(root, tmp_path / 'old')
+    assert set(available_workspaces(root, tmp_path / 'old')) == set(SELECTION)
+    path = root / 'amp0_titration.analysis-session.json'
+    payload, results = load_workspace(path)
+    assert results == [42]
+    assert payload['state']['workspace_session_name'] == 'amp0_titration'
+    payload['state']['value'] = 99
+    path.write_text(json.dumps(payload))
+    simplify(root, tmp_path / 'old')
+    assert load_workspace(path)[0]['state']['value'] == 99
+    assert len(available_workspaces(root, tmp_path / 'old', include_hidden=True)) == 15

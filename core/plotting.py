@@ -4211,6 +4211,8 @@ def plot_titration_concentration_accuracy(
     channel_colors: Optional[Dict[Any, Any]] = None,
     response_directions: Optional[Dict[Any, str]] = None,
     channel_labels: Optional[Dict[Any, str]] = None,
+    square_axes: bool = True,
+    error_summary_position: str = "inside",
 ) -> Optional[plt.Figure]:
     usable_rows = [
         row for row in accuracy_rows
@@ -4418,29 +4420,35 @@ def plot_titration_concentration_accuracy(
         else:
             continue
         compact_annotation_label = annotation_label.removesuffix(" Method")
-        ax.text(
+        summary_y = 0.97 - (0.075 * annotation_index)
+        if error_summary_position == "above":
+            summary_y = 1.04 + .085 * (len(log_errors_by_trace) - 1 - annotation_index)
+        elif error_summary_position == "below":
+            summary_y = -.24 - .085 * annotation_index
+        summary = ax.text(
             0.03,
-            0.97 - (0.075 * annotation_index),
+            summary_y,
             (
                 f"{compact_annotation_label} RMS Fold Error: "
                 f"{rms_fold_error:.2f}×"
             ),
             transform=ax.transAxes,
-            va="top",
+            va="bottom" if error_summary_position == "above" else "top",
             ha="left",
             fontsize=9,
             color=annotation_color_by_trace[annotation_label],
             bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=2),
         )
+        summary._swv_error_summary = True
     unit_suffix = f" ({concentration_unit})" if concentration_unit else ""
     ax.set_xlabel(f"Known concentration{unit_suffix}")
     ax.set_ylabel(f"Predicted concentration{unit_suffix}")
-    ax.set_title(title)
+    ax.set_title(title, pad=(12 + 10 * len(log_errors_by_trace)) if error_summary_position == "above" else 6)
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(axis_min, axis_max)
     ax.set_ylim(axis_min, axis_max)
-    ax.set_aspect("equal", adjustable="box")
+    ax.set_aspect("equal" if square_axes else "auto", adjustable="box")
     ax.grid(False)
     handles, labels = ax.get_legend_handles_labels()
     allowed_legend_labels = {

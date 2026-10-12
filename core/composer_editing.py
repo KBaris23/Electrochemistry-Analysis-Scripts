@@ -6,6 +6,40 @@ The UI queues an edit, and Composer applies it before creating its widgets.
 import copy
 
 
+def set_linked_trace_iteration(state, index, iteration, channel):
+    """Persist an explicit linked trace choice before template synchronization."""
+    if index not in (1, 2):
+        return
+    count = int(state.get('bo_composer_count', 0))
+    if state.get('bo_composer_type1_compact_linked_controls') and count == 6:
+        state.setdefault('bo_composer_type1_compact_manual_iterations', {})[str(index)] = {
+            'channel': str(channel), 'iteration': int(iteration),
+        }
+    elif state.get('bo_composer_type1_linked_controls') and count == 8:
+        iterations = list(state.get('bo_composer_type1_iterations') or [iteration])
+        iterations = (iterations + [iterations[-1]] * 2)[:2]
+        iterations[index - 1] = int(iteration)
+        state['bo_composer_type1_iterations'] = iterations
+
+
+def compact_example_iterations(state, channel, on_iteration, off_iteration, options):
+    """Automatic choices unless this channel has a valid explicit override."""
+    selected = [on_iteration, off_iteration]
+    manual = state.get('bo_composer_type1_compact_manual_iterations', {})
+    for index in (1, 2):
+        override = manual.get(str(index), {})
+        if override.get('channel') == str(channel) and override.get('iteration') in options:
+            selected[index - 1] = override['iteration']
+    return tuple(selected)
+
+
+def compact_example_roles(on_iteration, off_iteration, recorded_on, recorded_off):
+    return (
+        'Signal-on (max paired Q)' if on_iteration == recorded_on else 'Selected signal-on example',
+        'Signal-off (min paired Q)' if off_iteration == recorded_off else 'Selected signal-off example',
+    )
+
+
 def panel_edit_values(state, index):
     """Small per-panel checkpoint; never copy renders, uploads or editor UI state."""
     suffix = f'_{int(index)}'
@@ -40,9 +74,9 @@ def sync_panel_source_changes(state, index, previous):
     changed = False
     for field, widget in SOURCE_FIELDS[kind].items():
         key = f'bo_composer_{widget}_{index}'
-        if key in state:
+        if key in state and key in previous and state[key] != previous[key]:
             spec[field] = copy.deepcopy(state[key])
-            changed |= key in previous and state[key] != previous[key]
+            changed = True
     if changed:
         return apply_source_edit(state, {'index': index, 'spec': spec})
     return False
@@ -67,11 +101,13 @@ SOURCE_FIELDS = {
         "corrected": "trace_corrected", "corrected_trace_key": "trace_key",
         "normalize_to_peak": "trace_norm", "use_bo_snapshot": "trace_snapshot",
         "crop_to_minima": "trace_bracket",
+        "trace_line_width": "trace_width",
     },
     "Measured 3D tensor": {
         "channels": "measured_channels", "metric": "measured_metric",
         "phase": "measured_phase", "average_channels": "measured_average",
         "x": "measured_x", "y": "measured_y", "z": "measured_z",
+        "show_highlight_labels": "show_highlight_labels",
     },
     "Measured 2D map": {
         "channels": "real_channels", "metric": "real_metric", "phase": "real_phase",
@@ -86,6 +122,13 @@ SOURCE_FIELDS = {
         "corrected": "stack_corrected", "corrected_trace_key": "stack_trace_key",
         "normalize_to_peak": "stack_norm", "offset_to_baseline": "stack_offset",
         "max_traces": "stack_max_traces", "use_bo_snapshot": "stack_snapshot",
+        "crop_to_minima": "stack_bracket", "current_axis_top": "stack_current_top",
+        "voltage_display_range": "stack_voltage_range",
+        "stack_legend_location": "stack_legend_location",
+        "coordinate_frame_style": "stack_axis_style", "current_axis_scale": "stack_current_axis_scale",
+        "reverse_stack_order": "stack_reverse_order", "show_axis_ticks": "stack_axis_ticks",
+        "stack_axis_gap": "stack_axis_gap", "stack_depth_spacing": "stack_depth_spacing",
+        "show_all_successful": "stack_show_all", "custom_title": "custom_title",
     },
     "Measured parallel coordinates": {
         "channels": "measured_channels", "metric": "measured_metric",
@@ -95,6 +138,9 @@ SOURCE_FIELDS = {
 }
 
 SOURCE_FIELDS['Measured 1D slice'] = dict(SOURCE_FIELDS['Measured 3D tensor'])
+for _trace_kind in ('SWV trace overlay', 'Chronological SWV stack'):
+    SOURCE_FIELDS[_trace_kind].update({field: field for field in
+        ('correct_baseline_jumps', 'jump_sensitivity', 'jump_minimum_uA')})
 SOURCE_FIELDS['Channel x iteration heatmap'] = dict(SOURCE_FIELDS['Measured parallel coordinates'])
 SOURCE_FIELDS['Chronological buffer/target trend'] = {
     'metric': 'chrono_metric', 'channels': 'chrono_channels', 'layout': 'chrono_layout',
@@ -125,6 +171,10 @@ def apply_source_edit(state, edit):
     for field, key in SOURCE_FIELDS[spec["kind"]].items():
         if field in spec:
             state[f"bo_composer_{key}_{index}"] = copy.deepcopy(spec[field])
+    if spec['kind'] == 'Chronological SWV stack' and 'crop_to_minima' in spec and 'voltage_display_range' not in spec:
+        state[f'bo_composer_stack_voltage_range_{index}'] = (
+            'Corrected peak bracket' if spec['crop_to_minima'] else 'Full analyzed voltage range'
+        )
     if spec.get('camera') and spec['kind'] == 'Measured 3D tensor':
         camera = copy.deepcopy(spec['camera'])
         state[f'bo_composer_source_camera_{index}'] = camera
@@ -136,24 +186,23 @@ def apply_source_edit(state, edit):
         ] + [1.0]
     # Preserve template dependencies. A channel edit updates the linked group;
     # a trace or slice edit changes that member and its cube highlight/plane.
+    if state.get('bo_composer_validation_linked') and spec.get('channels'):
+        channel = str(spec['channels'][-1])
+        state['bo_composer_validation_channel'] = channel
+        state['bo_composer_validation_channel__preferred'] = channel
     compact = state.get("bo_composer_type1_compact_linked_controls") and count == 6
     classic = state.get("bo_composer_type1_linked_controls") and count == 8
     if compact or classic:
         prefix = "bo_composer_type1_compact" if compact else "bo_composer_type1"
         channels = spec.get("channels", [])
         if channels:
-            state[prefix + "_channel"] = str(channels[0])
+            state[prefix + "_channel"] = str(channels[-1])
+            state[prefix + "_channel__preferred"] = str(channels[-1])
         if spec["kind"] == "SWV trace overlay" and index in (1, 2):
-            if compact:
-                state.setdefault(prefix + "_manual_iterations", {})[str(index)] = {
-                    "channel": str(channels[0]), "iteration": int(spec["observation_iteration"])
-                }
-            else:
-                iterations = list(state.get(prefix + "_iterations", [1, 1]))
-                iterations = (iterations + iterations[-1:] * 2)[:2]
-                iterations[index-1] = int(spec["observation_iteration"])
-                state[prefix + "_iterations"] = iterations
-        if spec["kind"] == "Measured 2D map" and index >= 4:
+            if 'observation_iteration' in spec:
+                set_linked_trace_iteration(state, index, spec['observation_iteration'],
+                                           channels[0] if channels else state.get(prefix + '_channel', ''))
+        if spec["kind"] == "Measured 2D map" and index >= 4 and 'slice_value' in spec:
             planes = list(state.get(prefix + "_slice_values", []))
             if len(planes) > index-4:
                 planes[index-4] = spec["slice_value"]

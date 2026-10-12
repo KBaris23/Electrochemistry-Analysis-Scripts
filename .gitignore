@@ -41,6 +41,10 @@ bo_sessions/
 simulation_artifacts/
 analysis_outputs/
 analysis_sessions/
+# Session recipes/caches may contain private absolute paths; never publish them.
+*.analysis-session.json
+*.results.pkl.gz
+figure-workspaces-index.json
 figure_composer_presets.json.tmp
 bo_figure_set_g7_i47_refined/
 mini_bo_g7_i47
@@ -48,6 +52,21 @@ mini_bo_g7_i47
 # Locally rendered manuscript exports (source notes/configuration in paper/ stay tracked)
 paper/generated/
 paper/outputs/
+paper/.local_archive/
 
 # Local storage/research audit reports
 audit/
+
+# Machine-specific paper regeneration and publishing utilities (kept local)
+scripts/apply_journal_names.ps1
+scripts/audit_amp0_manual_response.py
+scripts/check_composer_channel_switching.py
+scripts/check_release_stack_candidates.py
+scripts/consolidate_journal_plots.py
+scripts/journal_followup.py
+scripts/journal_signal_on.py
+scripts/plan_journal_names.py
+scripts/publish_journal_additions.py
+scripts/publish_signal_on.py
+scripts/regenerate_validation_release.py
+scripts/release_titrations.py

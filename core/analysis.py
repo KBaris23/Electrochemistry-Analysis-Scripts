@@ -380,6 +380,8 @@ def correct_abrupt_baseline_jumps(
         "jump_correction_amplitudes_uA": np.array([], dtype=float),
         "jump_correction_sensitivity": float(sensitivity),
         "jump_correction_minimum_uA": float(minimum_jump_uA),
+        "jump_correction_unreliable": False,
+        "jump_correction_rejected_candidates": 0,
     }
     if values.size < max(2 * int(local_window) + 2, 12):
         return corrected, audit
@@ -391,6 +393,16 @@ def correct_abrupt_baseline_jumps(
     robust_sigma = max(1.4826 * mad, np.finfo(float).eps)
     threshold = max(float(minimum_jump_uA), float(sensitivity) * robust_sigma)
     candidates = np.flatnonzero(np.abs(diffs - median_diff) >= threshold)
+    # Repeated, closely spaced opposite edges describe pulses, not persistent
+    # offsets. Do not integrate them into an invented drifting baseline.
+    close_reversals = sum(
+        right - left <= window and diffs[left] * diffs[right] < 0
+        for left, right in zip(candidates[:-1], candidates[1:])
+    )
+    if close_reversals >= 6:
+        audit['jump_correction_unreliable'] = True
+        audit['jump_correction_rejected_candidates'] = len(candidates)
+        return corrected, audit
     offsets: list[tuple[int, float]] = []
     last_end = -1
     x = np.arange(values.size, dtype=float)
@@ -398,6 +410,9 @@ def correct_abrupt_baseline_jumps(
         # Adjacent candidates are normally the shoulders of one transient; a
         # genuine step needs clean support on each side.
         if index <= last_end or index < window or index + 1 + window > values.size:
+            continue
+        if np.any((np.abs(candidates - index) <= window) & (candidates != index)):
+            audit['jump_correction_rejected_candidates'] += 1
             continue
         left_x = x[index - window + 1:index + 1]
         right_x = x[index + 1:index + 1 + window]
@@ -412,6 +427,11 @@ def correct_abrupt_baseline_jumps(
         midpoint = float(index) + 0.5
         step = float(np.polyval(right_fit, midpoint) - np.polyval(left_fit, midpoint))
         if abs(step) < threshold:
+            continue
+        residual = max(np.max(np.abs(left_y - np.polyval(left_fit, left_x))),
+                       np.max(np.abs(right_y - np.polyval(right_fit, right_x))))
+        if residual > threshold * .5:
+            audit['jump_correction_rejected_candidates'] += 1
             continue
         corrected[index + 1:] -= step
         offsets.append((int(index), step))
@@ -614,9 +634,11 @@ def analyze_swv_arrays(
             "jump_correction_minimum_uA": float(jump_minimum_uA),
         })
     )
+    if jump_audit.get('jump_correction_unreliable'):
+        raise ValueError('Jump correction unsafe: repeated pulse-like transitions, not isolated baseline steps.')
     i_smooth = apply_smoothing(jump_corrected_current, smooth_window, smooth_polyorder) if smooth_window > 0 else jump_corrected_current.copy()
     wavelet_denoised_current = (
-        _wavelet_denoise_trace(i)
+        _wavelet_denoise_trace(jump_corrected_current)
         if (compute_wavelet_denoised_trace or use_wavelet_for_correction)
         else None
     )
