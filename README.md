@@ -168,9 +168,25 @@ streamlit run app.py
 
 Or launch it by double-clicking the file for your operating system:
 
-- Windows: `Open_SWV_App.cmd` or `launch_app_windows.bat` (both use the same
-  validated launcher)
+- Windows: `Open_SWV_App.cmd`
 - macOS: `launch_app_mac.command`
+
+### Windows: exact steps
+
+1. Keep the downloaded repository folder together; do not copy only the CMD.
+2. Double-click `Open_SWV_App.cmd`.
+3. On the first run, leave the terminal open while it creates the managed
+   64-bit environment and installs the requirements. This can take several
+   minutes, especially while Kaleido downloads.
+4. Wait for `Python ... 64-bit; dependencies ready.` and for the browser to
+   open at `http://localhost:8501`.
+5. On later runs, double-click the same CMD. The existing environment is
+   checked and reused; your figure presets, analysis sessions and raw data are
+   not recreated or deleted.
+
+If startup reports that no compatible Python exists, install 64-bit Python
+3.10, 3.11, 3.12 or 3.13, then double-click the CMD again. Do not point the
+launcher at a 32-bit `.venv` inside the repository.
 
 The launchers keep their managed virtual environments outside the GitHub
 checkout. Windows uses
