@@ -2040,6 +2040,7 @@ def _paper_response_panel(
         ylabel='Change in Peak Current (uA)' if change else 'Peak Current (uA)',
         vlines=vlines, vlines_by_channel=vlines_by_channel,
         scan_range=scan_range, xlabel='SWV Measurement Number',
+        measurement_start_at_one=bool(st.session_state.get("paper_titration_measurements_from_one", True)),
         channel_colors=colors,
         channel_labels={optimized: optimized_label, manual: unoptimized_label},
     )
@@ -2361,6 +2362,8 @@ def _apply_paper_recipe(payload: dict) -> None:
     """Restore source, analysis, titration, and layout controls from metadata."""
     recipe = payload["recipe"]
     _clear_loaded_analysis_state()
+    st.session_state.pop("paper_titration_render", None)
+    st.session_state.pop("paper_titration_render_signature", None)
     for key, value in recipe.get("analysis_state", {}).items():
         if isinstance(key, str) and key.startswith("swv_"):
             st.session_state[key] = copy.deepcopy(value)
@@ -7478,6 +7481,7 @@ if view == "Paper Figures":
             "Figure type",
             [
                 "Type 3 - SWV and titration response",
+                "Type 3A - Cross-channel signal-on/off",
                 "Type 3B - Signal-on/off shared Langmuir",
                 "Type 3C - Signal-on/off paired Langmuirs",
                 "Type 4 - Concentration validation",
@@ -7487,10 +7491,12 @@ if view == "Paper Figures":
             help=(
                 "Type 3B creates two fixed rows (signal-on and signal-off) and one "
                 "shared optimized-only Langmuir panel spanning the fourth column. "
-                "Type 3C instead gives each row its own optimized-vs-unoptimized fit."
+                "Type 3C instead gives each row its own optimized-vs-unoptimized fit. "
+                "Type 3A permits different physical channels and separate manual references "
+                "for the ON and OFF rows, with a shared fit panel."
             ),
         )
-        is_directional_type3 = figure_type.startswith(("Type 3B", "Type 3C"))
+        is_directional_type3 = figure_type.startswith(("Type 3A", "Type 3B", "Type 3C"))
         has_paired_directional_langmuirs = figure_type.startswith("Type 3C")
         if figure_type.startswith("Type 4"):
             with st.expander("Concentration validation layout", expanded=True):
@@ -7662,7 +7668,6 @@ if view == "Paper Figures":
                 "still use each row's Display start/end range. Fits remain controlled "
                 "separately by Fit only display range and the selected concentration steps."
             ),
-            disabled=is_directional_type3,
         )
         with st.expander("Panel layout, axes, and curve style", expanded=True):
             layout_cols = st.columns(4)
@@ -7744,7 +7749,48 @@ if view == "Paper Figures":
         from core.paper_titration import restore_method_selection
         paper_rows = 1
         directional_selection = None
-        if is_directional_type3:
+        if figure_type.startswith("Type 3A"):
+            st.info("Choose the physical channel and manual reference independently for each row. "
+                    "The shared Langmuir panel shows optimized ON, OFF, and matched-dose ON minus OFF.")
+            directional_rows = []
+            for role, label in (("on", "Signal-on"), ("off", "Signal-off")):
+                cols = st.columns([1.2, 2.2, 2.2])
+                row_physical = cols[0].selectbox(
+                    f"{label} physical channel", physical_channels,
+                    key=f"paper_titration_cross_{role}_physical",
+                )
+                options = sorted({row.get("channel") for row in titration_results
+                                  if str(row.get("original_channel", row.get("channel"))) == str(row_physical)},
+                                 key=_channel_display_sort_key)
+                restore_method_selection(st.session_state, f"paper_titration_cross_{role}_optimized", options)
+                optimized = cols[1].selectbox(
+                    f"{label} optimized method", options,
+                    key=f"paper_titration_cross_{role}_optimized", format_func=_swv_settings_channel_label,
+                )
+                references = [method for method in options if method != optimized]
+                restore_method_selection(st.session_state, f"paper_titration_cross_{role}_manual", references)
+                reference = cols[2].selectbox(
+                    f"{label} manual/reference method", references,
+                    key=f"paper_titration_cross_{role}_manual", format_func=_swv_settings_channel_label,
+                ) if references else None
+                directional_rows.append((row_physical, optimized, reference))
+            physical, signal_on, manual = directional_rows[0]
+            off_physical, signal_off, off_manual = directional_rows[1]
+            scans = [float(row["scan_number"]) for row in titration_results
+                     if row.get("channel") in {signal_on, signal_off, manual, off_manual}
+                     and row.get("scan_number") is not None]
+            if manual is None or off_manual is None or signal_on == signal_off or not scans:
+                st.warning("Choose distinct ON and OFF methods and a manual reference for each row.")
+            else:
+                scan_min, scan_max = int(min(scans)), int(max(scans))
+                cols = st.columns(2)
+                start = int(cols[0].number_input("Display start", scan_min, scan_max, value=scan_min,
+                                                key="paper_titration_directional_start"))
+                end = int(cols[1].number_input("Display end", scan_min, scan_max, value=scan_max,
+                                              key="paper_titration_directional_end"))
+                directional_selection = (physical, signal_on, signal_off, manual,
+                                         (min(start, end), max(start, end)), off_physical, off_manual)
+        elif is_directional_type3:
             st.info(
                 "This layout always has two rows: manual vs optimized signal-on, then "
                 "manual vs optimized signal-off. "
@@ -7812,7 +7858,8 @@ if view == "Paper Figures":
                     "Display end", scan_min, scan_max, value=scan_max,
                     key="paper_titration_directional_end",
                 ))
-                directional_selection = (physical, signal_on, signal_off, manual, (min(start, end), max(start, end)))
+                directional_selection = (physical, signal_on, signal_off, manual,
+                                         (min(start, end), max(start, end)), physical, manual)
         else:
             paper_rows = int(st.number_input(
                 "Comparison rows", 1, 6, value=1, key="paper_titration_rows"
@@ -7975,20 +8022,22 @@ if view == "Paper Figures":
             paper_y_label = 'Change in Peak Current (uA)' if paper_response_change else 'Peak Current (uA)'
             paper_fit_baseline = 'preceding_buffer' if paper_response_change else titration_baseline_mode
             if is_directional_type3:
-                physical, signal_on, signal_off, manual, display_range = directional_selection
+                physical, signal_on, signal_off, manual, display_range, off_physical, off_manual = directional_selection
                 directional_colors = {
                     manual: "#8ecae6",
+                    off_manual: "#8ecae6",
                     signal_on: "#1464a0",
                     signal_off: "#d62728",
                 }
 
-                def directional_trace(method, direction_label, colormap):
+                def directional_trace(method, direction_label, colormap, row_physical):
                     rows = [
                         row for row in paper_source_results
                         if row.get("channel") == method
-                        and display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1]
+                        and (st.session_state.get("paper_titration_swv_full_range", False)
+                             or display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1])
                     ]
-                    title = f"Channel {physical} {direction_label} SWVs"
+                    title = f"Channel {row_physical} {direction_label} SWVs"
                     rows = prepare_titration_swv_traces(
                         rows, peak_region=paper_trace_region.startswith("Corrected peak"),
                         zero_anchors=paper_zero_anchors,
@@ -8006,10 +8055,10 @@ if view == "Paper Figures":
                         show_anchors=True, show_zero_baseline=True,
                     )
 
-                def directional_response(method, direction_label):
+                def directional_response(method, direction_label, reference, row_physical):
                     response = _paper_response_panel(
-                        paper_metric_results, optimized=method, manual=manual, physical=physical,
-                        colors={method: '#1464a0', manual: '#8ecae6'},
+                        paper_metric_results, optimized=method, manual=reference, physical=row_physical,
+                        colors={method: '#1464a0', reference: '#8ecae6'},
                         vlines=paper_display_vlines,
                         vlines_by_channel=paper_display_vlines_by_channel,
                         scan_range=display_range,
@@ -8017,20 +8066,20 @@ if view == "Paper Figures":
                     )
                     if response is not None and response.axes:
                         response.axes[0].set_title(
-                            f"Channel {physical} {direction_label.title()} Titration Response"
+                            f"Channel {row_physical} {direction_label.title()} Titration Response"
                         )
                     return response
 
                 row_figures = [
                     [
-                        directional_trace(manual, "Unoptimized", "Greys"),
-                        directional_trace(signal_on, "Optimized Signal-On", "Blues"),
-                        directional_response(signal_on, "signal-on"),
+                        directional_trace(manual, "Unoptimized", "Greys", physical),
+                        directional_trace(signal_on, "Optimized Signal-On", "Blues", physical),
+                        directional_response(signal_on, "signal-on", manual, physical),
                     ],
                     [
-                        directional_trace(manual, "Unoptimized", "Greys"),
-                        directional_trace(signal_off, "Optimized Signal-Off", "Reds"),
-                        directional_response(signal_off, "signal-off"),
+                        directional_trace(off_manual, "Unoptimized", "Greys", off_physical),
+                        directional_trace(signal_off, "Optimized Signal-Off", "Reds", off_physical),
+                        directional_response(signal_off, "signal-off", off_manual, off_physical),
                     ],
                 ]
                 if has_paired_directional_langmuirs:
@@ -8086,7 +8135,8 @@ if view == "Paper Figures":
                         channels=[signal_on, signal_off],
                         vlines_by_channel=titration_vlines_by_channel,
                         scan_range=(display_range if paper_fit_display_range else None),
-                        title=langmuir_title_template.replace("{channel}", str(physical)),
+                        title=langmuir_title_template.replace("{channel}",
+                              str(physical) if physical == off_physical else f"{physical} ON / {off_physical} OFF"),
                         ylabel=paper_y_label,
                         edge_trim_fraction=titration_edge_trim_fraction,
                         concentration_unit=titration_concentration_unit,
@@ -8394,6 +8444,7 @@ if view == "Paper Figures":
             selected_methods.update(item[2] for item in comparisons)
             if directional_selection:
                 selected_methods.add(directional_selection[3])
+                selected_methods.add(directional_selection[6])
             method_quality = {}
             for method in sorted(selected_methods, key=_channel_display_sort_key):
                 method_rows = [row for row in titration_results if row.get("channel") == method]

@@ -58,10 +58,42 @@ def test_recovery_recipe_is_not_presented_as_a_named_workspace(tmp_path):
 def test_button_events_are_not_saved_or_restored(tmp_path):
     recipe, _ = save_workspace(tmp_path, 'buttons', {
         'swv_bo_config_load': False, 'FormSubmitter:test-Apply': True,
+        'bo_real_update_plots': False, 'bo_rescore_test_reset_controls': False,
+        'bo_synced_gifs_5_50_350_button': False,
+        'bo_composer_stack_spacing_reset_3': False,
+        'paper_type3_titration_metadata': False,
+        'paper_type3_titration_open_composer': False,
+        'paper_type3_titration_png': False,
         'swv_double_correction': True,
     })
     payload, _ = load_workspace(recipe)
     assert payload['state'] == {'swv_double_correction': True}
+
+
+def test_legacy_paper_uploader_is_not_restored(tmp_path):
+    import json
+    path = tmp_path / 'legacy.analysis-session.json'
+    path.write_text(json.dumps({
+        'schema_version': 1,
+        'state': {'paper_recipe_upload': None, 'paper_recipe_apply': False,
+                  'paper_titration_type': 'Type 3A - Cross-channel signal-on/off'},
+    }))
+    payload, _ = load_workspace(path)
+    assert payload['state'] == {'paper_titration_type': 'Type 3A - Cross-channel signal-on/off'}
+
+
+def test_selected_scorer_survives_fresh_page_initialization(tmp_path):
+    import hashlib
+    root = str(tmp_path.resolve())
+    token = hashlib.sha1(root.encode('utf-8')).hexdigest()
+    profile = {'id': 'pairwise', 'scoring': {'weight': 1}, 'results': []}
+    path, _ = save_workspace(tmp_path, 'scored', {
+        'analysis_mode': 'BO Session', 'bo_session_folder': root,
+        f'bo_rescore_{token[:12]}_active_profile': 'pairwise',
+        f'bo_rescore_profiles_{token[:16]}': {'pairwise': profile},
+    })
+    payload, _ = load_workspace(path)
+    assert payload['state']['bo_saved_figure_scoring'] == profile
 
 
 def test_local_directory_is_not_the_synced_checkout(tmp_path, monkeypatch):

@@ -26,6 +26,31 @@ def request():
     return FigureExports(render, viewer._composer_figure_bytes, metadata, 120, 'figure'), calls
 
 
+def test_metadata_restores_selected_scoring_profile(monkeypatch):
+    profile = {'id': 'pairwise', 'scoring': {'weight': 1}, 'results': []}
+    metadata = viewer._composer_metadata(
+        {'root': 'source', 'active_rescore_profile': profile},
+        {'state': {'bo_composer_count': 1}, 'panels': []},
+    )
+    state = {}
+    monkeypatch.setattr(viewer.st, 'session_state', state)
+    viewer._composer_apply_config(metadata['config'])
+    assert state['bo_saved_figure_scoring'] == profile
+    viewer._composer_apply_config({'state': {}, 'rescore_profile': None})
+    assert state['bo_saved_figure_scoring'] is None
+
+
+def test_composer_metadata_never_restores_stack_button_events(monkeypatch):
+    state = {'bo_composer_count': 5, 'bo_composer_stack_spacing_reset_3': False}
+    monkeypatch.setattr(viewer.st, 'session_state', state)
+    assert 'bo_composer_stack_spacing_reset_3' not in viewer._composer_widget_state(5)
+    state.clear()
+    viewer._composer_apply_config({'state': {
+        'bo_composer_count': 5, 'bo_composer_stack_spacing_reset_3': False}})
+    assert state['bo_composer_count'] == 5
+    assert 'bo_composer_stack_spacing_reset_3' not in state
+
+
 def test_export_is_lazy_and_all_formats_embed_same_metadata():
     exporter, calls = request()
     assert calls == []

@@ -31418,6 +31418,7 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_active_panel",
     "bo_composer_peak_aligned_selections",
     "bo_composer_find_peak_example",
+    "bo_composer_stack_spacing_reset_",
     "bo_composer_move_",
 )
 
@@ -31494,7 +31495,10 @@ def _composer_metadata(
             "session_id": str(state.get("session_id") or ""),
             "group_id": session.get("selected_group_id"),
         },
-        "config": dict(config),
+        "config": {
+            **dict(config),
+            "rescore_profile": copy.deepcopy(session.get("active_rescore_profile")),
+        },
     }
 
 
@@ -31534,6 +31538,10 @@ def _composer_metadata_from_upload(data: bytes, file_name: str) -> dict[str, Any
 
 def _composer_apply_config(config: Mapping[str, Any]) -> None:
     """Stage saved widget values before composer widgets are constructed."""
+    if "rescore_profile" in config:
+        # Apply on the next app run, before the scoring selector is built.
+        # None explicitly restores original recorded scoring.
+        st.session_state["bo_saved_figure_scoring"] = copy.deepcopy(config["rescore_profile"])
     for key in list(st.session_state):
         if str(key).startswith('bo_composer_editor_'):
             del st.session_state[key]
@@ -32519,24 +32527,66 @@ def _paper_parameter_sweep_center_preset(
     real_channels: Sequence[str] = (),
     trace_channels: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Type 1C: centered cubes with traces and slice maps at the right."""
+    """Type 1C: slice maps left, one combined cube, and SWVs right.
+
+    Type 1A/1B use two copies of the cube so one can carry example points and
+    the other can carry slice planes.  Type 1C deliberately combines those
+    overlays on a single cube.  Its wider canvas preserves the physical panel
+    sizes from the 9 x 10 inch compact Type 1 layouts.
+    """
     preset = copy.deepcopy(_paper_parameter_sweep_comparison_preset(
         observations, real_channels, trace_channels, mirrored=False,
     ))
     preset["name"] = "Type 1C - Sweep comparison (cube center)"
-    rects = (
-        (.24, .535, .52, .42), (.79, .775, .20, .17),
-        (.79, .535, .20, .17), (.24, .045, .52, .42),
-        (.79, .285, .20, .21), (.79, .035, .20, .21),
-    )
+
     config = preset.setdefault("config", {})
-    state = config.setdefault("state", {})
+    old_state = config.setdefault("state", {})
+    # Keep cube 0 and the two SWVs, discard the duplicate cube 3, and move the
+    # old map panels 4/5 into slots 3/4.  Copy every panel-scoped option, not
+    # merely its kind and rectangle, so saved formatting remains intact.
+    index_map = {0: 0, 1: 1, 2: 2, 4: 3, 5: 4}
+    state: dict[str, Any] = {}
+    for key, value in old_state.items():
+        match = re.search(r"_(\d+)$", str(key))
+        if match and int(match.group(1)) <= 5:
+            old_index = int(match.group(1))
+            if old_index in index_map:
+                state[
+                    f"{key[:match.start(1)]}{index_map[old_index]}"
+                ] = copy.deepcopy(value)
+        else:
+            state[key] = copy.deepcopy(value)
+
+    # Type 1A's 9-inch width gives a 5.4-inch cube and 2.61-inch support
+    # panels.  The normalized widths below reproduce those exact dimensions
+    # on the wider 14-inch Type 1C canvas.
+    state["bo_composer_aspect"] = "Sweep wide workspace (14 x 10 in)"
+    state["bo_composer_count"] = 5
+    state["bo_composer_real_slice_values_0"] = list(
+        state.get("bo_composer_type1_compact_slice_values", [])
+    )[:2]
+    rects = (
+        (.3071428571, .29, .3857142857, .42),
+        (.7785714286, .49, .1864285714, .17),
+        (.7785714286, .30, .1864285714, .17),
+        (.035, .50, .1864285714, .21),
+        (.035, .28, .1864285714, .21),
+    )
     for index, rect in enumerate(rects):
         for field, value in zip(("left", "bottom", "width", "height"), rect):
             state[f"bo_composer_{field}_{index}"] = value
-    panels = config.get("panels") or []
-    for index, panel in enumerate(panels[:len(rects)]):
+    config["state"] = state
+
+    old_panels = list(config.get("panels") or [])
+    panels = [copy.deepcopy(old_panels[index]) for index in index_map if index < len(old_panels)]
+    for index, panel in enumerate(panels):
         panel["rect"] = list(rects[index])
+        if index == 0:
+            panel["slice_sweep_values"] = list(
+                state.get("bo_composer_type1_compact_slice_values", [])
+            )[:2]
+            panel["show_example_markers"] = True
+    config["panels"] = panels
     return preset
 
 
@@ -34717,6 +34767,7 @@ def _composer_build_hyperparameter_plot(
 
 COMPOSER_CANVAS_SIZES = {
     "Sweep workspace (9 x 10 in)": (9.0, 10.0),
+    "Sweep wide workspace (14 x 10 in)": (14.0, 10.0),
     # Presentation canvases (large; text is scaled down when placed in a paper).
     "4:3": (12, 9),
     "16:9": (12.8, 7.2),
@@ -34879,6 +34930,12 @@ def _composer_scale_axes_marks(
 
 def _composer_swv_header(observation: Mapping[str, Any], role: str = "") -> str:
     """Return a compact, publication-readable waveform identity line."""
+    if role:
+        # Waveform parameters remain in the observation/recipe. A long header
+        # forces fit_panel_bounds to shrink the trace axes around a fixed legend.
+        label = 'Signal-Off' if 'signal-off' in role.lower() else (
+            'Signal-On' if 'signal-on' in role.lower() else role.title())
+        return f"{label} | Iteration {observation.get('iteration', '?')}"
     params = observation.get("params") or {}
     frequency = _finite_float(params.get("frequency"))
     amplitude = _finite_float(params.get("amplitude"))
@@ -36754,8 +36811,12 @@ def _render_figure_composer(
     # choices persist and remain synchronized with the cube and trace panels.
     if (
         st.session_state.get("bo_composer_type1_compact_linked_controls")
-        and panel_count == 6
+        and panel_count in (5, 6)
     ):
+        centered_type1 = panel_count == 5
+        slice_cube_index = 0 if centered_type1 else 3
+        cube_indices = (0,) if centered_type1 else (0, 3)
+        map_indices = (3, 4) if centered_type1 else (4, 5)
         iteration_options = sorted({
             int(item.get("iteration")) for item in observations
             if item.get("iteration") is not None
@@ -36827,8 +36888,8 @@ def _render_figure_composer(
         highlighted = [value for value in (on_iteration, off_iteration) if value is not None]
         st.session_state["bo_composer_real_highlight_iterations_0"] = highlighted
         st.session_state["bo_composer_real_highlight_labels_0"] = [f"Iter {on_iteration}", f"Iter {off_iteration}"]
-        st.session_state["bo_composer_real_slice_values_3"] = map_slices
-        for index in (0, 3):
+        st.session_state[f"bo_composer_real_slice_values_{slice_cube_index}"] = map_slices
+        for index in cube_indices:
             st.session_state[f"bo_composer_measured_channels_{index}"] = [linked_channel]
         for index, iteration in zip((1, 2), (on_iteration, off_iteration)):
             if iteration is not None:
@@ -36839,7 +36900,7 @@ def _render_figure_composer(
             st.session_state.setdefault(f"bo_composer_trace_key_{index}", "corrected_current")
         st.session_state["bo_composer_trace_role_1"] = on_role
         st.session_state["bo_composer_trace_role_2"] = off_role
-        for offset, (index, slice_value) in enumerate(zip((4, 5), map_slices)):
+        for offset, (index, slice_value) in enumerate(zip(map_indices, map_slices)):
             st.session_state[f"bo_composer_real_channels_{index}"] = [linked_channel]
             st.session_state[f"bo_composer_real_slice_value_{index}"] = slice_value
             st.session_state[f"bo_composer_border_color_{index}"] = to_hex(
@@ -37409,7 +37470,7 @@ def _render_figure_composer(
                             ).dropna().tolist()
                         })
                         linked_examples = index == 0 and (
-                            (st.session_state.get('bo_composer_type1_compact_linked_controls') and panel_count == 6)
+                            (st.session_state.get('bo_composer_type1_compact_linked_controls') and panel_count in (5, 6))
                             or (st.session_state.get('bo_composer_type1_linked_controls') and panel_count == 8))
                         if linked_examples:
                             spec['highlight_iterations'] = _composer_linked_example_controls(iteration_options)
@@ -38118,6 +38179,7 @@ def _render_figure_composer(
         'files': source_versions, 'captures': {key: hashlib.sha256(value.get('png_bytes') or b'').hexdigest()
                                               for key, value in capture_snapshot.items()},
         'plot_settings': plot_settings,
+        'scoring': session.get('active_rescore_profile'),
     })
     export_request = st.session_state.get(export_key)
     if not export_request or export_request['signature'] != export_signature:
@@ -38375,6 +38437,16 @@ def render_bo_session_app() -> None:
             if str(state_key).startswith("bo_rescore_"):
                 st.session_state.pop(state_key, None)
         st.session_state[rescore_page_marker] = True
+    if "bo_saved_figure_scoring" in st.session_state:
+        saved_profile = st.session_state.pop("bo_saved_figure_scoring")
+        token = hashlib.sha1(str(source_session["root"]).encode("utf-8")).hexdigest()[:12]
+        profile_id = "original"
+        if isinstance(saved_profile, dict) and saved_profile.get("id"):
+            profile_id = str(saved_profile["id"])
+            profiles = _load_rescore_profiles(source_session)
+            profiles[profile_id] = copy.deepcopy(saved_profile)
+            _store_rescore_profiles(source_session, profiles)
+        st.session_state[f"bo_rescore_{token}_active_profile"] = profile_id
     rescore_profiles = _load_rescore_profiles(source_session)
     rescore_root_token = hashlib.sha1(
         str(source_session["root"]).encode("utf-8")

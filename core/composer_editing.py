@@ -11,7 +11,7 @@ def set_linked_trace_iteration(state, index, iteration, channel):
     if index not in (1, 2):
         return
     count = int(state.get('bo_composer_count', 0))
-    if state.get('bo_composer_type1_compact_linked_controls') and count == 6:
+    if state.get('bo_composer_type1_compact_linked_controls') and count in (5, 6):
         state.setdefault('bo_composer_type1_compact_manual_iterations', {})[str(index)] = {
             'channel': str(channel), 'iteration': int(iteration),
         }
@@ -196,7 +196,7 @@ def apply_source_edit(state, edit):
         channel = str(spec['channels'][-1])
         state['bo_composer_validation_channel'] = channel
         state['bo_composer_validation_channel__preferred'] = channel
-    compact = state.get("bo_composer_type1_compact_linked_controls") and count == 6
+    compact = state.get("bo_composer_type1_compact_linked_controls") and count in (5, 6)
     classic = state.get("bo_composer_type1_linked_controls") and count == 8
     if compact or classic:
         prefix = "bo_composer_type1_compact" if compact else "bo_composer_type1"
@@ -208,10 +208,11 @@ def apply_source_edit(state, edit):
             if 'observation_iteration' in spec:
                 set_linked_trace_iteration(state, index, spec['observation_iteration'],
                                            channels[0] if channels else state.get(prefix + '_channel', ''))
-        if spec["kind"] == "Measured 2D map" and index >= 4 and 'slice_value' in spec:
+        map_start = 3 if compact and count == 5 else 4
+        if spec["kind"] == "Measured 2D map" and index >= map_start and 'slice_value' in spec:
             planes = list(state.get(prefix + "_slice_values", []))
-            if len(planes) > index-4:
-                planes[index-4] = spec["slice_value"]
+            if len(planes) > index-map_start:
+                planes[index-map_start] = spec["slice_value"]
                 state[prefix + "_slice_values"] = list(dict.fromkeys(planes))
     state["bo_composer_active_panel"] = index
     # Source changes are cheap state edits. Rebuilding every panel here made

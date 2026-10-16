@@ -27,6 +27,18 @@ def test_partial_map_edit_does_not_require_or_change_slice():
     assert state['bo_composer_type1_compact_slice_values'] == [.004, .007]
 
 
+def test_type1c_edits_preserve_selected_points_and_both_planes():
+    state = {'bo_composer_count': 5, 'bo_composer_type1_compact_linked_controls': True,
+             'bo_composer_type1_compact_channel': '2',
+             'bo_composer_type1_compact_slice_values': [.004, .007]}
+    assert apply_source_edit(state, {'index': 1, 'spec': {
+        'kind': 'SWV trace overlay', 'channels': ['2'], 'observation_iteration': 87}})
+    assert state['bo_composer_type1_compact_manual_iterations']['1'] == {'channel': '2', 'iteration': 87}
+    assert apply_source_edit(state, {'index': 3, 'spec': {
+        'kind': 'Measured 2D map', 'slice_value': .001}})
+    assert state['bo_composer_type1_compact_slice_values'] == [.001, .007]
+
+
 def test_classic_linked_iteration_preserves_other_example():
     from core.composer_editing import set_linked_trace_iteration
     state = {'bo_composer_count': 8, 'bo_composer_type1_linked_controls': True,

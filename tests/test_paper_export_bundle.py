@@ -10,6 +10,7 @@ import zipfile
 from zipfile import ZipFile
 
 import matplotlib.pyplot as plt
+import pytest
 from PIL import Image
 
 def app_functions():
@@ -22,21 +23,30 @@ def app_functions():
     return namespace
 
 
-def test_paper_exports_include_svg_and_final_metadata():
+@pytest.mark.parametrize('include_vector', [False, True])
+def test_paper_exports_include_final_metadata_and_optional_vectors(include_vector):
     api = app_functions()
     downloads = {}
     class Column:
         def download_button(self, label, data, **kwargs):
             downloads[kwargs['file_name']] = data
-    api['st'] = SimpleNamespace(columns=lambda n: [Column() for _ in range(n)], pyplot=lambda *a, **k: None)
+    api['st'] = SimpleNamespace(
+        session_state={'paper_titration_export_dpi': 150, 'paper_titration_export_vector': include_vector},
+        columns=lambda n: [Column() for _ in range(n)], pyplot=lambda *a, **k: None)
     fig, ax = plt.subplots(figsize=(2, 1))
     ax.plot([0, 1], [0, 1])
     api['_paper_figure_downloads'](fig, 'example', {'recipe': {'correction': True}})
     assert {'example.png', 'example.pdf', 'example.svg', 'example.metadata.json', 'example.zip'} <= downloads.keys()
     with ZipFile(BytesIO(downloads['example.zip'])) as archive:
-        assert set(archive.namelist()) == {'example.png', 'example.pdf', 'example.svg', 'example.metadata.json'}
+        expected = {'example.png', 'example.metadata.json'}
+        if include_vector:
+            expected.update({'example.pdf', 'example.svg'})
+        assert set(archive.namelist()) == expected
         assert archive.testzip() is None
     with Image.open(BytesIO(downloads['example.png'])) as image:
         assert json.loads(image.info['SWV Figure Metadata'])['recipe']['correction'] is True
-    assert b'correction' in downloads['example.svg']
-    assert b'correction' in downloads['example.pdf']
+    if include_vector:
+        assert b'correction' in downloads['example.svg']
+        assert b'correction' in downloads['example.pdf']
+    else:
+        assert downloads['example.svg'] == downloads['example.pdf'] == b''

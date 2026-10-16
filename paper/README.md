@@ -1,20 +1,45 @@
 # Paper figures: real-data runbook
 
-Updated 15 October 2026. Order: **sweep, BO validation, titration, concentration diagnostics**. These are preliminary figures, not publication approval. Raw data were not modified.
+Updated 16 October 2026. Order: **sweep, BO validation, titration, concentration diagnostics**. These are preliminary figures, not publication approval. Raw data were not modified.
 
-## Nanoporous NP: tomorrow checklist
+## Nanoporous NP: native application workflow
 
-Final review files are in `%USERPROFILE%\Downloads\Figures materials for the paper\Results\journal_plots\np`. Start with [the NP source audit and method map](generated/journal_plots/np_rebuilt_20261015/NP_DATA_ANALYSIS.md). The three prepared sessions are **`np sweep`**, **`np validation`**, and **`np titration`** under **Saved analysis sessions**.
+Final review folder:
+`%USERPROFILE%\Downloads\Figures materials for the paper\Results\journal_plots\np`.
+See [Recreating figures](../docs/recreating-figures.md) for exact session and
+metadata instructions. Every required template is available in the application.
 
-1. **Sweep:** open `np sweep` → **Figure Composer**. Compare `np_sweep_type1b_cube_left` and `np_sweep_type1c_cube_center`. Keep channel 2, signal-on measurement **87**, signal-off **80**, and **raw corrected / unsmoothed corrected** SWVs. Only this sweep was rescored. Use **Displayed voltage range → Custom voltage range** if a trace needs cropping.
-2. **BO validation:** open `np validation` → Type 2. It is group/channel **5**. If a bad run drives a negative-looking trace, use **Exclude outlier iterations from Type 2**; this is reversible and never deletes source data.
-3. **Titration:** open `np titration` → **Paper Figures → Type 3 – SWV and titration response** → **Generate paper figure**. Four rows compare optimized/manual methods on channels **2–5**, from `new_survey_20260813_150240`. Each row uses source measurements **41–160**: buffer, **80, 160, 320, 640, 1280, 2560 µM**, alternating with buffer. **Number displayed measurements from 1** gives 1–120 while preserving missing-scan gaps. **Fit only display range ON** excludes the earlier 40 µM blocks and later 5120 µM block. Leave **Ignore the first target response OFF** here, since the row limits already exclude the initial responses. SWV overlays retain all analyzed measurements via **Use the full analyzed range**.
-4. **Concentration check:** in the same session choose **Type 4**, canvas width **10 in**, row height **3.1 in**, then generate. The same channel/method/range selections apply. This is a calibration diagnostic, not held-out validation. Keep extreme filtering OFF.
-5. **Edit/export:** all controls are in the software; no reconstruction script is required. Use **Panel layout, axes, and curve style** or **Edit source panels in Figure Composer** (up to 24 panels). Keep **Export PNG DPI = 150** and **Include PDF and SVG exports OFF** for this review. Save using the same three session names.
+| Figure | Saved session | Selection |
+|---|---|---|
+| Type 1C sweep | `np_sweep_type1c` | Channel 2; SWVs 87/80; 4/7 mV slices; one cube with points and planes |
+| Type 2 validation | `np_validation` | Group/channel 5; recorded optimization data |
+| Type 3 titration | `np_titration` | Optimized/manual pairs on channels 2–5 |
+| Type 3A ON/OFF | `np_titration_type3a` | Channel 5 ON and channel 3 OFF, each with its own manual reference |
+| Type 4 concentration | `np_titration_type4` | Same four-channel titration calibration |
 
-New app-generated PNGs contain the recipe. Upload one under **Paper Figures → Load figure recipe → Load recipe into analyzer**, run analysis, then generate. Keep source files available. Only the sweep is rescored; validation/titration keep their recorded data. Type 2 defaults to **Corrected peak bracket**; use the reversible outlier picker only for traces you have reviewed. Negative signal-off responses are valid and must remain negative.
+For sweep/validation open **Figure Composer** and render/export. For titration
+open **Paper Figures** and click **Generate paper figure**. Fits and responses use
+source measurements **41–160**, displayed as **1–120**: buffer alternating with
+**80, 160, 320, 640, 1280, 2560 µM**. SWV overlays retain the full analyzed range.
+Extreme filtering and **Ignore the first target response** stay off. Type 4 is a
+calibration diagnostic, not held-out validation.
 
-Restart the app once to load the updated templates. For an older Type 2 session, load the built-in preset again to adopt the new bracket default. Older script-generated figures/recipes are superseded by these app-generated outputs. The historical sections below describe earlier releases.
+Type 3A's shared panel contains both baseline-referenced Langmuir fits and
+matched-dose ON-minus-OFF values. The difference is descriptive, not a third
+independently fitted curve. Negative signal-off values remain negative.
+
+Use **150-DPI PNG plus metadata** for this review; leave PDF/SVG off. Type 1C now
+renders its SWVs from numeric source traces through the application. The raster
+fallback and incorrect copies have been retired. Scoring profiles, selected
+points, slices, methods, and layout are recorded in metadata and saved sessions.
+
+Session copies are in `paper/generated/np_sessions/`; active sessions are in
+`%LOCALAPPDATA%\Electrochemistry Analysis Scripts\analysis_sessions`.
+Keep the source volume connected for reanalysis. Metadata restores settings; a
+session and its trusted cache restore the analyzed workspace. Neither replaces
+the original inputs. Raw data, caches, and local recipes are excluded from Git.
+
+The following sections document earlier releases and historical figure names.
 
 ## 1. Open the generated figures
 

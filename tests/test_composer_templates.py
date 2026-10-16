@@ -579,6 +579,48 @@ def test_compact_sweep_comparison_presets_are_mirrored_and_directional():
     assert normal["bo_composer_bottom_0"] == mirrored["bo_composer_bottom_0"]
 
 
+def test_type1c_uses_one_combined_cube_between_slices_and_swvs():
+    observations = [
+        {"iteration": index, "params": {"step_potential": step}}
+        for index, step in enumerate((.001, .004, .007, .010), 1)
+    ]
+    reference = viewer._paper_parameter_sweep_comparison_preset(
+        observations, ["5"], ["5"], mirrored=False,
+    )["config"]["state"]
+    centered = viewer._paper_parameter_sweep_center_preset(
+        observations, ["5"], ["5"],
+    )["config"]["state"]
+
+    assert centered["bo_composer_count"] == 5
+    assert [centered[f"bo_composer_kind_{index}"] for index in range(5)] == [
+        "Measured 3D tensor",
+        "SWV trace overlay",
+        "SWV trace overlay",
+        "Measured 2D map",
+        "Measured 2D map",
+    ]
+    assert centered["bo_composer_real_slice_values_0"] == [.004, .007]
+    assert "bo_composer_real_slice_values_3" not in centered
+    cube_left = centered["bo_composer_left_0"]
+    cube_right = cube_left + centered["bo_composer_width_0"]
+    assert all(
+        centered[f"bo_composer_left_{index}"]
+        + centered[f"bo_composer_width_{index}"] < cube_left
+        for index in (3, 4)
+    )
+    assert all(centered[f"bo_composer_left_{index}"] > cube_right for index in (1, 2))
+    assert centered["bo_composer_aspect"] == "Sweep wide workspace (14 x 10 in)"
+    # Physical panel dimensions match Type 1A even though Type 1C is wider.
+    assert centered["bo_composer_width_0"] * 14 == pytest.approx(
+        reference["bo_composer_width_0"] * 9
+    )
+    assert centered["bo_composer_width_1"] * 14 == pytest.approx(
+        reference["bo_composer_width_1"] * 9
+    )
+    assert centered["bo_composer_height_1"] == reference["bo_composer_height_1"]
+    assert centered["bo_composer_height_3"] == reference["bo_composer_height_4"]
+
+
 def test_compact_sweep_defines_signal_on_off_as_selected_channel_q_extremes():
     observations = [
         {

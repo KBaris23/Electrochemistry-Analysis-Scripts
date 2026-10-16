@@ -42,6 +42,7 @@ def test_paper_studio_channels_and_methods_follow_all_ten_channels(figure_type):
     block = textwrap.dedent(source[start:end])
     setup = f'''
 import streamlit as st
+figure_type = {figure_type!r}
 is_directional_type3 = {figure_type in ('Type 3B', 'Type 3C')!r}
 has_paired_directional_langmuirs = {figure_type == 'Type 3C'!r}
 _channel_display_sort_key = str
@@ -61,7 +62,36 @@ st.session_state.setdefault('paper_titration_physical_0', 3)
         assert not app.exception
         chosen = app.session_state['chosen']
         assert chosen[0] == channel
-        assert all(str(method).startswith(f'{channel}_') for method in chosen[1:-1])
+        assert all(str(method).startswith(f'{channel}_') for method in chosen[1:4] if not isinstance(method, tuple))
+
+
+def test_cross_channel_type3a_restores_both_manual_references():
+    source = Path('app.py').read_text(encoding='utf-8')
+    start = source.index('        physical_channels = sorted({', source.index('if view == "Paper Figures":'))
+    end = source.index('        if not is_directional_type3:', start)
+    block = textwrap.dedent(source[start:end])
+    setup = '''
+import streamlit as st
+figure_type = 'Type 3A - Cross-channel signal-on/off'
+is_directional_type3 = True
+has_paired_directional_langmuirs = False
+_channel_display_sort_key = str
+_swv_settings_channel_label = str
+titration_results = [dict(original_channel=c, channel=f'{c}_{method}', scan_number=scan)
+    for c in (3, 5) for method in ('optimized', 'manual') for scan in (1, 180)]
+for role, channel in [('on', 5), ('off', 3)]:
+    st.session_state.setdefault(f'paper_titration_cross_{role}_physical', channel)
+    st.session_state.setdefault(f'paper_titration_cross_{role}_optimized', f'{channel}_optimized')
+    st.session_state.setdefault(f'paper_titration_cross_{role}_manual', f'{channel}_manual')
+st.session_state.setdefault('paper_titration_directional_start', 41)
+st.session_state.setdefault('paper_titration_directional_end', 160)
+'''
+    app = AppTest.from_string(setup + block + "\nst.session_state['chosen'] = directional_selection\n").run()
+    assert not app.exception
+    assert app.session_state['chosen'] == (5, '5_optimized', '3_optimized', '5_manual', (41, 160), 3, '3_manual')
+    app.run()
+    assert not app.exception
+    assert app.session_state['chosen'][6] == '3_manual'
 
 
 @pytest.mark.parametrize('link, shared, count', [

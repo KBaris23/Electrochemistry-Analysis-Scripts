@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,8 +57,14 @@ _EXCLUDED_PREFIXES = (
     "bo_composer_render_", "bo_composer_captured_", "bo_composer_pending_",
     "bo_composer_exports_", "bo_composer_download_",
     "bo_composer_capture_preview_", "bo_gif_", "bo_sim_",
+    "bo_composer_stack_spacing_reset_",
 )
 _EXCLUDED_KEYS = {
+    "paper_recipe_upload", "paper_recipe_apply", "_pending_paper_recipe",
+    "bo_composer_find_peak_example", "bo_hp_response_render_button",
+    "bo_real_update_plots", "bo_surrogate_update_large_plots",
+    "bo_swv_clear_history_focus", "swv_qc_render",
+    "metrics_titration_accuracy_download", "metrics_titration_snr_download",
     "bo_snap_3d_perspective",
     "swv_bo_config_load", "swv_bo_config_check_recommended", "swv_bo_config_reload_recommended",
     "results", "last_results", "analysis_cache_results", "swv_annotated_results",
@@ -103,6 +110,11 @@ def serializable_state(state: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in state.items():
         key = str(key)
         if (key in _EXCLUDED_KEYS or key in transient or key.startswith(_EXCLUDED_PREFIXES)
+                or (key.startswith('bo_rescore_') and key.endswith(
+                    ('_reset_controls', '_persist_profile', '_delete_profile')))
+                or (key.startswith('bo_synced_gifs_') and key.endswith('_button'))
+                or (key.startswith('paper_') and key.endswith(
+                    ('_png', '_pdf', '_svg', '_metadata', '_package', '_open_composer')))
                 or (key.startswith('bo_selected_session_folder_') and isinstance(value, bool))):
             continue
         try:
@@ -111,6 +123,18 @@ def serializable_state(state: Mapping[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             continue
         result[key] = encoded
+    # Keep the selected scoring view portable across a fresh browser page.
+    # The BO viewer intentionally clears disposable page caches on first open.
+    root = state.get("bo_session_folder")
+    if state.get("analysis_mode") == "BO Session" and root:
+        root_text = str(Path(root).expanduser().resolve())
+        token = hashlib.sha1(root_text.encode("utf-8")).hexdigest()
+        active = state.get(f"bo_rescore_{token[:12]}_active_profile")
+        profiles = state.get(f"bo_rescore_profiles_{token[:16]}") or {}
+        if active == "original":
+            result["bo_saved_figure_scoring"] = None
+        elif active in profiles:
+            result["bo_saved_figure_scoring"] = _json_value(profiles[active])
     return result
 
 

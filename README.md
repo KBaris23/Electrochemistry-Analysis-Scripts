@@ -9,22 +9,26 @@ For the manuscript's exact dataset paths, channels and analysis settings, use
 [the per-figure paper guide](paper/README.md). Start with the sweep, then BO
 validation, then titration. These are different inputs, not interchangeable tabs.
 
-Current exports are together in [journal plots](paper/generated/journal_plots/) and
+Earlier manuscript exports are together in [journal plots](paper/generated/journal_plots/) and
 [one ZIP](paper/generated/journal_plots.zip): dataset folders with maximize/minimize
 subfolders, PNG/PDF/SVG and one metadata JSON per newly rendered plot. Older
 drafts are outside the active output folder in ignored `paper/.local_archive/`.
+The current NP review figures are PNG-only, with embedded metadata and JSON
+sidecars, in `Results/journal_plots/np` under the paper's Downloads folder.
+See [recreating figures](docs/recreating-figures.md) for the exact location,
+saved-session names, and native application instructions.
 
 | Task | Mode / input | Output |
 |---|---|---|
 | SWV processing | SWV; measurement CSVs or converted MAT files | Raw/smoothed/corrected overlays, peak metrics, failures, tables and export bundles |
 | CV processing | CV; supported CV files | CV traces, analysis, plots and exports |
-| Parameter sweep | BO Session; **survey** session | Types 1 / 1A / 1B: measured landscape, example SWVs and slices |
+| Parameter sweep | BO Session; **survey** session | Types 1 / 1A / 1B / 1C: measured landscape, example SWVs and slices; Type 1C has two slices left, one combined points-and-planes cube, and two SWVs right |
 | BO validation | BO Session; **optimization** session | Type 2: cube, Q with running mean, buffer/target trend, chronological SWVs, parallel coordinates; Type 2A: cube and two trends |
-| Titration response | SWV → **Paper Figures**; titration and Langmuir enabled | Type 3: manual/optimized SWVs, response and fits; Type 3B: ON/OFF rows with a shared optimized-only fit/difference panel; Type 3C: ON/OFF rows with a separate optimized-vs-unoptimized Langmuir panel per row |
+| Titration response | SWV → **Paper Figures**; titration and Langmuir enabled | Type 3: manual/optimized comparisons; Type 3A: cross-channel ON/OFF with independent manual references; Type 3B: same-channel ON/OFF with shared fits/difference; Type 3C: separate optimized/manual fits per row |
 | Concentration prediction | Same SWV channel/method/step selection | Type 4: concentration by measurement and predicted versus known; within-calibration assessment, not independent validation |
 
 **Why a preset is missing:** survey inputs offer the Type 1 family; optimization
-inputs offer the Type 2 family. Types 3/3B/3C/4 are in SWV **Paper Figures**, not the
+inputs offer the Type 2 family. Types 3/3A/3B/3C/4 are in SWV **Paper Figures**, not the
 BO preset menu. Saved custom presets additionally require compatible data fields
 and plot types. Select the correct session before loading a preset.
 
@@ -82,7 +86,7 @@ Legend corner**. Enable **Custom legend anchor** for precise X/Y placement
 (0 = left/bottom, 1 = right/top); select a corner other than Automatic first.
 These are saved formatting settings, not draggable legends in the exported PNG.
 
-For linked Type 1A/1B examples, edit the first cube and choose **Signal-on example
+For linked Type 1A/1B/1C examples, edit the first cube and choose **Signal-on example
 iteration** or **Signal-off example iteration** directly (for example, change
 174 to 98). These replace the old resetting highlight chips. The corresponding
 SWV panel and cube marker change together; the other example is unchanged.
@@ -248,6 +252,87 @@ caches (they use Python pickle). Recovery is saved on ordinary app reruns.
 There is no reliable save-on-browser-close prompt or built-in double-click
 association for session JSON files. Make a named save before leaving; use a
 portable figure package separately for captured figure assets.
+
+### Exact plot recreation: saved session versus figure metadata
+
+These are complementary records. Neither contains the raw experimental files.
+
+| Record | What it restores | Best use | What it does not contain |
+|---|---|---|---|
+| `<name>.analysis-session.json` | The whole working app state: analysis mode/view, input paths, analysis controls, annotations, channel choices, and current figure controls | Continue an analysis or rebuild several related figures from one dataset | Raw measurements or a rendered figure |
+| `<name>.results.pkl.gz` beside the session | Optional cached derived analysis rows for faster reopening | Reopen a trusted local SWV analysis without recomputing unchanged inputs | Raw files; it is Python pickle and must not be loaded from an untrusted source |
+| Metadata PNG, `.metadata.json`, `.composer.json`, or `.figure.zip` | One exported figure's final recipe/configuration, layout, typography, selected channels/panels, source path, and render settings | Recreate or transfer one exact figure | Raw measurements, the complete surrounding workspace, or arbitrary captured source plots not included in the package |
+
+Use a **saved analysis session** when the goal is to resume the complete analysis.
+Use **figure metadata** when the goal is to reproduce one particular exported
+figure. For the closest reproduction, use both: open the matching session first,
+then apply that figure's metadata. The session supplies the dataset and analysis
+context; the metadata supplies the final figure-specific selection and layout.
+
+#### Recreate from a saved analysis session
+
+1. Keep the `.analysis-session.json` and its optional `.results.pkl.gz` in the
+   same directory. Do not rename only one member of the pair.
+2. Start the app with `streamlit run app.py`.
+3. Open sidebar **Saved analysis sessions**, select the session, and click
+   **Open**. The sidebar displays the directories it searches.
+4. Confirm that the recorded source folders still exist. If the cache is absent,
+   stale, or rejected because the input signature changed, run the analysis from
+   the original files again. A missing cache is a speed issue, not missing raw
+   data recovery.
+5. Open **Figure Composer** for BO/sweep figures or **SWV > Paper Figures** for
+   titration figures. Render or generate the figure, then use the final export
+   buttons. A restored session does not restore an old preview bitmap.
+
+#### Recreate from exported image metadata
+
+For a BO/Figure Composer export:
+
+1. Open the original BO session, or another compatible survey/optimization
+   session, before importing the figure recipe.
+2. Open **Figure Composer > Load a preset or saved figure**.
+3. Upload the metadata-bearing PNG, its JSON sidecar (`.composer.json` or
+   `figure-metadata.json`), or the exported `.figure.zip`.
+4. Choose **Open original experiment** when the recorded path exists. Otherwise,
+   choose **Apply to active experiment**; the app validates plot types, fields,
+   and channels and reports any adaptations.
+5. Click the final PNG/PDF/SVG export. **Render figure (fast preview)** is optional.
+
+For an SWV Paper Figure export:
+
+1. Open **SWV > Paper Figures > Load figure recipe**.
+2. Upload the metadata-bearing PNG, `<stem>.metadata.json`, or the downloaded
+   figure ZIP, then click **Load recipe into analyzer**.
+3. The loader restores recorded folders, SWV analysis settings, titration
+   boundaries/selections, and Paper Figure controls. It deliberately clears
+   stale analyzed results.
+4. Verify the source paths, click **Run Analysis**, return to **Paper Figures**,
+   click **Generate paper figure**, and download the final output/package.
+
+The current upload controls accept PNG, JSON, and ZIP. Although PDF Subject and
+SVG Description fields also contain the recipe for archival provenance, upload
+the PNG, JSON, or ZIP to restore it in the app. Byte-identical rendering also
+requires the same source files, app revision, dependency/font environment,
+canvas size, and DPI. Metadata restoration is scientifically reproducible, but
+font rasterization or library changes can alter pixels.
+
+#### Exact NP recreation
+
+The current NP figures use the application templates and native scientific
+renderers. The reproducible workflow is **Saved analysis sessions → Open → render
+or Generate paper figure**. PNG metadata and JSON sidecars contain the figure
+recipe; the source measurements must be available for recalculation.
+
+See [Recreating figures](docs/recreating-figures.md) for the exact click sequences,
+the NP figure/session mapping, metadata versus session differences, source-path
+requirements, and troubleshooting. The delivered review files are in
+`%USERPROFILE%\Downloads\Figures materials for the paper\Results\journal_plots\np`.
+Use 150-DPI PNG and metadata for this review.
+
+The native templates include **Type 1C** (one central cube, two slices left, two
+SWVs right) and **Type 3A - Cross-channel signal-on/off** (independent physical
+channels and manual references, shared Langmuir panel). The earlier raster
+rearrangement helper has been retired. No AI image-generation service is needed.
 
 ### Reopen the prepared paper figures without entering paths
 
