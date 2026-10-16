@@ -101,6 +101,8 @@ SOURCE_FIELDS = {
         "corrected": "trace_corrected", "corrected_trace_key": "trace_key",
         "normalize_to_peak": "trace_norm", "use_bo_snapshot": "trace_snapshot",
         "crop_to_minima": "trace_bracket",
+        "voltage_display_range": "trace_voltage_range",
+        "voltage_min": "trace_voltage_min", "voltage_max": "trace_voltage_max",
         "trace_line_width": "trace_width",
     },
     "Measured 3D tensor": {
@@ -173,6 +175,10 @@ def apply_source_edit(state, edit):
             state[f"bo_composer_{key}_{index}"] = copy.deepcopy(spec[field])
     if spec['kind'] == 'Chronological SWV stack' and 'crop_to_minima' in spec and 'voltage_display_range' not in spec:
         state[f'bo_composer_stack_voltage_range_{index}'] = (
+            'Corrected peak bracket' if spec['crop_to_minima'] else 'Full analyzed voltage range'
+        )
+    if spec['kind'] == 'SWV trace overlay' and 'crop_to_minima' in spec and 'voltage_display_range' not in spec:
+        state[f'bo_composer_trace_voltage_range_{index}'] = (
             'Corrected peak bracket' if spec['crop_to_minima'] else 'Full analyzed voltage range'
         )
     if spec.get('camera') and spec['kind'] == 'Measured 3D tensor':

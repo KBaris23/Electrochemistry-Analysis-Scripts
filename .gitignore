@@ -36,6 +36,7 @@ dist/
 
 # Generated analysis outputs
 outputs/
+/.tmp_*
 _mat_csv/
 bo_sessions/
 simulation_artifacts/

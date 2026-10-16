@@ -55,3 +55,32 @@ def test_detects_manual_and_optimized_titration_boundaries(tmp_path, prefix):
     vlines, logs = _annotation_helpers()["detect_autotitration_vlines"]([str(tmp_path)], rows)
     assert vlines == [(1.0, "buffer"), (2.0, "1000 uM"), (4.0, "end")]
     assert logs == [log.resolve()]
+
+
+def test_detection_preserves_staggered_channel_boundaries(tmp_path):
+    log = tmp_path / "session_log.txt"
+    log.write_text("\n".join([
+        "Queue start -> Initial buffer | MUX ch 1 | rep 1/1",
+        "[Tag] meas_20260916_1808_1001_ch1",
+        "Queue start -> Initial buffer | MUX ch 2 | rep 1/1",
+        "[Tag] meas_20260916_1808_1002_ch2",
+        "Queue start -> 10 uM | MUX ch 1 | rep 1/1",
+        "[Tag] meas_20260916_1808_1003_ch1",
+        "Queue start -> 10 uM | MUX ch 2 | rep 1/1",
+        "[Tag] meas_20260916_1808_1004_ch2",
+    ]))
+    rows = [
+        dict(channel=1, scan_id_from_name=1001, scan_number=1),
+        dict(channel=1, scan_id_from_name=1003, scan_number=2),
+        dict(channel=2, scan_id_from_name=1002, scan_number=1),
+        dict(channel=2, scan_id_from_name=1004, scan_number=3),
+    ]
+    detected, by_channel, logs = _annotation_helpers()[
+        "detect_autotitration_vlines"
+    ]([str(tmp_path)], rows, include_channel_boundaries=True)
+    assert detected == [(1.0, "buffer"), (2.5, "10 uM"), (3.5, "end")]
+    assert by_channel == {
+        1: [(1.0, "buffer"), (2.0, "10 uM"), (3.0, "end")],
+        2: [(1.0, "buffer"), (3.0, "10 uM"), (4.0, "end")],
+    }
+    assert logs == [log.resolve()]

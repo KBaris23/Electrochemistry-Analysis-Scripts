@@ -29,6 +29,12 @@ import time
 import zipfile
 from typing import Any, Callable, Mapping, Sequence
 
+import matplotlib
+
+# Streamlit runs this module outside the GUI main thread.  Agg avoids the
+# MacOSX/Tk backend crashes seen on macOS and gives identical headless exports
+# on Windows, macOS, and Linux.
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.colors import (
@@ -40,6 +46,7 @@ from matplotlib.colors import (
     to_rgba,
 )
 from matplotlib.lines import Line2D
+from matplotlib import font_manager
 from matplotlib.patches import Rectangle
 from matplotlib.text import Text
 from matplotlib.ticker import FixedFormatter, FixedLocator, MaxNLocator, StrMethodFormatter
@@ -17189,7 +17196,7 @@ def _pdf_iteration_swv_overlays(
         ("Offset raw", True, False, "raw_current", True),
         ("Corrected", True, False, "smoothed_corrected_current", False),
         ("Normalized corrected", True, True, "smoothed_corrected_current", False),
-        ("Normalized raw", True, True, "corrected_current", False),
+        ("Normalized unsmoothed corrected", True, True, "corrected_current", False),
     ]
     for (
         label,
@@ -18230,11 +18237,11 @@ def _swv_trace_kind_label(
     if not corrected:
         return "raw"
     if normalize_to_peak and corrected_trace_key == "corrected_current":
-        return "normalized raw"
+        return "normalized unsmoothed corrected"
     if normalize_to_peak:
         return "normalized corrected"
     if corrected_trace_key == "corrected_current":
-        return "raw corrected"
+        return "unsmoothed corrected"
     return "corrected"
 
 
@@ -32341,6 +32348,12 @@ def _paper_parameter_sweep_preset(
         extra[f"bo_composer_trace_channels_{offset}"] = [channel]
         extra[f"bo_composer_trace_corrected_{offset}"] = True
         extra[f"bo_composer_trace_key_{offset}"] = "corrected_current"
+        extra[f"bo_composer_trace_voltage_range_{offset}"] = "Corrected peak bracket"
+        # The reference SWV raster is 120 dpi and its legend strokes occupy
+        # 2--3 pixels, which corresponds to Matplotlib's 1.5 pt stroke.  Keep
+        # the paper presets explicit so they do not inherit a thinner UI
+        # fallback on another operating system.
+        extra[f"bo_composer_trace_width_{offset}"] = 1.5
         extra[f"bo_composer_border_on_{offset}"] = False
         extra[f"bo_composer_border_color_{offset}"] = highlight_colors[offset - 1]
     for map_index, slice_value in zip(range(4, 8), slices[:4]):
@@ -32457,6 +32470,10 @@ def _paper_parameter_sweep_comparison_preset(
         "bo_composer_trace_corrected_2": True,
         "bo_composer_trace_key_1": "corrected_current",
         "bo_composer_trace_key_2": "corrected_current",
+        "bo_composer_trace_voltage_range_1": "Corrected peak bracket",
+        "bo_composer_trace_voltage_range_2": "Corrected peak bracket",
+        "bo_composer_trace_width_1": 1.5,
+        "bo_composer_trace_width_2": 1.5,
         "bo_composer_trace_role_1": "Signal-on",
         "bo_composer_trace_role_2": "Signal-off",
         "bo_composer_border_on_1": False,
@@ -32495,6 +32512,32 @@ def _paper_parameter_sweep_comparison_preset(
         kinds=(),
         extra_state=extra,
     )
+
+
+def _paper_parameter_sweep_center_preset(
+    observations: Sequence[dict] = (),
+    real_channels: Sequence[str] = (),
+    trace_channels: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Type 1C: centered cubes with traces and slice maps at the right."""
+    preset = copy.deepcopy(_paper_parameter_sweep_comparison_preset(
+        observations, real_channels, trace_channels, mirrored=False,
+    ))
+    preset["name"] = "Type 1C - Sweep comparison (cube center)"
+    rects = (
+        (.16, .535, .52, .42), (.71, .775, .26, .17),
+        (.71, .535, .26, .17), (.16, .045, .52, .42),
+        (.71, .285, .26, .21), (.71, .035, .26, .21),
+    )
+    config = preset.setdefault("config", {})
+    state = config.setdefault("state", {})
+    for index, rect in enumerate(rects):
+        for field, value in zip(("left", "bottom", "width", "height"), rect):
+            state[f"bo_composer_{field}_{index}"] = value
+    panels = config.get("panels") or []
+    for index, panel in enumerate(panels[:len(rects)]):
+        panel["rect"] = list(rects[index])
+    return preset
 
 
 def _paper_bo_validation_preset() -> dict[str, Any]:
@@ -33053,7 +33096,10 @@ def _composer_draw_trace(
     corrected_trace_key: str,
     normalize_to_peak: bool,
     crop_to_minima: bool = False,
-    trace_line_width: float = 1.15,
+    trace_line_width: float = 1.5,
+    voltage_display_range: str | None = None,
+    voltage_min: float | None = None,
+    voltage_max: float | None = None,
 ) -> None:
     traces = [
         item for item in _trace_paths(session, observation)
@@ -33069,6 +33115,19 @@ def _composer_draw_trace(
     phase_colors = _swv_phase_trace_colors(phases)
     labels = _swv_phase_replicate_labels(phases)
     failed_traces = []
+    range_mode = str(voltage_display_range or (
+        "Corrected peak bracket" if crop_to_minima
+        else "Full analyzed voltage range"
+    ))
+    custom_bounds = None
+    if range_mode == "Custom voltage range":
+        lower = _finite_float(voltage_min)
+        upper = _finite_float(voltage_max)
+        if lower is None or upper is None or lower >= upper:
+            ax.text(.5, .5, "Custom voltage minimum must be below maximum.", ha="center", va="center")
+            ax.set_axis_off()
+            return
+        custom_bounds = (float(lower), float(upper))
     for trace_index, item in enumerate(displayed_traces):
         try:
             voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
@@ -33079,9 +33138,20 @@ def _composer_draw_trace(
             )
             if normalize_to_peak:
                 y = _normalize_trace_to_peak(y, peak_idx, left_idx, right_idx)
-            if crop_to_minima and corrected and left_idx is not None and right_idx is not None:
+            if range_mode == "Corrected peak bracket" and corrected and left_idx is not None and right_idx is not None:
                 lo, hi = sorted((int(left_idx), int(right_idx)))
                 voltage, y = voltage[lo:hi + 1], y[lo:hi + 1]
+            elif custom_bounds is not None:
+                mask = (
+                    np.isfinite(voltage)
+                    & (voltage >= custom_bounds[0])
+                    & (voltage <= custom_bounds[1])
+                )
+                if not np.any(mask):
+                    raise ValueError(
+                        "custom voltage range contains no analyzed samples"
+                    )
+                voltage, y = voltage[mask], y[mask]
             line, = ax.plot(
                 voltage,
                 y,
@@ -33114,6 +33184,8 @@ def _composer_draw_trace(
             labelspacing=.16, loc="upper left",
         )
     ax.grid(alpha=.18, linewidth=.45)
+    if custom_bounds is not None:
+        ax.set_xlim(*custom_bounds)
     if failed_traces:
         ax.text(.98, .02, f"{len(failed_traces)} / {len(displayed_traces)} traces failed BO checks",
                 transform=ax.transAxes, ha="right", va="bottom", fontsize=6, color="#b91c1c")
@@ -34028,6 +34100,11 @@ def _composer_formatted_capture_figure(
     """Copy an in-memory source and apply Composer-owned formatting."""
     source = capture.get("source_figure")
     line_scale = max(0.1, float(spec.get("capture_line_scale", 1.0)))
+    marker_scale = max(0.1, float(spec.get("capture_marker_scale", 1.0)))
+    spine_width = max(0.1, float(spec.get("capture_spine_width", 0.8)))
+    spine_color = str(spec.get("capture_spine_color", "#222222"))
+    show_vlines = bool(spec.get("capture_show_vlines", True))
+    vline_width = max(0.1, float(spec.get("capture_vline_width", 1.0)))
     show_legend = bool(spec.get("capture_show_legend", True))
     show_grid = bool(spec.get("capture_show_grid", True))
     title = str(spec.get("capture_title") or "")
@@ -34085,14 +34162,30 @@ def _composer_formatted_capture_figure(
             legend = primary_axis.get_legend()
             if legend is not None:
                 legend.set_visible(show_legend)
+            for spine in primary_axis.spines.values():
+                spine.set_linewidth(spine_width)
+                spine.set_color(spine_color)
             for line in primary_axis.lines:
-                line.set_linewidth(max(0.1, line.get_linewidth() * line_scale))
+                if getattr(line, "_swv_titration_vline", False):
+                    line.set_visible(show_vlines)
+                    line.set_linewidth(vline_width)
+                else:
+                    line.set_linewidth(max(0.1, line.get_linewidth() * line_scale))
+                    if line.get_marker() not in (None, "None", "", " "):
+                        line.set_markersize(max(0.1, line.get_markersize() * marker_scale))
+            for annotation in primary_axis.texts:
+                if getattr(annotation, "_swv_titration_vline", False):
+                    annotation.set_visible(show_vlines)
             for collection in primary_axis.collections:
                 widths = collection.get_linewidths()
                 if len(widths):
                     collection.set_linewidths(
                         [max(0.1, float(width) * line_scale) for width in widths]
                     )
+                if hasattr(collection, "get_sizes") and hasattr(collection, "set_sizes"):
+                    sizes = collection.get_sizes()
+                    if len(sizes):
+                        collection.set_sizes(np.asarray(sizes) * marker_scale ** 2)
         return figure
     return None
 
@@ -34874,8 +34967,16 @@ def _composer_draw_cube(fig, slot, spec, observations):
     left, bottom, width, height = spec["rect"]
     slot.remove()
     path_view = bool(spec.get("show_iteration_path", False))
-    cube_rect = ([left+.04*width, bottom+.08*height, .76*width, .84*height] if path_view
-                 else [left+.13*width, bottom+.08*height, .84*width, .84*height])
+    colorbar_side = str(spec.get("colorbar_side", "left"))
+    # Give the Q bar its own lane.  The old left=.13/.10 geometry put a left
+    # colorbar immediately underneath the projected Frequency axis on fonts
+    # with wider metrics (most visibly Safari/macOS previews).
+    if path_view:
+        cube_rect = [left+.04*width, bottom+.08*height, .76*width, .84*height]
+    elif colorbar_side == "left":
+        cube_rect = [left+.20*width, bottom+.08*height, .77*width, .84*height]
+    else:
+        cube_rect = [left+.03*width, bottom+.08*height, .77*width, .84*height]
     ax = fig.add_axes(cube_rect, projection="3d", computed_zorder=False)
     ax.set_facecolor("none")
     font = float(spec.get("text_size", 10))
@@ -34992,7 +35093,7 @@ def _composer_draw_cube(fig, slot, spec, observations):
     ax.view_init(elev=np.degrees(np.arctan2(z, np.hypot(x,y))), azim=np.degrees(np.arctan2(y,x)))
     distance = max(.5, np.linalg.norm([x,y,z]) / np.linalg.norm([1.45,1.45,1.15]))
     ax.set_box_aspect((1,1,1), zoom=min(1.2, 1.0/distance))
-    bar_x = left + width*.10 if spec.get("colorbar_side","left") == "left" else left + width*.95
+    bar_x = left + width*.035 if colorbar_side == "left" else left + width*.94
     if path_view:
         bar_x = left + width*.88
     bar_ax = fig.add_axes([bar_x, bottom+height*.24, width*.018, height*.55])
@@ -35118,6 +35219,19 @@ def _build_composer_figure(
         _COMPOSER_PANEL_TYPOGRAPHY.reset(typography_token)
 
 
+@lru_cache(maxsize=16)
+def _composer_resolved_font_family(requested: str) -> str:
+    """Return an installed font so layout metrics do not change by platform."""
+    requested = str(requested or "").strip() or "DejaVu Sans"
+    fallbacks = {
+        "Arial": ("Arial", "Liberation Sans", "DejaVu Sans"),
+        "Calibri": ("Calibri", "Carlito", "DejaVu Sans"),
+        "Times New Roman": ("Times New Roman", "Liberation Serif", "DejaVu Serif"),
+    }.get(requested, (requested, "DejaVu Sans"))
+    installed = {font.name for font in font_manager.fontManager.ttflist}
+    return next((candidate for candidate in fallbacks if candidate in installed), "DejaVu Sans")
+
+
 def _build_composer_figure_inner(
     session: dict,
     history: pd.DataFrame,
@@ -35138,7 +35252,10 @@ def _build_composer_figure_inner(
     journal_style: bool,
 ) -> plt.Figure:
     width, height = canvas_size
-    with plt.rc_context({"font.family": font_family, "font.size": font_size}):
+    with plt.rc_context({
+        "font.family": _composer_resolved_font_family(font_family),
+        "font.size": font_size,
+    }):
         fig = plt.figure(figsize=(width, height), facecolor="white")
         if title:
             fig.suptitle(title, fontsize=font_size + 3, y=.985)
@@ -35199,7 +35316,10 @@ def _build_composer_figure_inner(
                     _composer_trace_analysis(spec, session, trace_analysis),
                     spec["corrected_trace_key"], spec["normalize_to_peak"],
                     crop_to_minima=spec.get("crop_to_minima", True),
-                    trace_line_width=spec.get("trace_line_width") or 1.15,
+                    trace_line_width=spec.get("trace_line_width") or 1.5,
+                    voltage_display_range=spec.get("voltage_display_range"),
+                    voltage_min=spec.get("voltage_min"),
+                    voltage_max=spec.get("voltage_max"),
                 )
                 if not panel_header and spec.get("trace_role"):
                     panel_header = _composer_swv_header(
@@ -35775,6 +35895,41 @@ def _composer_validation_scope(session, observations, history):
     if direction:
         state['bo_composer_direction'] = direction
         observations, history = _composer_filter_optimizer(session, observations, history, selected=direction)
+    iteration_options = sorted({
+        int(item.get("iteration")) for item in observations
+        if item.get("iteration") is not None
+    })
+    saved_exclusions = []
+    for value in state.get("bo_composer_validation_excluded_iterations", []):
+        try:
+            iteration = int(value)
+        except (TypeError, ValueError):
+            continue
+        if iteration in iteration_options:
+            saved_exclusions.append(iteration)
+    excluded = st.multiselect(
+        "Exclude outlier iterations from Type 2",
+        iteration_options,
+        default=saved_exclusions,
+        key="bo_composer_validation_excluded_iterations",
+        help=(
+            "Removes selected iterations from every linked Type 2 panel without "
+            "deleting or changing the recorded BO session. Clear the selection to restore them."
+        ),
+    )
+    if excluded:
+        excluded_set = set(map(int, excluded))
+        observations = [
+            item for item in observations
+            if int(item.get("iteration", -1)) not in excluded_set
+        ]
+        if "iteration" in history:
+            numeric_iteration = pd.to_numeric(history["iteration"], errors="coerce")
+            history = history.loc[~numeric_iteration.isin(excluded_set)].copy()
+        st.caption(
+            f"Type 2 excludes {len(excluded_set)} selected outlier iteration(s) "
+            "from this figure only; source data are unchanged."
+        )
     return observations, history
 
 
@@ -35855,8 +36010,35 @@ def _composer_source_controls(index, source_spec, session, history, observations
         keys = ["corrected_current", "smoothed_corrected_current", "wavelet_denoised_current"]
         old_key = draft.get("corrected_trace_key", keys[0])
         draft["corrected_trace_key"] = st.selectbox("Trace processing", keys, index=keys.index(old_key) if old_key in keys else 0, disabled=not draft["corrected"],
-            format_func=lambda key: {"corrected_current": "Raw / unsmoothed (corrected)", "smoothed_corrected_current": "Smoothed (corrected)", "wavelet_denoised_current": "Wavelet denoised"}[key])
-        draft["crop_to_minima"] = st.checkbox("Display detected peak bracket only", value=bool(draft.get("crop_to_minima",True)))
+            format_func=lambda key: {"corrected_current": "Unsmoothed corrected", "smoothed_corrected_current": "Smoothed corrected", "wavelet_denoised_current": "Wavelet denoised"}[key])
+        trace_ranges = [
+            "Corrected peak bracket",
+            "Full analyzed voltage range",
+            "Custom voltage range",
+        ]
+        saved_range = draft.get("voltage_display_range")
+        if saved_range not in trace_ranges:
+            saved_range = trace_ranges[0] if draft.get("crop_to_minima", True) else trace_ranges[1]
+        draft["voltage_display_range"] = st.radio(
+            "Displayed voltage range",
+            trace_ranges,
+            index=trace_ranges.index(saved_range),
+            help="Custom limits crop the displayed analyzed samples only; analysis and recorded Q are unchanged.",
+        )
+        draft["crop_to_minima"] = draft["voltage_display_range"] == trace_ranges[0]
+        if draft["voltage_display_range"] == "Custom voltage range":
+            saved_analysis = _bo_analysis_settings(session.get("config") or {})
+            voltage_cols = st.columns(2)
+            draft["voltage_min"] = float(voltage_cols[0].number_input(
+                "Voltage minimum (V)", -10.0, 10.0,
+                float(draft.get("voltage_min", saved_analysis.get("crop_min_v", -0.45))),
+                0.01,
+            ))
+            draft["voltage_max"] = float(voltage_cols[1].number_input(
+                "Voltage maximum (V)", -10.0, 10.0,
+                float(draft.get("voltage_max", saved_analysis.get("crop_max_v", 0.1))),
+                0.01,
+            ))
         draft["trace_line_width"] = st.number_input("SWV trace thickness (pt; 0 = automatic)", 0., 6., float(draft.get("trace_line_width") or 0.), .05)
         draft["normalize_to_peak"] = st.checkbox("Normalize to peak", value=bool(draft.get("normalize_to_peak",False)))
     elif kind in ("Measured 3D tensor", "Measured 2D map", "Measured parallel coordinates", "Measured 1D slice", "Channel x iteration heatmap"):
@@ -36110,6 +36292,21 @@ def _render_full_session_composer(full_session, observation, trace_analysis, pai
         full_session['observations'], observation, trace_analysis, paired_objective)
 
 
+def render_captured_figure_composer() -> None:
+    """Render Composer without requiring a BO session (for SWV/CV captures)."""
+    transfer_notice = st.session_state.pop("paper_composer_transfer_notice", None)
+    if transfer_notice:
+        st.warning(str(transfer_notice))
+    session = {
+        "root": Path.cwd() / ".captured_figure_composer",
+        "state": {"session_id": "captured-figures"},
+        "config": {},
+        "history": pd.DataFrame(),
+        "observations": [],
+    }
+    _render_figure_composer(session, pd.DataFrame(), [], {}, {}, False)
+
+
 def _render_figure_composer(
     session: dict,
     history: pd.DataFrame,
@@ -36319,6 +36516,11 @@ def _render_figure_composer(
                 observations, real_channels, current_trace_channels, mirrored=True,
             )
         )
+        saved_presets["Type 1C - Sweep comparison (cube center)"] = (
+            _paper_parameter_sweep_center_preset(
+                observations, real_channels, current_trace_channels,
+            )
+        )
     else:
         saved_presets["Type 2 - BO validation"] = _paper_bo_validation_preset()
         saved_presets["Type 2A - BO validation (focused)"] = (
@@ -36327,12 +36529,12 @@ def _render_figure_composer(
     saved_presets.update(_composer_load_presets())
     with st.expander("Load a preset or saved figure", expanded=False):
         st.info(
-            "Survey session: Types 1 / 1A / 1B show the parameter landscape. "
+            "Survey session: Types 1 / 1A / 1B / 1C show the parameter landscape. "
             "For BO validation (Types 2 / 2A), open the optimization session, not parameter_sweep. "
             "Titration Types 3 / 3B / 4 are in SWV mode → Paper figures."
             if is_survey_session else
             "Optimization session: Types 2 / 2A show BO validation. "
-            "For Types 1 / 1A / 1B, open a parameter-sweep (survey) session. "
+            "For Types 1 / 1A / 1B / 1C, open a parameter-sweep (survey) session. "
             "Titration Types 3 / 3B / 4 are in SWV mode → Paper figures."
         )
         preset_cols = st.columns([2.2, 1])
@@ -36460,6 +36662,12 @@ def _render_figure_composer(
     dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25, key="bo_composer_dpi"))
     c5, c6, c7 = st.columns(3)
     font_family = c5.selectbox("Font", ["Arial", "DejaVu Sans", "Times New Roman", "Calibri"], key="bo_composer_font")
+    resolved_font_family = _composer_resolved_font_family(font_family)
+    if resolved_font_family != font_family:
+        st.caption(
+            f"{font_family} is not installed on this computer; exports use "
+            f"{resolved_font_family} so text measurements remain deterministic."
+        )
     font_size = int(c6.slider("Plot font", 5, 18, 9, key="bo_composer_font_size"))
     label_size = int(c7.slider("Panel label", 8, 30, 16, key="bo_composer_label_size"))
     journal_style = st.checkbox(
@@ -37384,11 +37592,47 @@ def _render_figure_composer(
                     key=f"bo_composer_trace_snapshot_{index}",
                     help="Uses this session's saved crop, smoothing, baseline correction and peak/minima acceptance windows.",
                 )
-                spec["crop_to_minima"] = st.checkbox(
-                    "Show only corrected peak bracket", value=True,
-                    key=f"bo_composer_trace_bracket_{index}",
-                    help="Display each corrected trace between its detected minima. Does not change analysis or Q.",
+                trace_ranges = [
+                    "Corrected peak bracket",
+                    "Full analyzed voltage range",
+                    "Custom voltage range",
+                ]
+                range_key = f"bo_composer_trace_voltage_range_{index}"
+                if range_key not in st.session_state:
+                    st.session_state[range_key] = (
+                        trace_ranges[0]
+                        if st.session_state.get(f"bo_composer_trace_bracket_{index}", True)
+                        else trace_ranges[1]
+                    )
+                spec["voltage_display_range"] = st.radio(
+                    "Displayed voltage range",
+                    trace_ranges,
+                    key=range_key,
+                    help="Bracket crops to detected minima. Custom limits crop the displayed analyzed samples without changing analysis or Q.",
                 )
+                spec["crop_to_minima"] = spec["voltage_display_range"] == trace_ranges[0]
+                st.session_state[f"bo_composer_trace_bracket_{index}"] = spec["crop_to_minima"]
+                if spec["voltage_display_range"] == "Custom voltage range":
+                    saved_analysis = _bo_analysis_settings(session.get("config") or {})
+                    voltage_cols = st.columns(2)
+                    spec["voltage_min"] = float(voltage_cols[0].number_input(
+                        "Voltage minimum (V)",
+                        min_value=-10.0,
+                        max_value=10.0,
+                        value=float(saved_analysis.get("crop_min_v", -0.45)),
+                        step=0.01,
+                        key=f"bo_composer_trace_voltage_min_{index}",
+                    ))
+                    spec["voltage_max"] = float(voltage_cols[1].number_input(
+                        "Voltage maximum (V)",
+                        min_value=-10.0,
+                        max_value=10.0,
+                        value=float(saved_analysis.get("crop_max_v", 0.1)),
+                        step=0.01,
+                        key=f"bo_composer_trace_voltage_max_{index}",
+                    ))
+                    if spec["voltage_min"] >= spec["voltage_max"]:
+                        st.warning("Voltage minimum must be below voltage maximum.")
                 spec["axes_box"] = st.checkbox(
                     "Black SWV axes box", value=True, key=f"bo_composer_trace_axes_box_{index}",
                 )
@@ -37400,8 +37644,8 @@ def _render_figure_composer(
                 spec["corrected_trace_key"] = st.selectbox(
                     "Trace smoothing (after correction)",
                     ["corrected_current", "smoothed_corrected_current", "wavelet_denoised_current"],
-                    format_func=lambda key: {"corrected_current": "Raw / unsmoothed (corrected)", "smoothed_corrected_current": "Smoothed (corrected)", "wavelet_denoised_current": "Wavelet denoised"}[key],
-                    help="Raw here means no display smoothing. Saved BO baseline correction, peak detection and the selected display crop still apply.",
+                    format_func=lambda key: {"corrected_current": "Unsmoothed corrected", "smoothed_corrected_current": "Smoothed corrected", "wavelet_denoised_current": "Wavelet denoised"}[key],
+                    help="Unsmoothed means baseline-corrected samples without display smoothing. Saved BO peak detection and the selected display crop still apply.",
                     key=f"bo_composer_trace_key_{index}",
                     disabled=not spec["corrected"],
                 )
@@ -37621,7 +37865,7 @@ def _render_figure_composer(
                         ),
                     )
                     format_defaults = _composer_capture_format_defaults(capture)
-                    format_cols = st.columns(3)
+                    format_cols = st.columns(5)
                     spec["capture_show_legend"] = format_cols[0].checkbox(
                         "Show legend",
                         value=bool(format_defaults["show_legend"]),
@@ -37641,6 +37885,32 @@ def _render_figure_composer(
                         1.0,
                         0.25,
                         key=f"bo_composer_capture_line_scale_{index}",
+                        disabled=not source_is_editable,
+                    ))
+                    spec["capture_marker_scale"] = float(format_cols[3].slider(
+                        "Marker size", .25, 4.0, 1.0, .25,
+                        key=f"bo_composer_capture_marker_scale_{index}",
+                        disabled=not source_is_editable,
+                    ))
+                    spec["capture_spine_width"] = float(format_cols[4].slider(
+                        "Axis-line width", .2, 4.0, .8, .1,
+                        key=f"bo_composer_capture_spine_width_{index}",
+                        disabled=not source_is_editable,
+                    ))
+                    detail_cols = st.columns(3)
+                    spec["capture_spine_color"] = detail_cols[0].color_picker(
+                        "Axis-line color", "#222222",
+                        key=f"bo_composer_capture_spine_color_{index}",
+                        disabled=not source_is_editable,
+                    )
+                    spec["capture_show_vlines"] = detail_cols[1].checkbox(
+                        "Show titration boundaries", value=True,
+                        key=f"bo_composer_capture_show_vlines_{index}",
+                        disabled=not source_is_editable,
+                    )
+                    spec["capture_vline_width"] = float(detail_cols[2].slider(
+                        "Boundary width", .2, 4.0, 1.0, .1,
+                        key=f"bo_composer_capture_vline_width_{index}",
                         disabled=not source_is_editable,
                     ))
                     text_cols = st.columns(4)
@@ -37952,28 +38222,13 @@ def _render_figure_composer(
         )
         st.caption('Use the export buttons above for final-quality files with embedded metadata.')
 def _load_simulated_sweep_section(session: dict, section: str) -> bool:
-    """Defer expensive hidden tabs for simulated or genuinely large sessions.
+    """Keep legacy call sites while opening normal BO sections immediately.
 
-    Streamlit executes every ``st.tabs`` body on any normal rerun, even when a
-    tab is not visible.  A 2,000-point physical parameter sweep therefore
-    used to rebuild SWV, landscape, surrogate, and GIF controls while the user
-    was merely choosing a Composer preset.  Small ordinary BO sessions keep
-    the immediate tab behaviour; simulated and >=500-observation sessions
-    load each heavyweight section when the user asks for it.
+    Composer now runs in a fragment, so its edits no longer justify making the
+    other tabs opt in through a checkbox.  The render buttons inside expensive
+    sections remain the explicit boundary for genuinely costly plots.
     """
-    observation_count = len(session.get("observations") or [])
-    if not _is_loaded_simulated_sweep_session(session) and observation_count < 500:
-        return True
-    token = hashlib.sha1(str(session["root"]).encode("utf-8")).hexdigest()[:12]
-    return bool(st.checkbox(
-        f"Load {section} (on demand)",
-        value=False,
-        key=f"bo_sweep_load_{token}_{section}",
-        help=(
-            "Loads this section on demand to keep large BO sessions quick to open. "
-            "Turn it off when finished to skip its work on subsequent page updates."
-        ),
-    ))
+    return True
 
 
 def render_bo_session_app() -> None:

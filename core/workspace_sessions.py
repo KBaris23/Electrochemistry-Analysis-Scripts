@@ -181,6 +181,13 @@ def load_workspace(path: str | Path) -> tuple[dict[str, Any], Any | None]:
                 else 'Full analyzed voltage range',
             )
             payload['state'].setdefault(f'bo_composer_stack_legend_location_{index}', 'upper right')
+        elif key.startswith('bo_composer_kind_') and value == 'SWV trace overlay':
+            index = key.removeprefix('bo_composer_kind_')
+            payload['state'].setdefault(
+                f'bo_composer_trace_voltage_range_{index}',
+                'Corrected peak bracket' if payload['state'].get(f'bo_composer_trace_bracket_{index}', True)
+                else 'Full analyzed voltage range',
+            )
     results = None
     cache_name = payload.get("results_cache")
     if cache_name:

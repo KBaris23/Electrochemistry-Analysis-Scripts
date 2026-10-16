@@ -668,6 +668,14 @@ def test_publication_cube_has_one_scale_and_millivolt_step_ticks(monkeypatch):
         assert list(cube.get_xticks()) == [1,4,7,10]
         assert all(not axis.pane.get_fill() for axis in (cube.xaxis,cube.yaxis,cube.zaxis))
         figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        q_bar_box = figure.axes[1].get_tightbbox(renderer)
+        frequency_artists = [cube.zaxis.label, *cube.zaxis.get_ticklabels()]
+        assert all(
+            not q_bar_box.overlaps(artist.get_window_extent(renderer))
+            for artist in frequency_artists
+            if artist.get_visible() and artist.get_text()
+        )
     finally:
         plt.close(figure)
 

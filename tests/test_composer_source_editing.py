@@ -121,6 +121,24 @@ def test_source_update_retains_layout_and_updates_linked_iteration():
     assert state["bo_composer_auto_render"] is False
 
 
+def test_trace_source_update_saves_custom_voltage_range():
+    state = {"bo_composer_count": 1}
+    assert apply_source_edit(state, {
+        "index": 0,
+        "spec": {
+            "kind": "SWV trace overlay",
+            "crop_to_minima": False,
+            "voltage_display_range": "Custom voltage range",
+            "voltage_min": -0.37,
+            "voltage_max": -0.12,
+        },
+    })
+    assert state["bo_composer_trace_voltage_range_0"] == "Custom voltage range"
+    assert state["bo_composer_trace_voltage_min_0"] == -0.37
+    assert state["bo_composer_trace_voltage_max_0"] == -0.12
+    assert state["bo_composer_trace_bracket_0"] is False
+
+
 def test_add_source_copy_does_not_overwrite_original():
     state = {
         "bo_composer_count": 1, "bo_composer_kind_0": "SWV trace overlay",

@@ -175,8 +175,12 @@ To adjust the chronological stack (Type 2), select its block and open **Edit pan
   direction, so the Q line cannot concatenate different optimizers.
 - **Other plots:** generate them in their source tab, then use **Add to Composer**
   or **Replace selected Composer panel**. Captured/image panels have different
-  editing capabilities from live generated panels. SWV Paper Figures are guided
-  composites, not arbitrary independently editable Composer panels. Under
+  editing capabilities from live generated panels. SWV Paper Figures expose
+  row height/gaps, curve and marker scale, axis-line style, titration-boundary
+  style, legend position, and a display-range fit switch directly. After
+  generation, **Edit source panels in Figure Composer** sends each source panel
+  to the standalone SWV **Figure Composer** view for independent axis limits,
+  size, position, labels, lines, markers, spines, and boundary visibility. Under
   **SWV processing and filtering**, titration waveform panels default to stored
   **smoothed + corrected** current between the final correction minima (inside
   the analysis crop). **Full analysis crop** is available explicitly. Neither
@@ -348,6 +352,10 @@ Windows launcher rejects 32-bit or unsupported Python environments and prefers
 
 On macOS, if the launcher is not executable after downloading it, run
 `chmod +x launch_app_mac.command` once.
+The app forces Matplotlib's headless Agg renderer before Streamlit starts, so
+macOS native GUI backends are never initialized from a Streamlit worker thread.
+Composer also resolves unavailable Arial/Calibri/Times fonts to an installed
+fallback and reports the font actually used.
 
 If Streamlit is installed in a known 64-bit Python on Windows, you can also run
 it directly, for example:
@@ -440,8 +448,9 @@ more panels in its mouse editor and use **Delete selected**, Delete/Backspace,
 or the right-click menu to remove them.
 Use the earlier/later controls to reorder panels and reassign their default
 letters. New in-session captures retain their plot source, so the Composer can
-re-render them at final panel DPI and adjust text, titles, axes, legends, grids,
-and line widths instead of enlarging the thumbnail PNG. A final render prepares
+re-render them at final panel DPI and adjust text, titles, axis limits, legends,
+grids, line/marker widths, axis-line style, and titration boundaries instead of
+enlarging the thumbnail PNG. A final render prepares
 PNG, PDF, and SVG files together. Its compact configuration is
 embedded in the PNG and can also be downloaded as a JSON sidecar or portable
 ZIP. Upload any of those formats to reconstruct the layout from its recorded

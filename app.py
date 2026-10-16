@@ -4,6 +4,7 @@ Run with:  python -m streamlit run app.py
 """
 
 import bisect
+import copy
 from datetime import datetime, timedelta
 import io
 import hashlib
@@ -17,6 +18,12 @@ import sys
 import zipfile
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import matplotlib
+
+# Streamlit renders figures on worker threads.  GUI backends (especially the
+# macOS native backend and Tk) must only be created on the main thread, so the
+# web application always uses Matplotlib's platform-neutral renderer.
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import is_color_like, to_hex
@@ -62,8 +69,10 @@ from core.processing import (
 )
 from bo_session_viewer import (
     _bo_swv_settings_key,
+    _queue_plot_for_composer,
     _render_add_to_composer_button,
     bo_swv_optimization_direction_map,
+    render_captured_figure_composer,
     render_bo_session_app,
 )
 from bo_headless import _apply_result_constraints
@@ -1899,16 +1908,44 @@ def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cel
     axis_label_size = float(st.session_state.get("paper_axis_label_font_size", font_size))
     tick_size = float(st.session_state.get("paper_tick_font_size", max(4.5, font_size * .85)))
     legend_size = float(st.session_state.get("paper_legend_font_size", max(4.5, font_size * .8)))
+    line_scale = float(st.session_state.get("paper_titration_line_scale", 1.0))
+    marker_scale = float(st.session_state.get("paper_titration_marker_scale", 1.0))
+    spine_width = float(st.session_state.get("paper_titration_spine_width", 0.8))
+    spine_color = str(st.session_state.get("paper_titration_spine_color", "#222222"))
+    show_vlines = bool(st.session_state.get("paper_titration_show_vlines", True))
+    vline_width = float(st.session_state.get("paper_titration_vline_width", 1.0))
+    vline_alpha = float(st.session_state.get("paper_titration_vline_alpha", 0.6))
+    legend_location = str(st.session_state.get("paper_titration_legend_location", "Automatic"))
     for source_axis in source.axes:
         source_axis.title.set_fontsize(title_size)
         if source_axis.get_legend() is not None:
             source_axis.get_legend().set_title('')
+            if legend_location != "Automatic":
+                if hasattr(source_axis.get_legend(), "set_loc"):
+                    source_axis.get_legend().set_loc(legend_location.lower())
+                else:
+                    source_axis.get_legend()._loc = legend_location.lower()
             for text in source_axis.get_legend().get_texts():
                 text.set_fontsize(legend_size)
         source_axis.xaxis.label.set_fontsize(axis_label_size)
         source_axis.yaxis.label.set_fontsize(axis_label_size)
         source_axis.tick_params(labelsize=tick_size)
+        for spine in source_axis.spines.values():
+            spine.set_linewidth(spine_width)
+            spine.set_color(spine_color)
+        for line in source_axis.lines:
+            if getattr(line, "_swv_titration_vline", False):
+                line.set_visible(show_vlines)
+                line.set_linewidth(vline_width)
+                line.set_alpha(vline_alpha)
+            else:
+                line.set_linewidth(max(0.1, line.get_linewidth() * line_scale))
+                if line.get_marker() not in (None, "None", "", " "):
+                    line.set_markersize(max(0.1, line.get_markersize() * marker_scale))
         for annotation in list(source_axis.texts):
+            if getattr(annotation, "_swv_titration_vline", False):
+                annotation.set_visible(show_vlines)
+                annotation.set_alpha(vline_alpha)
             if abs(float(annotation.get_rotation()) - 90.0) < 1e-6:
                 # Dose labels on the titration boundaries: keep the doses, drop
                 # the repeated "buffer" labels, and shrink so they fit.
@@ -1978,7 +2015,18 @@ def _paper_reference_style() -> None:
     })
 
 
-def _paper_response_panel(rows, *, optimized, manual, physical, colors, vlines, scan_range, change):
+def _paper_response_panel(
+    rows,
+    *,
+    optimized,
+    manual,
+    physical,
+    colors,
+    vlines,
+    vlines_by_channel=None,
+    scan_range,
+    change,
+):
     optimized_label = str(st.session_state.get("paper_optimized_label", "Optimized"))
     unoptimized_label = str(st.session_state.get("paper_unoptimized_label", "Unoptimized"))
     title_template = str(st.session_state.get(
@@ -1988,7 +2036,8 @@ def _paper_response_panel(rows, *, optimized, manual, physical, colors, vlines, 
         rows, metric='peak_current_selected', channels=[optimized, manual],
         title=title_template.replace("{channel}", str(physical)),
         ylabel='Change in Peak Current (uA)' if change else 'Peak Current (uA)',
-        vlines=vlines, scan_range=scan_range, xlabel='SWV Measurement Number',
+        vlines=vlines, vlines_by_channel=vlines_by_channel,
+        scan_range=scan_range, xlabel='SWV Measurement Number',
         channel_colors=colors,
         channel_labels={optimized: optimized_label, manual: unoptimized_label},
     )
@@ -2065,6 +2114,7 @@ def _paper_composite_figure(
     raster_dpi: int = 300,
     width_ratios: Optional[List[float]] = None,
     column_gap: float = .16,
+    row_gap: float = .18,
 ) -> plt.Figure:
     """Arrange existing analysis figures into a consistently labelled paper grid.
 
@@ -2074,9 +2124,10 @@ def _paper_composite_figure(
     total_height = max(row_height, rows * row_height)
     output = plt.figure(figsize=(width, total_height), facecolor="white")
     grid = output.add_gridspec(
-        rows, columns, wspace=column_gap, hspace=.18, width_ratios=width_ratios,
+        rows, columns, wspace=column_gap, hspace=row_gap, width_ratios=width_ratios,
         top=.98, bottom=0.04, left=0.04, right=0.99,
     )
+    captured_sources: List[plt.Figure] = []
     for index in range(rows * columns):
         axis = output.add_subplot(grid[index // columns, index % columns])
         axis.set_axis_off()
@@ -2091,12 +2142,14 @@ def _paper_composite_figure(
                     box = grid[index // columns, index % columns].get_position(output)
                     cell_w, cell_h = box.width * width, box.height * total_height
                 _paper_style_source(source, font_size, cell_w, cell_h)
+            captured_sources.append(copy.deepcopy(source))
             axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
             plt.close(source)
         axis.text(
             -.02, 1.02, chr(ord("A") + index) if st.session_state.get("paper_show_panel_letters", False) else "", transform=axis.transAxes,
             ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
         )
+    output._paper_source_figures = captured_sources
     return output
 
 
@@ -2108,12 +2161,14 @@ def _paper_directional_titration_figure(
     row_height: float = 2.6,
     font_size: float = 8.0,
     raster_dpi: int = 300,
+    column_gap: float = .16,
+    row_gap: float = .18,
 ) -> plt.Figure:
     """Two directional Type-3 rows plus one Langmuir panel spanning both rows."""
     total_height = max(row_height * 2, 4.8)
     output = plt.figure(figsize=(width, total_height), facecolor="white")
     grid = output.add_gridspec(
-        2, 4, width_ratios=(1, 1, 1, 1), wspace=.16, hspace=.18,
+        2, 4, width_ratios=(1, 1, 1, 1), wspace=column_gap, hspace=row_gap,
         top=.98, bottom=.04, left=.04, right=.99,
     )
     targets = [
@@ -2126,6 +2181,7 @@ def _paper_directional_titration_figure(
         shared_langmuir,
     ]
     cell_w, cell_h = width / 4 * .92, row_height * .92
+    captured_sources: List[plt.Figure] = []
     for index, (slot, source) in enumerate(zip(targets, sources)):
         axis = output.add_subplot(slot)
         axis.set_axis_off()
@@ -2135,12 +2191,14 @@ def _paper_directional_titration_figure(
             if not getattr(source, "_paper_prestyled", False):
                 source_height = cell_h * (2.0 if index == 6 else 1.0)
                 _paper_style_source(source, font_size, cell_w, source_height)
+            captured_sources.append(copy.deepcopy(source))
             axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
             plt.close(source)
         axis.text(
             -.02, 1.02, chr(ord("A") + index) if st.session_state.get("paper_show_panel_letters", False) else "", transform=axis.transAxes,
             ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
         )
+    output._paper_source_figures = captured_sources
     return output
 
 
@@ -2212,7 +2270,206 @@ def _paper_figure_downloads(
         "Download Package", package.getvalue(), file_name=f"{stem}.zip",
         mime="application/zip", key=f"{stem}_package", use_container_width=True,
     )
+    source_figures = list(getattr(figure, "_paper_source_figures", []) or [])
+    if source_figures and st.button(
+        "Edit source panels in Figure Composer",
+        key=f"{stem}_open_composer",
+        type="primary",
+        use_container_width=True,
+        help=(
+            "Sends every source panel to the same drag-and-resize Composer used "
+            "by BO figures. Each panel keeps editable axes, lines, markers, and text."
+        ),
+    ):
+        try:
+            current_count = int(st.session_state.get("bo_composer_count", 0) or 0)
+            pending_count = len(st.session_state.get("bo_composer_pending_captures", []) or [])
+            capacity = max(0, 12 - current_count - pending_count)
+            if capacity == 0:
+                raise ValueError(
+                    "Figure Composer already has 12 panels. Delete panels there "
+                    "before sending another titration figure."
+                )
+            selected_sources = source_figures[:capacity]
+            for index, source in enumerate(selected_sources):
+                title = next(
+                    (
+                        axis.get_title()
+                        for axis in source.axes
+                        if str(axis.get_title() or "").strip()
+                    ),
+                    f"Titration panel {index + 1}",
+                )
+                _queue_plot_for_composer(
+                    None,
+                    label=title,
+                    file_stem=f"{stem}_panel_{index + 1}",
+                    figure=copy.deepcopy(source),
+                    settings={"text_size": float(st.session_state.get("paper_titration_font", 8.0))},
+                )
+            if len(selected_sources) < len(source_figures):
+                st.session_state["paper_composer_transfer_notice"] = (
+                    f"Added the first {len(selected_sources)} of {len(source_figures)} "
+                    "source panels because Composer supports at most 12 panels."
+                )
+            st.session_state["analysis_view"] = "Figure Composer"
+            st.rerun()
+        except ValueError as exc:
+            st.warning(str(exc))
     plt.close(figure)
+
+
+def _paper_recipe_from_upload(data: bytes, file_name: str) -> dict:
+    """Read a paper recipe from JSON, a metadata-bearing PNG, or its ZIP."""
+    suffix = Path(file_name).suffix.lower()
+    if suffix == ".png":
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as image:
+            encoded = image.info.get("SWV Figure Metadata")
+        if not encoded:
+            raise ValueError("This PNG does not contain an SWV paper recipe.")
+        payload = json.loads(encoded)
+    elif suffix == ".zip":
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            candidates = [
+                name for name in archive.namelist()
+                if name.endswith(".metadata.json") or name == "figure-metadata.json"
+            ]
+            if not candidates:
+                raise ValueError("This ZIP contains no paper-figure metadata JSON.")
+            payload = json.loads(archive.read(candidates[0]))
+    else:
+        payload = json.loads(data.decode("utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError("The uploaded paper recipe is not a JSON object.")
+    recipe = payload.get("recipe")
+    if not isinstance(recipe, dict) or not isinstance(recipe.get("controls"), dict):
+        raise ValueError("The metadata does not contain a restorable paper recipe.")
+    return payload
+
+
+def _apply_paper_recipe(payload: dict) -> None:
+    """Restore source, analysis, titration, and layout controls from metadata."""
+    recipe = payload["recipe"]
+    source = payload.get("source_manifest") or {}
+    source_root = source.get("root")
+    recipe_folders = recipe.get("folders") or ([source_root] if source_root else [])
+    if recipe_folders:
+        st.session_state.folders = [str(path) for path in recipe_folders]
+    st.session_state["analysis_mode"] = "SWV"
+    st.session_state["analysis_view"] = "Paper Figures"
+
+    analysis = recipe.get("analysis") or {}
+    crop_range = analysis.get("crop_range_V")
+    if isinstance(crop_range, (list, tuple)) and len(crop_range) == 2:
+        st.session_state["swv_crop_min"] = float(crop_range[0])
+        st.session_state["swv_crop_max"] = float(crop_range[1])
+    analysis_controls = {
+        "smooth_window": "swv_smooth_window",
+        "smooth_polyorder": "swv_smooth_polyorder",
+        "minima_search_window_V": "swv_minima_window",
+        "prominent_minima": "swv_use_prominent_minima",
+        "double_correction": "swv_double_correction",
+    }
+    for recipe_key, state_key in analysis_controls.items():
+        if recipe_key in analysis:
+            st.session_state[state_key] = copy.deepcopy(analysis[recipe_key])
+    cutoff = analysis.get("minimum_peak_cutoff_uA")
+    st.session_state["swv_use_peak_cutoff"] = cutoff is not None
+    if cutoff is not None:
+        st.session_state["swv_min_peak_height"] = float(cutoff)
+
+    titration = recipe.get("titration") or {}
+    st.session_state["swv_enable_titration_analysis"] = True
+    st.session_state["swv_fit_titration_langmuir"] = True
+    if titration.get("baseline_mode") == "preceding_buffer":
+        st.session_state["swv_titration_baseline_mode"] = "Immediately preceding buffer"
+    if titration.get("concentration_unit"):
+        st.session_state["swv_titration_concentration_unit"] = str(
+            titration["concentration_unit"]
+        )
+    if titration.get("edge_trim_fraction") is not None:
+        st.session_state["swv_titration_edge_trim_fraction"] = float(
+            titration["edge_trim_fraction"]
+        )
+    if "remove_extreme_outliers" in titration:
+        st.session_state["swv_remove_extreme_titration_outliers"] = bool(
+            titration["remove_extreme_outliers"]
+        )
+    included_steps = recipe.get("included_steps")
+    if isinstance(included_steps, list):
+        st.session_state["swv_titration_included_step_labels"] = copy.deepcopy(
+            included_steps
+        )
+        st.session_state["_swv_titration_recipe_preserve_selection"] = True
+    vlines = recipe.get("vlines")
+    if isinstance(vlines, list):
+        vline_lines = []
+        for item in vlines:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            try:
+                position = float(item[0])
+            except (TypeError, ValueError):
+                continue
+            vline_lines.append(f"{position:g},{item[1]}")
+        vline_text = "\n".join(vline_lines)
+        st.session_state["swv_post_vlines_input"] = vline_text
+        st.session_state["_swv_autotitration_generated_vlines"] = vline_text
+    for key, value in recipe["controls"].items():
+        if isinstance(key, str) and (
+            key == "paper_show_panel_letters" or key.startswith("paper_")
+        ):
+            st.session_state[key] = copy.deepcopy(value)
+    st.session_state["paper_recipe_loaded_name"] = str(
+        payload.get("figure_type") or payload.get("name") or "paper figure"
+    )
+
+
+def _paper_source_manifest(rows: List[dict], source_folders: List[str]) -> dict:
+    """Hash the real source files used by a paper figure recipe."""
+    roots = [Path(folder).expanduser().resolve() for folder in source_folders]
+    records = []
+    seen = set()
+    for row in rows:
+        raw_path = row.get("file_path")
+        if not raw_path:
+            continue
+        path = Path(str(raw_path)).expanduser().resolve()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        relative = path.name
+        root_index = None
+        for index, root in enumerate(roots):
+            try:
+                relative = str(path.relative_to(root))
+                root_index = index
+                break
+            except ValueError:
+                continue
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        records.append({
+            "root_index": root_index,
+            "relative_path": relative,
+            "sha256": digest.hexdigest(),
+            "size_bytes": path.stat().st_size,
+        })
+    return {
+        "roots": [str(root) for root in roots],
+        "files": records,
+        "file_count": len(records),
+        "verification": "SHA-256 of every plotted source file",
+    }
+
+
+_pending_paper_recipe = st.session_state.pop("_pending_paper_recipe", None)
+if isinstance(_pending_paper_recipe, dict):
+    _apply_paper_recipe(_pending_paper_recipe)
 
 # 
 # Page config
@@ -3415,7 +3672,7 @@ def parse_vlines(text: str) -> Tuple[List[Tuple[float, str]], List[str]]:
     return vlines, errors
 
 
-AUTOTITRATION_VLINE_DETECTION_VERSION = 3
+AUTOTITRATION_VLINE_DETECTION_VERSION = 4
 
 _AUTOTITRATION_QUEUE_ITEM_RE = re.compile(
     r"(?:Queue start ->|Queue step\s+\d+\s*/\s*\d+:)\s*",
@@ -3489,7 +3746,8 @@ def _autotitration_session_logs(folders: List[str]) -> List[Path]:
 def detect_autotitration_vlines(
     folders: List[str],
     results: List[dict],
-) -> Tuple[List[Tuple[float, str]], List[Path]]:
+    include_channel_boundaries: bool = False,
+) -> tuple:
     """Map logged autotitration concentrations onto the active result scan axis."""
     logs = _autotitration_session_logs(folders)
     logged_measurements: Dict[Tuple[int, int], Tuple[str, str]] = {}
@@ -3559,51 +3817,57 @@ def detect_autotitration_vlines(
             "unit": concentration[1],
         })
     if not matched_rows:
-        return [], used_logs
+        return ([], {}, used_logs) if include_channel_boundaries else ([], used_logs)
 
-    matched_rows.sort(key=lambda row: (row["global_scan"], row["channel"]))
-    segments: List[dict] = []
-    for row in matched_rows:
-        identity = (row["concentration"], row["unit"])
-        if not segments or segments[-1]["identity"] != identity:
-            segments.append({"identity": identity, "rows": []})
-        segments[-1]["rows"].append(row)
-
-    detected_vlines: List[Tuple[float, str]] = []
-    for segment in segments:
-        first_by_channel: Dict[int, float] = {}
-        for row in segment["rows"]:
-            channel = int(row["channel"])
-            first_by_channel[channel] = min(
-                first_by_channel.get(channel, float("inf")),
-                float(row["plotted_scan"]),
-            )
-        if not first_by_channel:
-            continue
-        boundary = float(np.median(list(first_by_channel.values())))
-        if np.isclose(boundary, round(boundary)):
-            boundary = float(round(boundary))
-        concentration, unit = segment["identity"]
-        if detected_vlines and boundary <= detected_vlines[-1][0]:
-            continue
-        detected_vlines.append((boundary, f"{concentration} {unit}".strip()))
-
-    if detected_vlines and segments:
-        last_by_channel: Dict[int, float] = {}
-        for row in segments[-1]["rows"]:
-            channel = int(row["channel"])
-            last_by_channel[channel] = max(
-                last_by_channel.get(channel, float("-inf")),
-                float(row["plotted_scan"]),
-            )
-        if last_by_channel:
-            closing_boundary = float(
-                np.median([value + 1.0 for value in last_by_channel.values()])
-            )
+    # Build boundaries independently for each physical channel.  Combining all
+    # rows first used to collapse staggered method/channel starts to a median,
+    # which then shifted or dropped intervals during display-group remapping.
+    vlines_by_channel: Dict[int, List[Tuple[float, str]]] = {}
+    for channel in sorted({int(row["channel"]) for row in matched_rows}):
+        channel_rows = sorted(
+            (row for row in matched_rows if int(row["channel"]) == channel),
+            key=lambda row: row["global_scan"],
+        )
+        segments: List[dict] = []
+        for row in channel_rows:
+            identity = (row["concentration"], row["unit"])
+            if not segments or segments[-1]["identity"] != identity:
+                segments.append({"identity": identity, "rows": []})
+            segments[-1]["rows"].append(row)
+        channel_vlines: List[Tuple[float, str]] = []
+        for segment in segments:
+            boundary = min(float(row["plotted_scan"]) for row in segment["rows"])
+            if np.isclose(boundary, round(boundary)):
+                boundary = float(round(boundary))
+            concentration, unit = segment["identity"]
+            channel_vlines.append((boundary, f"{concentration} {unit}".strip()))
+        if segments:
+            closing_boundary = max(
+                float(row["plotted_scan"]) for row in segments[-1]["rows"]
+            ) + 1.0
             if np.isclose(closing_boundary, round(closing_boundary)):
                 closing_boundary = float(round(closing_boundary))
-            if closing_boundary > detected_vlines[-1][0]:
-                detected_vlines.append((closing_boundary, "end"))
+            channel_vlines.append((closing_boundary, "end"))
+        if channel_vlines:
+            vlines_by_channel[channel] = channel_vlines
+
+    # The editable textarea remains a shared-axis summary.  Match boundary
+    # occurrences by ordinal+label and use a median only for that summary;
+    # analysis and plotting retain the exact channel-specific lists above.
+    aggregate_events: Dict[Tuple[int, str], List[float]] = {}
+    for channel_vlines in vlines_by_channel.values():
+        for ordinal, (boundary, label) in enumerate(channel_vlines):
+            aggregate_events.setdefault((ordinal, label), []).append(boundary)
+    detected_vlines = []
+    for (_ordinal, label), boundaries in aggregate_events.items():
+        boundary = float(np.median(boundaries))
+        if np.isclose(boundary, round(boundary)):
+            boundary = float(round(boundary))
+        detected_vlines.append((boundary, label))
+    detected_vlines.sort(key=lambda item: item[0])
+
+    if include_channel_boundaries:
+        return detected_vlines, vlines_by_channel, used_logs
     return detected_vlines, used_logs
 
 
@@ -4103,6 +4367,8 @@ def apply_swv_modulo_split_for_display(
 def remap_vlines_to_swv_display_group(
     vlines: List[Tuple[float, str]],
     group_rows: List[dict],
+    *,
+    allow_local_axis_fallback: bool = False,
 ) -> List[Tuple[float, str]]:
     """Map source-axis annotation intervals onto one group-local iteration axis."""
     if not vlines or not group_rows:
@@ -4146,16 +4412,12 @@ def remap_vlines_to_swv_display_group(
         closing_value = final_local_value + 1.0
         if closing_value > remapped[-1][0]:
             remapped.append((closing_value, ordered_vlines[-1][1]))
-    # BO and other block-saved exports can give every settings group a complete
-    # local measurement sequence while retaining disjoint source scan ranges.
-    # In that layout source-axis remapping annotates only the first group (or a
-    # small tail of a later group). Prefer the local-axis interpretation when
-    # it preserves more of the supplied annotation sequence. Interleaved
-    # methods still use the source remapping because both interpretations have
-    # equal coverage there.
-    local_axis_vlines = filter_vlines_to_results_axis(vlines, group_rows)
-    if len(local_axis_vlines) > len(remapped):
-        return local_axis_vlines
+    # Axis provenance is explicit.  Choosing whichever interpretation happened
+    # to produce more lines made a source boundary silently become a local one.
+    # The fallback remains available only to callers that know their input was
+    # authored on a pre-grouped local axis.
+    if allow_local_axis_fallback and not remapped:
+        return filter_vlines_to_results_axis(vlines, group_rows)
     return remapped
 
 
@@ -4716,7 +4978,6 @@ with st.sidebar:
                 updated_folders = _append_unique_folder(updated_folders, output_folder)
             st.session_state.folders = updated_folders
             st.rerun()
-
     conversion_report = st.session_state.get("mat_conversion_report")
     if analysis_mode == "SWV" and conversion_report:
         converted_count = len(conversion_report.get("converted", []))
@@ -6128,8 +6389,16 @@ if analysis_mode == "SWV":
             "without rerunning the expensive analysis."
         )
 
-    detected_autotitration_vlines, autotitration_logs = (
-        detect_autotitration_vlines(folders, results)
+    (
+        detected_autotitration_vlines,
+        detected_autotitration_vlines_by_channel,
+        autotitration_logs,
+    ) = (
+        detect_autotitration_vlines(
+            folders,
+            results,
+            include_channel_boundaries=True,
+        )
     )
     detected_autotitration_text = _vlines_input_text(
         detected_autotitration_vlines
@@ -6320,7 +6589,17 @@ if analysis_mode == "SWV":
                     previous_selection = st.session_state.get(
                         "swv_titration_included_step_labels"
                     )
-                    if previous_selection is None or not previous_signature:
+                    preserve_recipe_selection = bool(
+                        st.session_state.pop(
+                            "_swv_titration_recipe_preserve_selection", False
+                        )
+                    )
+                    if preserve_recipe_selection and previous_selection is not None:
+                        next_selection = [
+                            label for label in previous_selection
+                            if label in concentration_options
+                        ]
+                    elif previous_selection is None or not previous_signature:
                         next_selection = concentration_options
                     else:
                         next_selection = [
@@ -6374,6 +6653,35 @@ if analysis_mode == "SWV":
             st.warning(err)
 
         active_vlines = filter_vlines_to_results_axis(vlines, results)
+        using_unedited_autotitration_boundaries = (
+            bool(detected_autotitration_text)
+            and str(st.session_state.get("swv_post_vlines_input", "")).strip()
+            == detected_autotitration_text.strip()
+        )
+        active_autotitration_vlines_by_channel: Dict[
+            Any, List[Tuple[float, str]]
+        ] = {}
+        if using_unedited_autotitration_boundaries:
+            result_channels = {
+                row.get("original_channel", row.get("channel"))
+                for row in results
+            }
+            for result_channel in result_channels:
+                detected_lines = next((
+                    lines
+                    for detected_channel, lines
+                    in detected_autotitration_vlines_by_channel.items()
+                    if str(detected_channel) == str(result_channel)
+                ), None)
+                if detected_lines:
+                    channel_rows = [
+                        row for row in results
+                        if str(row.get("original_channel", row.get("channel")))
+                        == str(result_channel)
+                    ]
+                    active_autotitration_vlines_by_channel[result_channel] = (
+                        filter_vlines_to_results_axis(detected_lines, channel_rows)
+                    )
         kept_vlines = len(active_vlines)
         if use_scan_range and scan_windows:
             st.caption(
@@ -6412,7 +6720,12 @@ plot_results_by_channel = results_by_channel
 plot_failed_results_by_channel = failed_results_by_channel
 plot_ok_results_by_channel = ok_plot_results_by_channel
 plot_channels_display = channels_display
-plot_vlines_by_channel: Dict[Any, List[Tuple[float, str]]] = {}
+plot_vlines_by_channel: Dict[Any, List[Tuple[float, str]]] = dict(
+    active_autotitration_vlines_by_channel
+    if analysis_mode == "SWV"
+    and "active_autotitration_vlines_by_channel" in locals()
+    else {}
+)
 use_swv_display_grouping = (
     analysis_mode == "SWV"
     and (use_swv_settings_grouping or use_swv_modulo_split)
@@ -6464,7 +6777,20 @@ if use_swv_display_grouping:
     ]
     plot_vlines_by_channel = {
         display_channel: remap_vlines_to_swv_display_group(
-            active_vlines,
+            next((
+                channel_lines
+                for source_channel, channel_lines
+                in (
+                    active_autotitration_vlines_by_channel.items()
+                    if "active_autotitration_vlines_by_channel" in locals()
+                    else []
+                )
+                if str(source_channel) == str(
+                    plot_results_by_channel.get(display_channel, [{}])[0].get(
+                        "original_channel", display_channel
+                    )
+                )
+            ), active_vlines),
             plot_results_by_channel.get(display_channel, []),
         )
         for display_channel in plot_channels_display
@@ -6510,7 +6836,25 @@ if analysis_mode == "SWV" and enable_titration_analysis and not use_swv_display_
         ]
         titration_vlines_by_channel = {
             channel: remap_vlines_to_swv_display_group(
-                active_vlines,
+                next((
+                    channel_lines
+                    for source_channel, channel_lines
+                    in (
+                        active_autotitration_vlines_by_channel.items()
+                        if "active_autotitration_vlines_by_channel" in locals()
+                        else []
+                    )
+                    if str(source_channel) == str(
+                        next(
+                            (
+                                row.get("original_channel", channel)
+                                for row in titration_results
+                                if row.get("channel") == channel
+                            ),
+                            channel,
+                        )
+                    )
+                ), active_vlines),
                 [row for row in titration_results if row.get("channel") == channel],
             )
             for channel in titration_channels
@@ -6961,7 +7305,10 @@ if analysis_mode == "SWV":
 # 
 # Tabs
 # 
-view_options = ["Overlays", "Metrics", "Paper Figures", "Drift", "Data Table", "Export"]
+view_options = [
+    "Overlays", "Metrics", "Paper Figures", "Figure Composer",
+    "Drift", "Data Table", "Export",
+]
 view_options.insert(3, "Failures")
 if analysis_mode == "SWV":
     view_options.insert(4, "Quality audit")
@@ -6971,6 +7318,10 @@ view = st.radio(
     horizontal=True,
     key="analysis_view",
 )
+
+if view == "Figure Composer":
+    render_captured_figure_composer()
+    st.stop()
 
 
 if view == "Quality audit":
@@ -7030,6 +7381,31 @@ if view == "Paper Figures":
         "Types 3 and 4 share every row's physical channel, optimized/manual method, "
         "measurement interval, and fit selection. Change it once here; both figures update."
     )
+    with st.expander("Load figure recipe", expanded=False):
+        recipe_upload = st.file_uploader(
+            "Recipe JSON, metadata PNG, or figure ZIP",
+            type=["json", "png", "zip"],
+            key="paper_recipe_upload",
+            help=(
+                "Restores source folders and every saved Paper Figure control. "
+                "The raw source files are never embedded or modified."
+            ),
+        )
+        if recipe_upload is not None and st.button(
+            "Load recipe into analyzer", key="paper_recipe_apply", type="primary"
+        ):
+            try:
+                loaded_recipe = _paper_recipe_from_upload(
+                    recipe_upload.getvalue(), recipe_upload.name
+                )
+                st.session_state["_pending_paper_recipe"] = loaded_recipe
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not load figure recipe: {exc}")
+        if st.session_state.get("paper_recipe_loaded_name"):
+            st.success(
+                f"Loaded recipe: {st.session_state['paper_recipe_loaded_name']}"
+            )
     if analysis_mode != "SWV" or not titration_ready or not fit_titration_langmuir:
         st.warning(
             "Run SWV analysis, enable titration intervals, and enable Langmuir fitting first."
@@ -7072,7 +7448,7 @@ if view == "Paper Figures":
             key="paper_titration_font",
         ))
         paper_width = float(control_cols[1].number_input(
-            "Canvas width (in)", 6.0, 16.0, value=10.0, step=.5,
+            "Canvas width (in)", 6.0, 30.0, value=10.0, step=.5,
             key="paper_titration_width",
         ))
         paper_raster_dpi = int(control_cols[2].number_input(
@@ -7142,7 +7518,11 @@ if view == "Paper Figures":
                 "Legend size (pt)", 4.0, 30.0, value=max(4.5, paper_font * .8), step=.5,
                 key="paper_legend_font_size",
             )
-        st.caption("Transparent, content-cropped exports. Scan range crops the display; fitting uses all included doses. PDF panels retain the selected raster DPI.")
+        st.caption(
+            "Transparent, content-cropped exports. Display start/end crop the panels; "
+            "Fit only display range determines whether those limits also constrain fitting. "
+            "PDF panels retain the selected raster DPI."
+        )
         with st.expander("SWV processing and filtering", expanded=True):
             paper_trace_region = st.radio(
                 "SWV voltage window",
@@ -7158,6 +7538,14 @@ if view == "Paper Figures":
             paper_accepted_only = st.checkbox('Accepted SWVs only', value=True,
                 key='paper_titration_accepted_only',
                 help='Matches the standard SWV overlay: show scans passing analysis acceptance. Failed scans stay in the quality audit and are not replaced.')
+            paper_ignore_first_response = st.checkbox(
+                'Ignore the first target response', value=False,
+                key='paper_titration_ignore_first_response',
+                help=(
+                    'Excludes every measurement in the first non-buffer titration interval '
+                    'from SWV, response, fit, and validation panels. The source files remain unchanged.'
+                ),
+            )
             paper_response_change = st.radio('Response display',
                 ['Change from preceding buffer', 'Absolute peak current'],
                 key='paper_titration_response_measure', horizontal=True,
@@ -7187,11 +7575,91 @@ if view == "Paper Figures":
             key="paper_titration_response_display",
         )
         paper_extra_columns = display_cols[3].multiselect(
-            "Extra Type 3 columns", ["SNR by concentration", "Predicted vs known"],
+            "Extra Type 3 columns",
+            [
+                "SNR by concentration",
+                "Concentration by measurement",
+                "Predicted vs known",
+            ],
             key="paper_titration_extra_columns",
             help="Appended after the Langmuir column for every comparison row.",
             disabled=is_directional_type3,
         )
+        st.checkbox(
+            "Use the full analyzed range in SWV overlay panels",
+            value=False,
+            key="paper_titration_swv_full_range",
+            help=(
+                "When enabled, the manual/optimized SWV overlays include every analyzed "
+                "measurement, while the response and concentration-by-measurement panels "
+                "still use each row's Display start/end range. Fits remain controlled "
+                "separately by Fit only display range and the selected concentration steps."
+            ),
+            disabled=is_directional_type3,
+        )
+        with st.expander("Panel layout, axes, and curve style", expanded=True):
+            layout_cols = st.columns(4)
+            paper_row_height = float(layout_cols[0].number_input(
+                "Row height (in)", 1.5, 6.0,
+                value=3.1 if figure_type.startswith("Type 4") else 2.6,
+                step=.1, key="paper_titration_row_height",
+            ))
+            paper_column_gap = float(layout_cols[1].slider(
+                "Column gap", 0.0, .6, .16, .01,
+                key="paper_titration_column_gap",
+            ))
+            paper_row_gap = float(layout_cols[2].slider(
+                "Row gap", 0.0, .6, .18, .01,
+                key="paper_titration_row_gap",
+            ))
+            paper_fit_display_range = layout_cols[3].checkbox(
+                "Fit only display range",
+                value=False,
+                key="paper_titration_fit_display_range",
+                help=(
+                    "Off fits all selected dose intervals. On gives every row's "
+                    "Display start/end controls authority over both the plots and fits."
+                ),
+            )
+            style_cols = st.columns(5)
+            style_cols[0].slider(
+                "Curve thickness", .25, 4.0, 1.0, .05,
+                key="paper_titration_line_scale",
+            )
+            style_cols[1].slider(
+                "Marker size", .25, 4.0, 1.0, .05,
+                key="paper_titration_marker_scale",
+            )
+            style_cols[2].slider(
+                "Axis-line thickness", .2, 4.0, .8, .1,
+                key="paper_titration_spine_width",
+            )
+            style_cols[3].color_picker(
+                "Axis-line color", "#222222",
+                key="paper_titration_spine_color",
+            )
+            style_cols[4].selectbox(
+                "Legend position",
+                ["Automatic", "Upper right", "Upper left", "Lower right", "Lower left"],
+                key="paper_titration_legend_location",
+            )
+            vline_cols = st.columns(3)
+            vline_cols[0].checkbox(
+                "Show titration boundaries", value=True,
+                key="paper_titration_show_vlines",
+            )
+            vline_cols[1].slider(
+                "Boundary thickness", .2, 4.0, 1.0, .1,
+                key="paper_titration_vline_width",
+            )
+            vline_cols[2].slider(
+                "Boundary opacity", .05, 1.0, .6, .05,
+                key="paper_titration_vline_alpha",
+            )
+            st.caption(
+                "For different limits, sizes, and placement on every individual panel, "
+                "generate the figure and choose Edit source panels in Figure Composer."
+            )
         physical_channels = sorted({
             row.get("original_channel", row.get("channel")) for row in titration_results
         }, key=_channel_display_sort_key)
@@ -7356,12 +7824,61 @@ if view == "Paper Figures":
         if can_generate and st.button("Generate paper figure", type="primary", use_container_width=True):
             _PAPER_LEGEND_STORE.clear()
             panels: List[Optional[plt.Figure]] = []
+            paper_source_results = titration_results
+            if paper_ignore_first_response:
+                def outside_first_target(row):
+                    channel_markers = titration_vlines_by_channel.get(
+                        row.get('channel'), titration_active_vlines
+                    )
+                    markers = sorted(channel_markers or [], key=lambda item: float(item[0]))
+                    for marker_index, (start_value, marker_label) in enumerate(markers):
+                        label = str(marker_label or '').strip().lower()
+                        if not label or 'buffer' in label or label == 'end':
+                            continue
+                        try:
+                            scan = float(row.get('scan_number'))
+                            start = float(start_value)
+                            end = (
+                                float(markers[marker_index + 1][0])
+                                if marker_index + 1 < len(markers) else float('inf')
+                            )
+                        except (TypeError, ValueError):
+                            return True
+                        return not (start <= scan < end)
+                    return True
+
+                paper_source_results = [
+                    row for row in titration_results if outside_first_target(row)
+                ]
+            def display_markers(markers):
+                markers = list(markers or [])
+                if not paper_ignore_first_response:
+                    return markers
+                output = []
+                first_target_hidden = False
+                for position, label_value in markers:
+                    label = str(label_value or '').strip().lower()
+                    hide = (
+                        not first_target_hidden
+                        and bool(label)
+                        and 'buffer' not in label
+                        and label != 'end'
+                    )
+                    output.append((position, '' if hide else label_value))
+                    first_target_hidden = first_target_hidden or hide
+                return output
+
+            paper_display_vlines = display_markers(titration_active_vlines)
+            paper_display_vlines_by_channel = {
+                channel: display_markers(markers)
+                for channel, markers in titration_vlines_by_channel.items()
+            }
             paper_metric_results = (
                 filter_extreme_titration_outliers(
-                    titration_results, metric="peak_current_selected",
+                    paper_source_results, metric="peak_current_selected",
                     vlines=titration_active_vlines,
                     vlines_by_channel=titration_vlines_by_channel,
-                ) if remove_extreme_titration_outliers else titration_results
+                ) if remove_extreme_titration_outliers else paper_source_results
             )
             if paper_response_change:
                 paper_metric_results = titration_measurement_changes(
@@ -7382,7 +7899,7 @@ if view == "Paper Figures":
 
                 def directional_trace(method, direction_label, colormap):
                     rows = [
-                        row for row in titration_results
+                        row for row in paper_source_results
                         if row.get("channel") == method
                         and display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1]
                     ]
@@ -7408,7 +7925,9 @@ if view == "Paper Figures":
                     response = _paper_response_panel(
                         paper_metric_results, optimized=method, manual=manual, physical=physical,
                         colors={method: '#1464a0', manual: '#8ecae6'},
-                        vlines=titration_active_vlines, scan_range=display_range,
+                        vlines=paper_display_vlines,
+                        vlines_by_channel=paper_display_vlines_by_channel,
+                        scan_range=display_range,
                         change=paper_response_change,
                     )
                     if response is not None and response.axes:
@@ -7432,11 +7951,12 @@ if view == "Paper Figures":
                 if has_paired_directional_langmuirs:
                     def paired_directional_langmuir(method, direction_label, color):
                         return plot_titration_langmuir(
-                            titration_results,
+                            paper_source_results,
                             metric="peak_current_selected",
                             vlines=titration_active_vlines,
                             channels=[method, manual],
                             vlines_by_channel=titration_vlines_by_channel,
+                            scan_range=(display_range if paper_fit_display_range else None),
                             title=(
                                 f"Channel {physical} {direction_label} Langmuir Response"
                             ),
@@ -7465,8 +7985,9 @@ if view == "Paper Figures":
                     ))
                     composite = _paper_composite_figure(
                         [panel for row in row_figures for panel in row],
-                        2, 4, width=paper_width, row_height=2.6,
+                        2, 4, width=paper_width, row_height=paper_row_height,
                         font_size=paper_font, raster_dpi=paper_raster_dpi,
+                        column_gap=paper_column_gap, row_gap=paper_row_gap,
                     )
                     st.session_state["paper_titration_render"] = (
                         "type3_signal_on_off_paired", composite, 2,
@@ -7474,11 +7995,12 @@ if view == "Paper Figures":
                     )
                 else:
                     shared_langmuir = plot_titration_langmuir(
-                        titration_results,
+                        paper_source_results,
                         metric="peak_current_selected",
                         vlines=titration_active_vlines,
                         channels=[signal_on, signal_off],
                         vlines_by_channel=titration_vlines_by_channel,
+                        scan_range=(display_range if paper_fit_display_range else None),
                         title=langmuir_title_template.replace("{channel}", str(physical)),
                         ylabel=paper_y_label,
                         edge_trim_fraction=titration_edge_trim_fraction,
@@ -7494,8 +8016,9 @@ if view == "Paper Figures":
                         channel_labels={signal_on: 'Optimized Signal-On', signal_off: 'Optimized Signal-Off'},
                     )
                     difference_steps = build_titration_step_table(
-                        titration_results, metric="peak_current_selected", vlines=titration_active_vlines,
+                        paper_source_results, metric="peak_current_selected", vlines=titration_active_vlines,
                         channels=[signal_on, signal_off], vlines_by_channel=titration_vlines_by_channel,
+                        scan_range=(display_range if paper_fit_display_range else None),
                         edge_trim_fraction=titration_edge_trim_fraction,
                         concentration_unit=titration_concentration_unit, baseline_mode=paper_fit_baseline,
                         included_step_labels=titration_included_step_labels,
@@ -7506,7 +8029,9 @@ if view == "Paper Figures":
                         st.warning("No matched accepted concentrations for ON minus OFF; no difference curve was fabricated.")
                     composite = _paper_directional_titration_figure(
                         row_figures, shared_langmuir, width=paper_width,
-                        row_height=2.6, font_size=paper_font, raster_dpi=paper_raster_dpi,
+                        row_height=paper_row_height, font_size=paper_font,
+                        raster_dpi=paper_raster_dpi,
+                        column_gap=paper_column_gap, row_gap=paper_row_gap,
                     )
                     st.session_state["paper_titration_render"] = (
                         "type3_signal_on_off", composite, 2, paper_width, paper_font
@@ -7515,9 +8040,12 @@ if view == "Paper Figures":
                 for physical, optimized, manual, display_range in comparisons:
                     row_map = {
                         method: [
-                            row for row in titration_results
+                            row for row in paper_source_results
                             if row.get("channel") == method
-                            and display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1]
+                            and (
+                                bool(st.session_state.get("paper_titration_swv_full_range", False))
+                                or display_range[0] <= float(row.get("scan_number", -1)) <= display_range[1]
+                            )
                         ]
                         for method in (manual, optimized)
                     }
@@ -7553,7 +8081,8 @@ if view == "Paper Figures":
                             channels=method_channels,
                             title=label,
                             ylabel=paper_y_label,
-                            vlines=titration_active_vlines,
+                            vlines=paper_display_vlines,
+                            vlines_by_channel=paper_display_vlines_by_channel,
                             scan_range=display_range,
                             xlabel="SWV Measurement Number",
                             channel_colors=consistent_channel_colors,
@@ -7571,7 +8100,8 @@ if view == "Paper Figures":
                                 response_panel([optimized], f"Channel {physical} Optimized Response"),
                                 response_panel([manual], f"Channel {physical} Unoptimized Response"),
                             ],
-                            paper_font, paper_width / (4 + len(paper_extra_columns)) * 0.92, 2.6 * 0.92,
+                            paper_font, paper_width / (4 + len(paper_extra_columns)) * 0.92,
+                            paper_row_height * 0.92,
                             raster_dpi=paper_raster_dpi,
                         )
                         panels.append(stacked_response)
@@ -7580,11 +8110,12 @@ if view == "Paper Figures":
                             [optimized, manual], response_title_template.replace("{channel}", str(physical)),
                         ))
                     panels.append(plot_titration_langmuir(
-                        titration_results,
+                        paper_source_results,
                         metric="peak_current_selected",
                         vlines=titration_active_vlines,
                         channels=[optimized, manual],
                         vlines_by_channel=titration_vlines_by_channel,
+                        scan_range=(display_range if paper_fit_display_range else None),
                         title=langmuir_title_template.replace("{channel}", str(physical)),
                         ylabel=paper_y_label,
                         edge_trim_fraction=titration_edge_trim_fraction,
@@ -7599,14 +8130,14 @@ if view == "Paper Figures":
                         offset_to_response_baseline=paper_response_change,
                         channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
                     ))
-                    # The fit always uses the full titration (all selected doses);
-                    # the display range above only crops the plotted portion.
+                    # Fit range is explicit: either the whole selected titration
+                    # or this row's displayed measurement interval.
                     if paper_extra_columns:
                         fit_kwargs = dict(
                             vlines=titration_active_vlines,
                             vlines_by_channel=titration_vlines_by_channel,
                             channels=[optimized, manual],
-                            scan_range=None,
+                            scan_range=(display_range if paper_fit_display_range else None),
                             edge_trim_fraction=titration_edge_trim_fraction,
                             concentration_unit=titration_concentration_unit,
                             baseline_mode=titration_baseline_mode,
@@ -7616,10 +8147,10 @@ if view == "Paper Figures":
                     for extra_column in paper_extra_columns:
                         if extra_column == "SNR by concentration":
                             step_rows = build_titration_step_table(
-                                titration_results, metric="peak_current_selected", **fit_kwargs,
+                                paper_source_results, metric="peak_current_selected", **fit_kwargs,
                             )
                             fit_rows = build_titration_langmuir_summary_table(
-                                titration_results, metric="peak_current_selected", **fit_kwargs,
+                                paper_source_results, metric="peak_current_selected", **fit_kwargs,
                             )
                             panels.append(plot_titration_snr(
                                 step_rows,
@@ -7631,9 +8162,29 @@ if view == "Paper Figures":
                                 response_directions=consistent_response_directions,
                                 channel_colors=consistent_channel_colors,
                             ))
+                        elif extra_column == "Concentration by measurement":
+                            extra_accuracy = collect_titration_measurement_accuracy_rows(
+                                paper_source_results,
+                                metric_cfg={"Peak current": ("peak_current_selected", "Peak Height (uA)")},
+                                include_buffer_measurements=True,
+                                **fit_kwargs,
+                            )
+                            panels.append(plot_titration_concentration_vs_measurement(
+                                extra_accuracy,
+                                title=f"Channel {physical} | Concentration by Measurement",
+                                concentration_unit=titration_concentration_unit,
+                                channel_colors=consistent_channel_colors,
+                                response_directions=consistent_response_directions,
+                                vlines=paper_display_vlines,
+                                vlines_by_channel=paper_display_vlines_by_channel,
+                                channel_labels={
+                                    optimized: optimized_display_label,
+                                    manual: unoptimized_display_label,
+                                },
+                            ))
                         else:
                             extra_accuracy = collect_titration_measurement_accuracy_rows(
-                                titration_results,
+                                paper_source_results,
                                 metric_cfg={"Peak current": ("peak_current_selected", "Peak Height (uA)")},
                                 include_buffer_measurements=True,
                                 **fit_kwargs,
@@ -7650,8 +8201,9 @@ if view == "Paper Figures":
                             ))
                 composite = _paper_composite_figure(
                     panels, len(comparisons), 4 + len(paper_extra_columns),
-                    width=paper_width, row_height=2.6, font_size=paper_font,
+                    width=paper_width, row_height=paper_row_height, font_size=paper_font,
                     raster_dpi=paper_raster_dpi,
+                    column_gap=paper_column_gap, row_gap=paper_row_gap,
                 )
                 st.session_state["paper_titration_render"] = (
                     "type3", composite, paper_rows, paper_width, paper_font
@@ -7659,13 +8211,12 @@ if view == "Paper Figures":
             else:
                 for physical, optimized, manual, display_range in comparisons:
                     accuracy_rows = collect_titration_measurement_accuracy_rows(
-                        titration_results,
+                        paper_source_results,
                         metric_cfg={"Peak current": ("peak_current_selected", "Peak Height (uA)")},
                         channels=[optimized, manual],
                         vlines=titration_active_vlines,
                         vlines_by_channel=titration_vlines_by_channel,
-                        # Fit on the whole titration; the display range below only crops.
-                        scan_range=None,
+                        scan_range=(display_range if paper_fit_display_range else None),
                         edge_trim_fraction=titration_edge_trim_fraction,
                         concentration_unit=titration_concentration_unit,
                         baseline_mode=titration_baseline_mode,
@@ -7685,7 +8236,8 @@ if view == "Paper Figures":
                             concentration_unit=titration_concentration_unit,
                             channel_colors=consistent_channel_colors,
                             response_directions=consistent_response_directions,
-                            vlines=titration_active_vlines,
+                            vlines=paper_display_vlines,
+                            vlines_by_channel=paper_display_vlines_by_channel,
                             channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
                         )
 
@@ -7701,7 +8253,8 @@ if view == "Paper Figures":
                                     f"Channel {physical} Unoptimized Concentration by Measurement",
                                 ),
                             ],
-                            paper_font, paper_width / 2 * 0.92, 3.1 * 0.92,
+                            paper_font, paper_width / 2 * 0.92,
+                            paper_row_height * 0.92,
                             raster_dpi=paper_raster_dpi,
                         ))
                     else:
@@ -7722,11 +8275,12 @@ if view == "Paper Figures":
                     ))
                 composite = _paper_composite_figure(
                     panels, len(comparisons), 2, width=paper_width,
-                    row_height=3.1, font_size=paper_font,
+                    row_height=paper_row_height, font_size=paper_font,
                     raster_dpi=paper_raster_dpi,
                     width_ratios=[100 - st.session_state.get("paper_validation_width_percent", 45),
                                   st.session_state.get("paper_validation_width_percent", 45)],
-                    column_gap=float(st.session_state.get("paper_validation_column_gap", .04)),
+                    column_gap=float(st.session_state.get("paper_validation_column_gap", paper_column_gap)),
+                    row_gap=paper_row_gap,
                 )
                 st.session_state["paper_titration_render"] = (
                     "type4", composite, paper_rows, paper_width, paper_font
@@ -7761,12 +8315,19 @@ if view == "Paper Figures":
                         1 for row in method_rows if row.get("qa_status") not in (None, "OK")
                     ),
                 }
+            selected_source_rows = [
+                row for row in titration_results
+                if row.get("channel") in selected_methods
+            ]
             composite._paper_metadata = {
-                "schema": "swv-paper-figure/v1",
+                "schema": "swv-paper-figure/v2",
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "figure_type": figure_type,
                 "recipe_hash": paper_signature,
                 "recipe": paper_recipe,
+                "source_manifest": _paper_source_manifest(
+                    selected_source_rows, list(folders)
+                ),
                 "selection": {
                     "comparisons": comparisons,
                     "directional_selection": directional_selection,

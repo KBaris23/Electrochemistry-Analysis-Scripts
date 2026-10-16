@@ -7,21 +7,17 @@ import pytest
 import bo_session_viewer as viewer
 
 
-@pytest.mark.parametrize('enabled', [False, True])
-def test_simulated_sweep_sections_require_explicit_loading(monkeypatch, tmp_path, enabled):
+def test_simulated_sweep_sections_open_without_checkbox(monkeypatch, tmp_path):
     session = {
         'root': tmp_path,
         'state': {'simulation_metadata': {'run_count': 20}},
         'config': {'records': {'simulated_session': True}},
     }
-    calls = []
-    def checkbox(label, **kwargs):
-        calls.append((label, kwargs))
-        return enabled
-    monkeypatch.setattr(viewer.st, 'checkbox', checkbox)
-    assert viewer._load_simulated_sweep_section(session, 'Surrogate plots') is enabled
-    assert calls[0][1]['value'] is False
-    assert 'Surrogate plots' in calls[0][0]
+    monkeypatch.setattr(
+        viewer.st, 'checkbox',
+        lambda *args, **kwargs: pytest.fail('Normal tabs must not require a gate'),
+    )
+    assert viewer._load_simulated_sweep_section(session, 'Surrogate plots')
 
 
 def test_real_sessions_keep_existing_loading_behavior(monkeypatch, tmp_path):
@@ -29,17 +25,14 @@ def test_real_sessions_keep_existing_loading_behavior(monkeypatch, tmp_path):
     assert viewer._load_simulated_sweep_section({'root': tmp_path}, 'Surrogate plots')
 
 
-def test_large_physical_sessions_also_defer_hidden_tabs(monkeypatch, tmp_path):
-    calls = []
+def test_large_physical_sessions_open_without_checkbox(monkeypatch, tmp_path):
     monkeypatch.setattr(
         viewer.st,
         'checkbox',
-        lambda label, **kwargs: calls.append((label, kwargs)) or False,
+        lambda *args, **kwargs: pytest.fail('Normal tabs must not require a gate'),
     )
     session = {'root': tmp_path, 'observations': [{}] * 500}
-    assert not viewer._load_simulated_sweep_section(session, 'Real data landscapes')
-    assert calls[0][1]['value'] is False
-    assert 'on demand' in calls[0][0]
+    assert viewer._load_simulated_sweep_section(session, 'Real data landscapes')
 
 
 @pytest.mark.parametrize('function', [

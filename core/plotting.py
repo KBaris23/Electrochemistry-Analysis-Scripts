@@ -548,6 +548,10 @@ def add_scan_vlines(
     fontsize: float = 9,
     fontweight: str = "bold",
     bbox_alpha: float = 0.6,
+    color: str = "gray",
+    linewidth: float = 1.0,
+    alpha: float = 0.6,
+    label_prefix: str = "",
 ):
 
     if not vlines:
@@ -556,22 +560,30 @@ def add_scan_vlines(
 
     for x, label in vlines:
 
-        ax.axvline(x=x, color="gray", linestyle="--", alpha=0.6)
+        boundary = ax.axvline(
+            x=x,
+            color=color,
+            linestyle="--",
+            linewidth=linewidth,
+            alpha=alpha,
+        )
+        boundary._swv_titration_vline = True
 
         label_artist = ax.text(
 
-            x, y_frac, label,
+            x, y_frac, f"{label_prefix}{label}",
 
             rotation=90, va="center", ha="center",
 
             transform=ax.get_xaxis_transform(),
 
-            fontsize=fontsize, fontweight=fontweight, color="gray",
+            fontsize=fontsize, fontweight=fontweight, color=color,
 
             bbox=dict(facecolor="white", edgecolor="none", alpha=bbox_alpha, pad=1.0),
 
         )
         label_artist._swv_preserve_fontsize = True
+        label_artist._swv_titration_vline = True
 
 
 
@@ -2589,6 +2601,8 @@ def plot_metric_vs_scan(
 
     vlines: Optional[List[Tuple[float, str]]] = None,
 
+    vlines_by_channel: Optional[Dict[Any, List[Tuple[float, str]]]] = None,
+
     vline_y_frac: float = 0.85,
 
     scan_range: Optional[Tuple[int, int]] = None,
@@ -2910,14 +2924,23 @@ def plot_metric_vs_scan(
                 trace_label += " · rate unavailable"
 
         line_style, marker = trace_style_by_channel[ch]
-        line, = plot_axis.plot(x, y, marker=marker, linestyle=line_style, ms=3, lw=1.6,
-
-                color=colors[ch],
-
-                alpha=0.15 if dimmed else 0.9,
-
-                label=trace_label)
-        line._swv_preserve_color = _swv_method_blue(ch) is not None
+        plot_segments = [np.arange(len(x))]
+        if x_key == "scan_number" and len(x) > 1:
+            gap_indexes = np.flatnonzero(
+                np.diff(np.asarray(x, dtype=float)) > 1.0
+            ) + 1
+            plot_segments = np.split(np.arange(len(x)), gap_indexes)
+        line = None
+        for segment_index, segment in enumerate(plot_segments):
+            if not len(segment):
+                continue
+            line, = plot_axis.plot(
+                np.asarray(x)[segment], y[segment], marker=marker,
+                linestyle=line_style, ms=3, lw=1.6,
+                color=colors[ch], alpha=0.15 if dimmed else 0.9,
+                label=trace_label if segment_index == 0 else "_nolegend_",
+            )
+            line._swv_preserve_color = _swv_method_blue(ch) is not None
         plotted_y_by_axis[plot_axis].append(y[np.isfinite(y)])
 
         if annotate_measurement_numbers and x_key == "measurement_time":
@@ -3018,7 +3041,37 @@ def plot_metric_vs_scan(
     else:
         ax.legend(title="Channel", loc="best", fontsize=8)
 
-    add_scan_vlines(ax, filtered_vlines, vline_y_frac)
+    channel_boundary_groups: Dict[
+        Tuple[Tuple[float, str], ...], List[Any]
+    ] = {}
+    if vlines_by_channel and x_key == "scan_number":
+        for channel in channels:
+            channel_lines = _filter_titration_vlines(
+                vlines_by_channel.get(channel), scan_range
+            )
+            if channel_lines:
+                key = tuple((float(x), str(label)) for x, label in channel_lines)
+                channel_boundary_groups.setdefault(key, []).append(channel)
+    if channel_boundary_groups:
+        multiple_mappings = len(channel_boundary_groups) > 1
+        for mapping_index, (channel_lines, mapped_channels) in enumerate(
+            channel_boundary_groups.items()
+        ):
+            first_channel = mapped_channels[0]
+            mapping_color = colors.get(first_channel, "gray") if multiple_mappings else "gray"
+            readable = "/".join(
+                str((channel_labels or {}).get(channel, channel))
+                for channel in mapped_channels
+            )
+            add_scan_vlines(
+                ax,
+                channel_lines,
+                max(0.15, vline_y_frac - mapping_index * 0.12),
+                color=mapping_color,
+                label_prefix=f"{readable}: " if multiple_mappings else "",
+            )
+    else:
+        add_scan_vlines(ax, filtered_vlines, vline_y_frac)
 
     if offset_to_response_baseline:
         ax.axhline(0.0, color="gray", lw=0.9, alpha=0.6, zorder=1)
@@ -4486,6 +4539,7 @@ def plot_titration_concentration_vs_measurement(
     channel_colors: Optional[Dict[Any, Any]] = None,
     response_directions: Optional[Dict[Any, str]] = None,
     vlines: Optional[List[Tuple[float, str]]] = None,
+    vlines_by_channel: Optional[Dict[Any, List[Tuple[float, str]]]] = None,
     vline_y_frac: float = 0.86,
     channel_labels: Optional[Dict[Any, str]] = None,
 ) -> Optional[plt.Figure]:
@@ -4563,16 +4617,21 @@ def plot_titration_concentration_vs_measurement(
     plotted_level_values = list(reference_levels)
 
     fig, ax = plt.subplots(figsize=figsize)
-    ax.step(
-        reference_x,
-        reference_levels,
-        where="mid",
-        color="black",
-        lw=1.8,
-        linestyle="--",
-        label="Known Concentration",
-        zorder=10,
-    )
+    reference_breaks = np.flatnonzero(np.diff(np.asarray(reference_x, dtype=float)) > 1.0) + 1
+    reference_segments = np.split(np.arange(len(reference_x)), reference_breaks)
+    for segment_index, segment in enumerate(reference_segments):
+        if not len(segment):
+            continue
+        ax.step(
+            np.asarray(reference_x)[segment],
+            reference_levels[segment],
+            where="mid",
+            color="black",
+            lw=1.8,
+            linestyle="--",
+            label="Known Concentration" if segment_index == 0 else "_nolegend_",
+            zorder=10,
+        )
 
     channels = sorted(
         {row.get("channel") for row in usable_rows},
@@ -4677,16 +4736,22 @@ def plot_titration_concentration_vs_measurement(
             _data_line, cap_lines, bar_line_collections = uncertainty_errorbar.lines
             for errorbar_artist in (*cap_lines, *bar_line_collections):
                 errorbar_artist._swv_concentration_errorbar = True
-        ax.plot(
-            x_values,
-            predicted_levels,
-            color=color,
-            lw=1.0,
-            linestyle=line_style,
-            alpha=0.65,
-            label="_nolegend_",
-            zorder=3,
-        )
+        channel_breaks = np.flatnonzero(
+            np.diff(np.asarray(x_values, dtype=float)) > 1.0
+        ) + 1
+        for segment in np.split(np.arange(len(x_values)), channel_breaks):
+            if not len(segment):
+                continue
+            ax.plot(
+                np.asarray(x_values)[segment],
+                predicted_levels[segment],
+                color=color,
+                lw=1.0,
+                linestyle=line_style,
+                alpha=0.65,
+                label="_nolegend_",
+                zorder=3,
+            )
         method_trace_label = (channel_labels or {}).get(channel) or _swv_method_trace_label(channel)
         ax.scatter(
             x_values,
@@ -4775,28 +4840,52 @@ def plot_titration_concentration_vs_measurement(
         for row in usable_rows
         if row.get(x_key) is not None and np.isfinite(row.get(x_key))
     ])
-    filtered_vlines = []
-    if finite_x_values.size:
+    def visible_boundaries(boundaries):
+        filtered = []
+        if not finite_x_values.size:
+            return filtered
         x_min = float(np.nanmin(finite_x_values))
         x_max = float(np.nanmax(finite_x_values))
-        filtered_vlines = _filter_titration_vlines(
-            vlines,
+        filtered = _filter_titration_vlines(
+            boundaries,
             scan_range=(x_min, x_max),
         )
         right_boundaries = [
             (float(position), str(label))
-            for position, label in (vlines or [])
+            for position, label in (boundaries or [])
             if float(position) > x_max
         ]
         if right_boundaries:
             next_boundary = min(right_boundaries, key=lambda item: item[0])
-            if not any(np.isclose(position, next_boundary[0]) for position, _ in filtered_vlines):
-                filtered_vlines.append(next_boundary)
-    add_scan_vlines(
-        ax,
-        filtered_vlines,
-        max(float(vline_y_frac), 0.92),
-    )
+            if not any(np.isclose(position, next_boundary[0]) for position, _ in filtered):
+                filtered.append(next_boundary)
+        return filtered
+
+    grouped_boundaries: Dict[Tuple[Tuple[float, str], ...], List[Any]] = {}
+    for channel in channels if vlines_by_channel else []:
+        channel_boundaries = visible_boundaries(vlines_by_channel.get(channel))
+        if channel_boundaries:
+            grouped_boundaries.setdefault(tuple(channel_boundaries), []).append(channel)
+    if grouped_boundaries:
+        multiple_mappings = len(grouped_boundaries) > 1
+        for mapping_index, (boundaries, mapped_channels) in enumerate(grouped_boundaries.items()):
+            readable = "/".join(
+                str((channel_labels or {}).get(channel, channel))
+                for channel in mapped_channels
+            )
+            add_scan_vlines(
+                ax,
+                boundaries,
+                max(0.2, max(float(vline_y_frac), 0.92) - mapping_index * .12),
+                color=colors.get(mapped_channels[0], "gray") if multiple_mappings else "gray",
+                label_prefix=f"{readable}: " if multiple_mappings else "",
+            )
+    else:
+        add_scan_vlines(
+            ax,
+            visible_boundaries(vlines),
+            max(float(vline_y_frac), 0.92),
+        )
     ax.grid(False)
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(

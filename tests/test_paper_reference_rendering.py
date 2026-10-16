@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import bo_session_viewer as viewer
 from core.plotting import add_titration_on_off_difference
+from pathlib import Path
 
 
 def test_off_example_rechecks_changed_trace_acceptance(monkeypatch):
@@ -70,6 +71,23 @@ def test_sweep_presets_default_to_unsmoothed_corrected_traces():
         for index in (1,2):
             assert state[f"bo_composer_trace_key_{index}"] == "corrected_current"
             assert state[f"bo_composer_trace_corrected_{index}"] is True
+            assert state[f"bo_composer_trace_width_{index}"] == 1.5
+
+
+def test_type3_can_append_both_concentration_validation_panels():
+    source = Path("app.py").read_text(encoding="utf-8")
+    assert '"Concentration by measurement"' in source
+    assert 'extra_column == "Concentration by measurement"' in source
+    assert 'title=f"Channel {physical} | Concentration by Measurement"' in source
+    assert '"Canvas width (in)", 6.0, 30.0' in source
+    assert 'key="paper_titration_swv_full_range"' in source
+
+
+def test_unsmoothed_corrected_trace_is_never_labeled_raw():
+    assert viewer._swv_trace_kind_label(True, False, "corrected_current") == "unsmoothed corrected"
+    assert viewer._swv_trace_kind_label(
+        True, True, "corrected_current"
+    ) == "normalized unsmoothed corrected"
 
 
 def test_cube_marker_toggle_preserves_source_selection(monkeypatch):

@@ -89,6 +89,15 @@ def test_legacy_stack_range_is_restored_explicitly(tmp_path):
     assert payload['state']['bo_composer_stack_voltage_range_3'] == 'Full analyzed voltage range'
 
 
+def test_legacy_trace_range_is_restored_explicitly(tmp_path):
+    recipe, _ = save_workspace(tmp_path, 'legacy-trace', {
+        'bo_composer_kind_2': 'SWV trace overlay',
+        'bo_composer_trace_bracket_2': False,
+    })
+    payload, _ = load_workspace(recipe)
+    assert payload['state']['bo_composer_trace_voltage_range_2'] == 'Full analyzed voltage range'
+
+
 def test_hidden_workspaces_are_recoverable_and_new_saves_visible(tmp_path):
     import json
     from core.workspace_sessions import available_workspaces

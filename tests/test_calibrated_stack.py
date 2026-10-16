@@ -168,6 +168,28 @@ def test_waveform_linewidth_is_user_controlled(monkeypatch):
     plt.close(fig)
 
 
+def test_trace_custom_voltage_range_crops_samples_and_sets_exact_limits(monkeypatch):
+    monkeypatch.setattr(viewer, '_trace_paths', lambda *a: [
+        {'phase': 'buffer', 'path': 'example', 'channel': '1'},
+    ])
+    voltage = np.array([-.5, -.4, -.3, -.2, -.1, 0.])
+    current = np.arange(len(voltage), dtype=float)
+    monkeypatch.setattr(
+        viewer, '_swv_trace_arrays',
+        lambda *a: (voltage, current, 2, 1, 4),
+    )
+    fig, ax = plt.subplots()
+    viewer._composer_draw_trace(
+        ax, {}, {'iteration': 1}, True, ['1'], {},
+        'corrected_current', False,
+        voltage_display_range='Custom voltage range',
+        voltage_min=-.35, voltage_max=-.15,
+    )
+    np.testing.assert_allclose(ax.lines[0].get_xdata(), [-.3, -.2])
+    np.testing.assert_allclose(ax.get_xlim(), [-.35, -.15])
+    plt.close(fig)
+
+
 def test_journal_composer_does_not_clamp_explicit_thin_trace(monkeypatch):
     import pandas as pd
     from pathlib import Path
