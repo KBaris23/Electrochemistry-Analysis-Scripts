@@ -614,6 +614,11 @@ def _filter_titration_vlines(
             if float(x) < start_scan
         ]
         filtered = ([max(left_candidates, key=lambda item: item[0])] if left_candidates else []) + in_range
+        right_candidates = [(float(x), str(label)) for x, label in vlines if float(x) > end_scan]
+        if right_candidates:
+            # The last visible dose needs its closing boundary to form a
+            # plateau. Rows are cropped separately; this adds no measurements.
+            filtered.append(min(right_candidates, key=lambda item: item[0]))
     else:
         filtered = [(float(x), str(label)) for x, label in vlines]
     filtered = sorted(filtered, key=lambda item: item[0])
@@ -874,6 +879,11 @@ def build_titration_step_table(
             continue
         original_channel = ch_res[0].get("original_channel", ch)
 
+        full_channel_vlines = _filter_titration_vlines((vlines_by_channel or {}).get(ch, vlines))
+        selection_key_by_start = dict(zip(
+            [position for position, _ in full_channel_vlines[:-1]],
+            _titration_step_selection_keys(full_channel_vlines),
+        ))
         channel_selection_keys = _titration_step_selection_keys(channel_vlines)
         for step_index, ((start_scan, left_label), (end_scan, right_label)) in enumerate(
 
@@ -956,7 +966,7 @@ def build_titration_step_table(
                 "step_concentration": step_concentration,
                 "step_concentration_unit": concentration_unit if step_concentration is not None else "",
                 "step_note": step_note,
-                "step_selection_key": channel_selection_keys[step_index - 1],
+                "step_selection_key": selection_key_by_start.get(start_scan, channel_selection_keys[step_index - 1]),
 
                 "left_vline_label": left_label,
 
@@ -2642,12 +2652,19 @@ def plot_metric_vs_scan(
 
     annotation_offset_by_channel: Optional[Dict[Any, float]] = None,
     channel_labels: Optional[Dict[Any, str]] = None,
+    measurement_start_at_one: bool = False,
 
 ) -> Optional[plt.Figure]:
 
     if normalize_per_channel and percent_change_per_channel:
 
         raise ValueError("Choose only one per-channel normalization mode.")
+
+    if measurement_start_at_one and scan_range and x_key == "scan_number":
+        from core.paper_titration import measurement_display_data
+        all_results, vlines, vlines_by_channel, scan_range = measurement_display_data(
+            all_results, vlines, vlines_by_channel, scan_range=scan_range, start_at_one=True,
+        )
 
     all_ch = sorted({r["channel"] for r in all_results}, key=_channel_sort_key)
 
@@ -4542,6 +4559,8 @@ def plot_titration_concentration_vs_measurement(
     vlines_by_channel: Optional[Dict[Any, List[Tuple[float, str]]]] = None,
     vline_y_frac: float = 0.86,
     channel_labels: Optional[Dict[Any, str]] = None,
+    scan_range: Optional[Tuple[int, int]] = None,
+    measurement_start_at_one: bool = False,
 ) -> Optional[plt.Figure]:
     """Plot per-SWV Langmuir concentration predictions by measurement number.
 
@@ -4550,6 +4569,12 @@ def plot_titration_concentration_vs_measurement(
     uncertainty is poorly conditioned and an enormous symmetric bar is not a
     meaningful quantitative interval.
     """
+    if scan_range:
+        from core.paper_titration import measurement_display_data
+        accuracy_rows, vlines, vlines_by_channel, _ = measurement_display_data(
+            accuracy_rows, vlines, vlines_by_channel, scan_range=scan_range,
+            start_at_one=measurement_start_at_one,
+        )
     usable_rows = []
     for row in accuracy_rows:
         try:

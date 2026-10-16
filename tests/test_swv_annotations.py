@@ -84,3 +84,20 @@ def test_detection_preserves_staggered_channel_boundaries(tmp_path):
         2: [(1.0, "buffer"), (3.0, "10 uM"), (4.0, "end")],
     }
     assert logs == [log.resolve()]
+
+
+def test_reused_scan_ids_in_other_runs_cannot_replace_concentrations(tmp_path):
+    log = tmp_path / 'session_log.txt'
+    log.write_text('\n'.join([
+        'Queue start -> Initial buffer | MUX ch 2 | rep 1/1',
+        '[Tag] meas_20260816_1800_1001_ch2',
+        'Queue start -> 80 uM | MUX ch 2 | rep 1/1',
+        '[Tag] meas_20260816_1801_1002_ch2',
+        'Queue start -> 2560 uM | MUX ch 2 | rep 1/1',
+        '[Tag] meas_20260901_1801_1002_ch2',
+    ]))
+    rows = [dict(channel=2, scan_id_from_name=1000+i, scan_number=i,
+                 file_path=f'swv_ch2_abcdef_meas_20260816_180{i-1}_100{i}_ch2.csv')
+            for i in (1, 2)]
+    vlines, _ = _annotation_helpers()['detect_autotitration_vlines']([str(tmp_path)], rows)
+    assert vlines == [(1., 'buffer'), (2., '80 uM'), (3., 'end')]

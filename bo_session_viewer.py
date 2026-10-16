@@ -28793,8 +28793,8 @@ def _queue_plot_for_composer(
         current_panel_count = 0
     if replace_index is not None and not 0 <= replace_index < current_panel_count:
         raise ValueError("Select an existing Composer panel before replacing it.")
-    if replace_index is None and current_panel_count + len(pending) >= 12:
-        raise ValueError("Figure Composer already has 12 panels queued or in use.")
+    if replace_index is None and current_panel_count + len(pending) >= 24:
+        raise ValueError("Figure Composer already has 24 panels queued or in use.")
     reserved_index = replace_index if replace_index is not None else len(pending)
     reserved_label = chr(ord("A") + reserved_index)
     captured_png = (
@@ -31624,7 +31624,7 @@ def _composer_apply_pending_captures() -> tuple[int, int]:
         for capture_id in pending
         if isinstance(registry.get(str(capture_id)), Mapping)
     ]
-    capacity = max(0, 12 - panel_count)
+    capacity = max(0, 24 - panel_count)
     accepted = valid_pending[:capacity]
     shift = len(accepted)
     if shift:
@@ -31653,7 +31653,7 @@ def _composer_apply_pending_captures() -> tuple[int, int]:
                 value = chr(ord("A") + new_index)
             elif prefix == "bo_composer_zoom_from_" and value not in {None, "None"}:
                 source_index = ord(str(value)) - ord("A")
-                if 0 <= source_index < 12 - shift:
+                if 0 <= source_index < 24 - shift:
                     value = chr(ord("A") + source_index + shift)
             st.session_state[f"{prefix}{new_index}"] = value
     added = 0
@@ -32525,9 +32525,9 @@ def _paper_parameter_sweep_center_preset(
     ))
     preset["name"] = "Type 1C - Sweep comparison (cube center)"
     rects = (
-        (.16, .535, .52, .42), (.71, .775, .26, .17),
-        (.71, .535, .26, .17), (.16, .045, .52, .42),
-        (.71, .285, .26, .21), (.71, .035, .26, .21),
+        (.24, .535, .52, .42), (.79, .775, .20, .17),
+        (.79, .535, .20, .17), (.24, .045, .52, .42),
+        (.79, .285, .20, .21), (.79, .035, .20, .21),
     )
     config = preset.setdefault("config", {})
     state = config.setdefault("state", {})
@@ -32827,7 +32827,7 @@ def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
     if isinstance(duplicates, list) and duplicates:
         st.session_state["bo_composer_pending_duplicates"] = [
             i for i in duplicates if isinstance(i, int) and 0 <= i < panel_count
-        ][:max(0, 12 - panel_count)]
+        ][:max(0, 24 - panel_count)]
     return True
 
 
@@ -36153,7 +36153,7 @@ def _composer_source_controls(index, source_spec, session, history, observations
                 plt.close(figure)
     update, add, cancel = st.columns(3)
     action = "update" if update.button(f"Update panel {letter}", type="primary") else None
-    if add.button("Add as new panel", disabled=int(st.session_state.get("bo_composer_count",0)) >= 12):
+    if add.button("Add as new panel", disabled=int(st.session_state.get("bo_composer_count",0)) >= 24):
         action = "add"
     if action:
         _composer_close_source_editor()
@@ -36336,7 +36336,7 @@ def _render_figure_composer(
     duplicates = st.session_state.pop("bo_composer_pending_duplicates", [])
     count_before = int(st.session_state.get("bo_composer_count", 4))
     for source in duplicates:
-        if count_before >= 12:
+        if count_before >= 24:
             break
         for key, value in list(st.session_state.items()):
             match = re.fullmatch(r"(bo_composer_.+_)(\d+)", str(key))
@@ -36436,7 +36436,7 @@ def _render_figure_composer(
         st.warning(
             f"Could not add {skipped_captures} captured plot"
             f"{'s' if skipped_captures != 1 else ''}: the Composer supports "
-            "at most 12 panels."
+            "at most 24 panels."
         )
     if deleted_panels:
         st.success(
@@ -36657,7 +36657,7 @@ def _render_figure_composer(
             "The presentation canvases are larger and get scaled down in a paper."
         ),
     )
-    panel_count = int(c2.number_input("Panels", min_value=1, max_value=12, value=4, step=1, key="bo_composer_count"))
+    panel_count = int(c2.number_input("Panels", min_value=1, max_value=24, value=4, step=1, key="bo_composer_count"))
     preset = c3.selectbox("Layout", ["Manual", "Grid", "Main left + stack", "Top wide + grid"], key="bo_composer_layout")
     dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25, key="bo_composer_dpi"))
     c5, c6, c7 = st.columns(3)

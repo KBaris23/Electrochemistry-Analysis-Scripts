@@ -1174,8 +1174,17 @@ def run_batch(
     parallel_workers: int = 1,
     progress_callback=None,
     channels: Optional[List[int]] = None,
+    source_paths: Optional[List[str]] = None,
 ) -> List[dict]:
     files = collect_swv_csvs_from_folders(folders)
+    if source_paths is not None:
+        canonical = lambda path: os.path.normcase(os.path.abspath(path))
+        selected_paths = {canonical(path) for path in source_paths}
+        available_paths = {canonical(item.path) for item in files}
+        missing = selected_paths - available_paths
+        if missing:
+            raise ValueError(f"Figure recipe requires {len(missing)} source file(s) missing from the selected folders.")
+        files = [item for item in files if canonical(item.path) in selected_paths]
     if not files:
         raise ValueError("No SWV CSVs found.")
 

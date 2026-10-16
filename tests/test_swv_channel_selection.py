@@ -10,7 +10,8 @@ from core.io import SWVFile
 @pytest.mark.parametrize("workers", [1, 3])
 @pytest.mark.parametrize("selection", [None, [2]])
 @pytest.mark.parametrize("use_time_range", [False, True])
-def test_channel_filter_limits_work_and_progress(monkeypatch, workers, selection, use_time_range):
+@pytest.mark.parametrize("restrict_files", [False, True])
+def test_channel_filter_limits_work_and_progress(monkeypatch, workers, selection, use_time_range, restrict_files):
     start = datetime(2026, 9, 25, 12)
     files = [
         SWVFile(mode="swv", scan=scan, ch=channel, ts=scan,
@@ -38,15 +39,24 @@ def test_channel_filter_limits_work_and_progress(monkeypatch, workers, selection
         ["/input"], channels=selection, parallel_workers=workers,
         time_range=(start, start + timedelta(minutes=3)) if use_time_range else None,
         progress_callback=lambda done, total, name: progress.append((done, total)),
+        source_paths=[file.path for file in files if file.scan == 2] if restrict_files else None,
     )
     expected = {2} if selection else {1, 2, 3}
     assert {file.ch for file in processed} == expected
     assert {row["channel"] for row in rows} == expected
-    assert len(rows) == len(expected) * 2
+    assert len(rows) == len(expected) * (1 if restrict_files else 2)
+    if restrict_files:
+        assert all(file.scan == 2 for file in processed)
     assert progress[-1] == (len(rows), len(rows))
     if not use_time_range:
         assert {file.ch for file in indexed} == expected
-        assert [row["scan_number"] for row in rows if row["channel"] == 2] == [1, 2]
+        assert [row["scan_number"] for row in rows if row["channel"] == 2] == ([1] if restrict_files else [1, 2])
+
+
+def test_missing_recipe_file_does_not_silently_use_other_files(monkeypatch):
+    monkeypatch.setattr(analysis, 'collect_swv_csvs_from_folders', lambda folders: [])
+    with pytest.raises(ValueError, match='source file'):
+        analysis.run_batch(['/input'], source_paths=['/input/missing.csv'])
 
 
 def test_unmatched_channel_does_not_process_any_files(monkeypatch):

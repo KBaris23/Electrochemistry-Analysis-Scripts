@@ -157,7 +157,7 @@ def apply_source_edit(state, edit):
     if not 0 <= index < count or spec["kind"] not in SOURCE_FIELDS:
         return False
     if edit.get("duplicate"):
-        if count >= 12:
+        if count >= 24:
             return False
         # Copy the whole panel first, including formatting; source values below
         # override just the generation settings of the new panel.

@@ -258,7 +258,7 @@
             "correct_baseline_jumps": true,
             "corrected": true,
             "corrected_trace_key": "corrected_current",
-            "crop_to_minima": false,
+            "crop_to_minima": true,
             "current_axis_scale": 0.72,
             "current_axis_top": 0.0,
             "custom_title": "",
@@ -298,7 +298,7 @@
             "title_size": 12.0,
             "trace_height_scale": 1.0,
             "use_bo_snapshot": true,
-            "voltage_display_range": "Shared correction window (union)"
+            "voltage_display_range": "Corrected peak bracket"
           },
           {
             "average_channels": true,
@@ -507,7 +507,7 @@
           "bo_composer_stack_axis_style_3": "Shared-Origin Three-Axis Frame",
           "bo_composer_stack_axis_ticks_3": true,
           "bo_composer_hide_title_3": true,
-          "bo_composer_stack_bracket_3": false,
+          "bo_composer_stack_bracket_3": true,
           "bo_composer_stack_channels_3": [
             "10_max"
           ],
@@ -528,7 +528,7 @@
           "bo_composer_stack_show_all_3": true,
           "bo_composer_stack_snapshot_3": true,
           "bo_composer_stack_trace_key_3": "corrected_current",
-          "bo_composer_stack_voltage_range_3": "Shared correction window (union)",
+          "bo_composer_stack_voltage_range_3": "Corrected peak bracket",
           "bo_composer_stack_width_3": 1.5,
           "bo_composer_start_dx_2": -50,
           "bo_composer_start_dy_2": -20,
