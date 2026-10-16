@@ -24,6 +24,11 @@ source measurements **41–160**, displayed as **1–120**: buffer alternating w
 Extreme filtering and **Ignore the first target response** stay off. Type 4 is a
 calibration diagnostic, not held-out validation.
 
+The fresh native analysis rejects 20 optimized channel-2 traces whose left
+minimum is below the saved -0.44 V acceptance limit. The legacy batch cache had
+marked these as accepted. Current caches retain those failures, and accepted-only
+figures exclude them; no raw measurements or acceptance limits were changed.
+
 Type 3A's shared panel contains both baseline-referenced Langmuir fits and
 matched-dose ON-minus-OFF values. The difference is descriptive, not a third
 independently fitted curve. Negative signal-off values remain negative.
