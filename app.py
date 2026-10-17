@@ -17,7 +17,7 @@ import re
 import subprocess
 import sys
 import zipfile
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import matplotlib
 
@@ -1894,6 +1894,9 @@ def _paper_collect_legend(source: plt.Figure) -> None:
         legend = source_axis.get_legend()
         if legend is None:
             continue
+        if getattr(legend, "_swv_keep_location", False):
+            legend.set_frame_on(False)
+            continue
         legend.set_frame_on(True)
         legend.get_frame().set_facecolor("white")
         legend.get_frame().set_alpha(.82)
@@ -1970,7 +1973,19 @@ def _paper_normalize_row_layout(values, panel_count: int) -> list[list[float]]:
     return output
 
 
-def _paper_titration_row_layout_editor(row_index: int, roles: list[str]) -> list[list[float]]:
+def _paper_titration_type_scope(figure_type: Any) -> str:
+    """Stable widget-state namespace for one native titration figure type."""
+    return re.sub(r"[^a-z0-9]+", "_", str(figure_type or "type").lower()).strip("_")
+
+
+def _paper_titration_row_layout_editor(
+    row_index: int,
+    roles: list[str],
+    figure_type: Optional[str] = None,
+    *,
+    canvas_width_inches: float = 10.0,
+    canvas_height_inches: float = 2.8,
+) -> list[list[float]]:
     """Visible drag/resize template repeated for every comparison row."""
     role_names = {
         "manual_swv": "Manual SWVs",
@@ -1981,17 +1996,61 @@ def _paper_titration_row_layout_editor(row_index: int, roles: list[str]) -> list
         "accuracy": "Predicted vs known",
         "snr": "SNR",
     }
-    state_key = f"paper_titration_row_layout_{row_index}"
-    event_key = f"_paper_titration_row_layout_event_{row_index}"
+    type_scope = _paper_titration_type_scope(
+        figure_type or st.session_state.get("paper_titration_type")
+    )
+    state_key = f"paper_titration_row_layout_{type_scope}_{row_index}"
+    event_key = f"_paper_titration_row_layout_event_{type_scope}_{row_index}"
+    editor_key = f"_paper_titration_layout_editor_{type_scope}_{row_index}"
+    # One-time migration for sessions/metadata made before canvases were
+    # namespaced by figure type. Removing the shared key prevents a different
+    # type from inheriting and then mutating that canvas.
+    legacy_state_key = f"paper_titration_row_layout_{row_index}"
+    if state_key not in st.session_state and legacy_state_key in st.session_state:
+        st.session_state[state_key] = _paper_normalize_row_layout(
+            st.session_state.pop(legacy_state_key), len(roles)
+        )
     rects = _paper_normalize_row_layout(
         st.session_state.get(state_key), len(roles)
     )
+    guide_key = f"_paper_titration_plot_guides_{type_scope}"
+    stored_guides = st.session_state.get(guide_key, [])
+    plot_guides = []
+    for index, role in enumerate(roles):
+        guide = (
+            copy.deepcopy(stored_guides[index])
+            if isinstance(stored_guides, list)
+            and index < len(stored_guides)
+            and isinstance(stored_guides[index], dict)
+            else None
+        )
+        # A guide measured with a different requested axes shape is stale.
+        # Show the theoretical aspect box until the next preview rather than
+        # reporting misleading physical dimensions.
+        if guide is not None:
+            measured_aspect = guide.get("requested_aspect")
+            current_aspect = _paper_panel_aspect_ratio(role)
+            same_aspect = (
+                measured_aspect is None and current_aspect is None
+            ) or (
+                measured_aspect is not None
+                and current_aspect is not None
+                and np.isclose(float(measured_aspect), float(current_aspect))
+            )
+            if not same_aspect:
+                guide = None
+        plot_guides.append(guide)
     st.markdown("**Repeated comparison-row canvas**")
     result = _figure_layout_editor(
         rects=rects,
         labels=[role_names.get(role, role.replace("_", " ").title()) for role in roles],
+        panel_aspects=[_paper_panel_aspect_ratio(role) for role in roles],
+        panel_plot_guides=plot_guides,
         aspect="Row 4:1",
-        key=f"_paper_titration_layout_editor_{row_index}",
+        canvas_aspect=float(canvas_width_inches) / max(float(canvas_height_inches), .01),
+        canvas_width_in=float(canvas_width_inches),
+        canvas_height_in=float(canvas_height_inches),
+        key=editor_key,
         allow_overlap=False,
         default=None,
     )
@@ -2004,7 +2063,11 @@ def _paper_titration_row_layout_editor(row_index: int, roles: list[str]) -> list
             rects = candidate
     st.caption(
         "Drag panels to move them or resize from an edge/corner. This one layout "
-        "is repeated identically for every comparison row in the generated figure."
+        "is repeated identically for every comparison row in the generated figure. "
+        "After the first preview, the dashed inner box is measured from the real "
+        "axes—including space consumed by labels, ticks, titles, and legends—and "
+        "shows its physical plot width × height. Before then, an explicitly selected "
+        "aspect ratio is shown as a centered estimate."
     )
     return rects
 
@@ -2041,17 +2104,25 @@ def _paper_panel_aspect_controls(roles: list[str]) -> None:
                 st.session_state["paper_validation_square_axes"] = mode == "1:1 (square)"
 
 
+def _paper_panel_aspect_ratio(role: str) -> Optional[float]:
+    """Return the requested plot-box width/height, or None for automatic."""
+    key = f"paper_titration_aspect_{role}"
+    mode = st.session_state.get(f"{key}_mode", "Automatic")
+    if mode == "Automatic":
+        return None
+    ratio = 1.0 if mode == "1:1 (square)" else float(st.session_state.get(f"{key}_ratio", 1.))
+    if not np.isfinite(ratio) or ratio <= 0:
+        raise ValueError("Panel width / height must be a positive finite number.")
+    return ratio
+
+
 def _paper_apply_panel_aspect(source: Optional[plt.Figure], role: str) -> None:
     """Set physical axes shape before rasterization; leave colorbars untouched."""
     if source is None or not source.axes:
         return
-    key = f"paper_titration_aspect_{role}"
-    mode = st.session_state.get(f"{key}_mode", "Automatic")
-    if mode == "Automatic":
+    ratio = _paper_panel_aspect_ratio(role)
+    if ratio is None:
         return
-    ratio = 1.0 if mode == "1:1 (square)" else float(st.session_state.get(f"{key}_ratio", 1.))
-    if not np.isfinite(ratio) or ratio <= 0:
-        raise ValueError("Panel width / height must be a positive finite number.")
     axis = source.axes[0]
     axis.set_aspect("auto")
     axis.set_box_aspect(1.0 / ratio)
@@ -2162,6 +2233,74 @@ def _paper_figure_image(source: plt.Figure, dpi: int = 300) -> np.ndarray:
     return plt.imread(buffer)
 
 
+def _paper_source_plot_box(source: plt.Figure) -> list[float]:
+    """Return the main axes inside the exact tight-cropped source raster."""
+    if not source.axes:
+        return [0.0, 0.0, 1.0, 1.0]
+    try:
+        source.canvas.draw()
+        renderer = source.canvas.get_renderer()
+        axis_box = source.axes[0].get_window_extent(renderer)
+        tight_inches = source.get_tightbbox(renderer)
+        if tight_inches is None:
+            raise ValueError("No tight bounding box")
+        tight_box = tight_inches.transformed(source.dpi_scale_trans)
+        pad = float(plt.rcParams.get("savefig.pad_inches", 0.1)) * float(source.dpi)
+        saved_left = float(tight_box.x0) - pad
+        saved_bottom = float(tight_box.y0) - pad
+        saved_width = float(tight_box.width) + 2.0 * pad
+        saved_height = float(tight_box.height) + 2.0 * pad
+        if saved_width <= 0 or saved_height <= 0:
+            raise ValueError("Invalid tight bounding box")
+        values = [
+            (float(axis_box.x0) - saved_left) / saved_width,
+            (float(axis_box.y0) - saved_bottom) / saved_height,
+            float(axis_box.width) / saved_width,
+            float(axis_box.height) / saved_height,
+        ]
+        left = min(max(values[0], 0.0), 1.0)
+        bottom = min(max(values[1], 0.0), 1.0)
+        width = min(max(values[2], 0.01), 1.0 - left)
+        height = min(max(values[3], 0.01), 1.0 - bottom)
+        return [left, bottom, width, height]
+    except Exception:
+        return [0.0, 0.0, 1.0, 1.0]
+
+
+def _paper_store_plot_guides(
+    composite: plt.Figure,
+    figure_type: str,
+    roles: list[str],
+) -> bool:
+    """Cache the smallest measured plot box per repeated column for the editor."""
+    raw_guides = getattr(composite, "_paper_panel_plot_guides", None)
+    if not isinstance(raw_guides, list) or not roles:
+        return False
+    guides = []
+    column_count = len(roles)
+    for column, role in enumerate(roles):
+        candidates = [
+            item for item in raw_guides[column::column_count]
+            if isinstance(item, dict)
+        ]
+        if not candidates:
+            guides.append(None)
+            continue
+        selected = min(
+            candidates,
+            key=lambda item: float(item.get("source_box", [0, 0, 1, 1])[2])
+            * float(item.get("source_box", [0, 0, 1, 1])[3]),
+        )
+        selected = copy.deepcopy(selected)
+        selected["requested_aspect"] = _paper_panel_aspect_ratio(role)
+        guides.append(selected)
+    scope = _paper_titration_type_scope(figure_type)
+    key = f"_paper_titration_plot_guides_{scope}"
+    changed = st.session_state.get(key) != guides
+    st.session_state[key] = guides
+    return changed
+
+
 def _paper_stack_vertically(
     figures: List[Optional[plt.Figure]],
     font_size: float,
@@ -2209,6 +2348,181 @@ def _paper_reference_style() -> None:
         'paper_titration_accepted_only': True,
         'paper_titration_response_measure': 'Change from preceding buffer',
     })
+
+
+_PAPER_TITRATION_PRESET_SCHEMA = "swv.paper-titration-format-presets/1"
+_PAPER_TITRATION_BUILTIN_FORMAT_PRESETS = {
+    "Type 4A - Langmuir and concentration validation": {
+        # A compact three-panel row whose final panel has enough outer margin
+        # for labels while its data axes remain physically square.
+        "paper_titration_width": 13.0,
+        "paper_titration_row_height": 3.6,
+        "paper_titration_font": 8.0,
+        "paper_title_font_size": 8.5,
+        "paper_axis_label_font_size": 8.0,
+        "paper_tick_font_size": 7.0,
+        "paper_legend_font_size": 6.5,
+        "paper_titration_column_gap": 0.08,
+        "paper_titration_row_gap": 0.18,
+        "paper_validation_column_gap": 0.04,
+        "paper_validation_width_percent": 35,
+        "paper_validation_error_position": "Inside plot",
+        "paper_validation_square_axes": True,
+        "paper_titration_aspect_langmuir_mode": "Automatic",
+        "paper_titration_aspect_concentration_mode": "Automatic",
+        "paper_titration_aspect_accuracy_mode": "1:1 (square)",
+        "paper_titration_row_layout_type_4a_langmuir_and_concentration_validation_0": [
+            [0.015, 0.08, 0.26, 0.84],
+            [0.29, 0.08, 0.34, 0.84],
+            [0.645, 0.08, 0.34, 0.84],
+        ],
+    },
+}
+_PAPER_TITRATION_FORMAT_EXACT_KEYS = {
+    "paper_show_panel_letters",
+    "paper_optimized_label",
+    "paper_unoptimized_label",
+    "paper_optimized_trace_title",
+    "paper_unoptimized_trace_title",
+    "paper_response_title",
+    "paper_langmuir_title",
+    "paper_validation_title",
+    "paper_title_font_size",
+    "paper_axis_label_font_size",
+    "paper_tick_font_size",
+    "paper_legend_font_size",
+    "paper_validation_width_percent",
+    "paper_validation_column_gap",
+    "paper_validation_error_position",
+    "paper_validation_square_axes",
+}
+_PAPER_TITRATION_NON_FORMAT_KEYS = {
+    "paper_titration_type",
+    "paper_titration_rows",
+    "paper_titration_trace_region",
+    "paper_titration_zero_anchors",
+    "paper_titration_accepted_only",
+    "paper_titration_ignore_first_response",
+    "paper_titration_response_measure",
+    "paper_titration_fit_display_range",
+    "paper_titration_extra_columns",
+}
+_PAPER_TITRATION_SELECTION_PREFIXES = (
+    "paper_titration_format_preset_",
+    "paper_titration_physical_",
+    "paper_titration_optimized_",
+    "paper_titration_manual_",
+    "paper_titration_start_",
+    "paper_titration_end_",
+    "paper_titration_cross_",
+    "paper_titration_directional_",
+    "paper_titration_render",
+)
+
+
+def _paper_titration_preset_path() -> Path:
+    return local_session_directory().parent / "paper-titration-figure-type-presets.json"
+
+
+def _paper_titration_format_values(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture display choices without channels, methods, ranges, or analysis."""
+    output = {}
+    active_layout_prefix = (
+        "paper_titration_row_layout_"
+        + _paper_titration_type_scope(state.get("paper_titration_type"))
+        + "_"
+    )
+    for key, value in state.items():
+        if not isinstance(key, str):
+            continue
+        included = key in _PAPER_TITRATION_FORMAT_EXACT_KEYS or key.startswith(
+            "paper_titration_"
+        )
+        excluded = (
+            key in _PAPER_TITRATION_NON_FORMAT_KEYS
+            or key.startswith(_PAPER_TITRATION_SELECTION_PREFIXES)
+            or (
+                key.startswith("paper_titration_row_layout_")
+                and not key.startswith(active_layout_prefix)
+            )
+        )
+        if included and not excluded:
+            output[key] = copy.deepcopy(value)
+    return serializable_state(output)
+
+
+def _paper_titration_load_format_presets(path: Optional[Path] = None) -> dict[str, dict]:
+    source = Path(path) if path is not None else _paper_titration_preset_path()
+    builtins = (
+        copy.deepcopy(_PAPER_TITRATION_BUILTIN_FORMAT_PRESETS)
+        if path is None else {}
+    )
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return builtins
+    if not isinstance(payload, dict):
+        return builtins
+    presets = payload.get("presets", payload)
+    if not isinstance(presets, dict):
+        return builtins
+    saved = {
+        str(name): dict(values)
+        for name, values in presets.items()
+        if isinstance(name, str) and isinstance(values, dict)
+    }
+    builtins.update(saved)
+    return builtins
+
+
+def _paper_titration_save_format_preset(
+    name: str,
+    state: Mapping[str, Any],
+    path: Optional[Path] = None,
+    *,
+    require_existing: bool = False,
+) -> Path:
+    target = Path(path) if path is not None else _paper_titration_preset_path()
+    cleaned = str(name or "").strip()
+    if not cleaned:
+        raise ValueError("Enter a preset name.")
+    presets = _paper_titration_load_format_presets(None if path is None else target)
+    if require_existing and cleaned not in presets:
+        raise ValueError("That formatting preset no longer exists.")
+    presets[cleaned] = _paper_titration_format_values(state)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({
+        "schema": _PAPER_TITRATION_PRESET_SCHEMA,
+        "presets": presets,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    return target
+
+
+def _paper_titration_apply_format_preset(
+    name: str,
+    state: dict[str, Any],
+    path: Optional[Path] = None,
+) -> None:
+    presets = _paper_titration_load_format_presets(path)
+    if name not in presets:
+        raise ValueError("That formatting preset no longer exists.")
+    state.update(copy.deepcopy(presets[name]))
+
+
+def _paper_titration_apply_selected_type_preset() -> None:
+    """Apply the selected figure type's formatting without touching its data choices."""
+    figure_type = str(st.session_state.get("paper_titration_type") or "")
+    presets = _paper_titration_load_format_presets()
+    if figure_type in presets:
+        st.session_state.update(copy.deepcopy(presets[figure_type]))
+        st.session_state["_paper_titration_type_preset_notice"] = (
+            f"Loaded saved formatting for {figure_type.split(' - ', 1)[0]}."
+        )
+
+
+def _paper_request_titration_exports() -> None:
+    """Queue the full-resolution render from the action below its preview."""
+    st.session_state["_paper_titration_export_requested"] = True
 
 
 def _paper_response_panel(
@@ -2343,6 +2657,7 @@ def _paper_composite_figure(
             top=.98, bottom=0.04, left=0.04, right=0.99,
         )
     captured_sources: List[plt.Figure] = []
+    panel_plot_guides: list[Optional[dict]] = []
     for index in range(rows * columns):
         row_index, column_index = divmod(index, columns)
         if use_row_layouts:
@@ -2364,10 +2679,11 @@ def _paper_composite_figure(
         source = figures[index] if index < len(figures) else None
         if source is None:
             axis.text(.5, .5, "No data", ha="center", va="center", fontsize=font_size)
+            panel_plot_guides.append(None)
         else:
+            panel_role = panel_roles[index % columns] if panel_roles else ""
             if restyle and not getattr(source, "_paper_prestyled", False):
                 if panel_roles:
-                    panel_role = panel_roles[index % columns]
                     if panel_role in {"manual_swv", "optimized_swv"}:
                         _paper_apply_swv_axis_controls(source)
                     _paper_apply_panel_aspect(source, panel_role)
@@ -2382,13 +2698,36 @@ def _paper_composite_figure(
                 _paper_style_source(source, font_size, cell_w, cell_h)
             if capture_sources:
                 captured_sources.append(copy.deepcopy(source))
-            axis.imshow(_paper_figure_image(source, dpi=raster_dpi), aspect="auto")
+            source_box = _paper_source_plot_box(source)
+            image = _paper_figure_image(source, dpi=raster_dpi)
+            requested_aspect = (
+                _paper_panel_aspect_ratio(panel_role) if panel_role else None
+            )
+            preserve_image_aspect = requested_aspect is not None
+            # Explicit square/custom axes used to be stretched back to the
+            # outer panel aspect here. Automatic panels keep legacy filling.
+            axis.imshow(
+                image,
+                aspect="equal" if preserve_image_aspect else "auto",
+            )
+            if preserve_image_aspect:
+                # A square accuracy raster inside a wider draggable slot has
+                # unavoidable spare width. Keep that space on the outside so
+                # the visible plot stays adjacent to the preceding panel.
+                axis.set_anchor("W" if panel_role == "accuracy" else "C")
+            panel_plot_guides.append({
+                "source_box": source_box,
+                "image_aspect": float(image.shape[1]) / max(float(image.shape[0]), 1.0),
+                "preserve_aspect": preserve_image_aspect,
+                "anchor": "left" if panel_role == "accuracy" else "center",
+            })
             plt.close(source)
         axis.text(
             -.02, 1.02, chr(ord("A") + index) if st.session_state.get("paper_show_panel_letters", False) else "", transform=axis.transAxes,
             ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
         )
     output._paper_source_figures = captured_sources
+    output._paper_panel_plot_guides = panel_plot_guides
     return output
 
 
@@ -2510,7 +2849,7 @@ def _paper_figure_downloads(
         if callable(getattr(st, "caption", None)):
             st.caption(
                 "Fast preview uses sampled SWV traces and reduced raster resolution. "
-                "Use Generate full-resolution exports for PNG, PDF, SVG, and ZIP."
+                "Use Prepare PNG/PDF/SVG exports below for the full-resolution files."
             )
         plt.close(figure)
         return
@@ -7752,6 +8091,7 @@ if view == "Paper Figures":
             ],
             horizontal=True,
             key="paper_titration_type",
+            on_change=_paper_titration_apply_selected_type_preset,
             help=(
                 "Type 3B creates two fixed rows (signal-on and signal-off) and one "
                 "shared optimized-only Langmuir panel spanning the fourth column. "
@@ -7760,6 +8100,56 @@ if view == "Paper Figures":
                 "for the ON and OFF rows, with a shared fit panel. "
                 "Type 3D omits fitting panels. Type 4A adds Langmuir before the two prediction panels."
             ),
+        )
+        type_preset_notice = st.session_state.pop(
+            "_paper_titration_type_preset_notice", ""
+        )
+        if type_preset_notice:
+            st.success(type_preset_notice)
+        figure_type_presets = _paper_titration_load_format_presets()
+        type_preset_name = figure_type.split(" - ", 1)[0]
+        type_preset_cols = st.columns(2)
+        if type_preset_cols[0].button(
+            f"Overwrite {type_preset_name} formatting preset",
+            key="paper_titration_format_preset_overwrite",
+            use_container_width=True,
+            help=(
+                "Makes the current visual formatting the saved default for this figure "
+                "type. Channels, methods, measurement ranges, vlines, and analysis "
+                "choices are not stored."
+            ),
+        ):
+            try:
+                _paper_titration_save_format_preset(
+                    figure_type, st.session_state
+                )
+                st.success(
+                    f"Overwrote the {type_preset_name} formatting preset."
+                )
+                figure_type_presets = _paper_titration_load_format_presets()
+            except Exception as exc:
+                st.error(f"Could not overwrite the figure-type preset: {exc}")
+        if type_preset_cols[1].button(
+            f"Reload {type_preset_name} formatting preset",
+            key="paper_titration_format_preset_reload",
+            disabled=figure_type not in figure_type_presets,
+            use_container_width=True,
+            help="Discards unsaved formatting edits for this type; data choices stay unchanged.",
+        ):
+            try:
+                _paper_titration_apply_format_preset(
+                    figure_type, st.session_state
+                )
+                st.session_state["_paper_titration_type_preset_notice"] = (
+                    f"Reloaded saved formatting for {type_preset_name}."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not reload the figure-type preset: {exc}")
+        st.caption(
+            "Each figure type keeps its own saved formatting. Switching types reloads "
+            "that type's formatting without replacing channels, methods, display "
+            "start/end, vlines, or analysis settings."
         )
         if not figure_type.startswith("Type 3D") and not fit_titration_langmuir:
             st.warning("Enable Langmuir fitting for this template, or choose Type 3D for SWVs and response only.")
@@ -7899,12 +8289,14 @@ if view == "Paper Figures":
             )
             tick_options = ["Automatic", *range(2, 13)]
             swv_axis_cols[2].selectbox(
-                "X-axis tick count", tick_options,
+                "X-axis tick count (positions automatic)", tick_options,
                 key="paper_titration_swv_x_tick_count",
+                help="Choose only the count; positions are evenly spaced across the final visible voltage range.",
             )
             swv_axis_cols[3].selectbox(
-                "Y-axis tick count", tick_options,
+                "Y-axis tick count (positions automatic)", tick_options,
                 key="paper_titration_swv_y_tick_count",
+                help="Choose only the count; positions are evenly spaced across the final visible current range.",
             )
             paper_response_change = st.radio('Response display',
                 ['Change from preceding buffer', 'Absolute peak current'],
@@ -8235,7 +8627,9 @@ if view == "Paper Figures":
                     comparisons.append((physical, optimized, manual, (min(start, end), max(start, end))))
             if comparisons:
                 repeated_row_layout = _paper_titration_row_layout_editor(
-                    0, paper_panel_roles
+                    0, paper_panel_roles, figure_type,
+                    canvas_width_inches=paper_width,
+                    canvas_height_inches=paper_row_height,
                 )
                 comparison_row_layouts = [
                     copy.deepcopy(repeated_row_layout) for _ in comparisons
@@ -8274,15 +8668,12 @@ if view == "Paper Figures":
             'lod': show_titration_lod, 'uloq': show_titration_uloq,
         }
         paper_signature = hashlib.sha256(json.dumps(paper_recipe, sort_keys=True, default=str).encode()).hexdigest()
-        action_columns = st.columns([3, 2])
-        preview_clicked = action_columns[0].button(
+        preview_clicked = st.button(
             "Generate preview", type="primary", use_container_width=True,
             disabled=not can_generate,
         )
-        final_clicked = action_columns[1].button(
-            "Generate full-resolution exports", use_container_width=True,
-            disabled=not can_generate,
-            help="Uses the selected Panel raster DPI and takes longer than the preview.",
+        final_clicked = bool(
+            st.session_state.pop("_paper_titration_export_requested", False)
         )
         generation_status = st.empty()
         generated_this_run = False
@@ -8785,13 +9176,17 @@ if view == "Paper Figures":
                         accuracy_rows,
                         title=validation_title_template.replace("{channel}", str(physical)),
                         concentration_unit=titration_concentration_unit,
+                        figsize=(5.2, 5.0) if bool(st.session_state.get(
+                            "paper_validation_square_axes", False
+                        )) else (9, 4.5),
                         show_lod=show_titration_lod,
                         show_uloq=show_titration_uloq,
                         channel_colors=consistent_channel_colors,
                         response_directions=consistent_response_directions,
                         channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
                         square_axes=bool(st.session_state.get("paper_validation_square_axes", False)),
-                        error_summary_position=str(st.session_state.get("paper_validation_error_position", "Above plot")).split()[0].lower(),
+                        error_summary_position=str(st.session_state.get("paper_validation_error_position", "Inside plot")).split()[0].lower(),
+                        compact_legend=True,
                     ))
                 composite = _paper_composite_figure(
                     panels, len(comparisons), len(paper_panel_roles), width=paper_width,
@@ -8810,6 +9205,9 @@ if view == "Paper Figures":
                     "type4a" if figure_type.startswith("Type 4A") else "type4",
                     composite, paper_rows, paper_width, paper_font
                 )
+            plot_guides_changed = _paper_store_plot_guides(
+                composite, figure_type, paper_panel_roles
+            )
             selected_optimized_methods = {
                 item[1] for item in comparisons
             }
@@ -8873,6 +9271,11 @@ if view == "Paper Figures":
             }
             st.session_state['paper_titration_render_signature'] = paper_signature
             generated_this_run = True
+            if preview_clicked and plot_guides_changed:
+                # The editor is rendered earlier on the page. One cache-only
+                # rerun lets it immediately receive the measured inner axes;
+                # the expensive preview is reused from session state.
+                st.rerun()
             generation_status.success(
                 "Preview generated below."
                 if preview_clicked else
@@ -8889,9 +9292,26 @@ if view == "Paper Figures":
                 _paper_figure_downloads(rendered[1], f"paper_{rendered[0]}_titration")
             else:
                 st.info(
-                    'Settings changed. Click Generate preview or Generate full-resolution '
-                    'exports to refresh the figure.'
+                    'Settings changed. Click Generate preview to refresh the figure.'
                 )
+        rendered = st.session_state.get("paper_titration_render")
+        render_matches = (
+            rendered
+            and st.session_state.get('paper_titration_render_signature') == paper_signature
+        )
+        render_metadata = (
+            getattr(rendered[1], "_paper_metadata", {}) if render_matches else {}
+        )
+        if render_matches and render_metadata.get("render_quality") == "preview":
+            st.button(
+                "Prepare PNG/PDF/SVG exports",
+                on_click=_paper_request_titration_exports,
+                use_container_width=True,
+                help=(
+                    "Renders the selected full-resolution figure once; the individual "
+                    "PNG, PDF, SVG, and ZIP download buttons then appear here."
+                ),
+            )
 
 
 

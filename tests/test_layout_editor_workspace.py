@@ -16,6 +16,14 @@ def test_grid_defaults_to_one_percent():
     assert '<option value="1" selected>Fit width</option>' in html
 
 
+def test_editor_exposes_measured_inner_plot_box():
+    html = EDITOR.read_text(encoding='utf-8')
+    assert 'panel_plot_guides' in html
+    assert 'canvas_width_in' in html
+    assert 'class="plot-size"' in html
+    assert 'sourceBox[2] * imageWidth' in html
+
+
 @pytest.mark.skipif(shutil.which('node') is None, reason='Node required for editor JS check')
 def test_workspace_zoom_preserves_geometry_and_fills_width():
     html = EDITOR.read_text(encoding='utf-8')

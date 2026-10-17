@@ -224,6 +224,7 @@ SOURCE_FIELDS = {
         "max_traces": "stack_max_traces", "use_bo_snapshot": "stack_snapshot",
         "crop_to_minima": "stack_bracket", "current_axis_top": "stack_current_top",
         "voltage_display_range": "stack_voltage_range",
+        "voltage_min": "stack_voltage_min", "voltage_max": "stack_voltage_max",
         "stack_legend_location": "stack_legend_location",
         "coordinate_frame_style": "stack_axis_style", "current_axis_scale": "stack_current_axis_scale",
         "reverse_stack_order": "stack_reverse_order", "show_axis_ticks": "stack_axis_ticks",

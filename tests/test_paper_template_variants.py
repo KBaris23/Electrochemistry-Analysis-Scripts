@@ -24,6 +24,125 @@ def api():
     plt.close('all')
 
 
+def test_titration_export_request_is_queued_after_preview(api):
+    api['_paper_request_titration_exports']()
+    assert api['st'].session_state['_paper_titration_export_requested'] is True
+
+
+def test_titration_figure_type_preset_overwrites_format_without_data_choices(api, tmp_path):
+    path = tmp_path / 'titration-presets.json'
+    figure_type = 'Type 3D - SWVs and response only'
+    state = {
+        'paper_titration_font': 11.0,
+        'paper_titration_column_gap': .22,
+        'paper_show_panel_letters': True,
+        'paper_titration_row_layout_type_3d_swvs_and_response_only_0': [
+            [.01, .08, .30, .84], [.35, .08, .30, .84], [.69, .08, .30, .84],
+        ],
+        'paper_titration_row_layout_type_4_concentration_validation_0': [
+            [.01, .08, .48, .84], [.51, .08, .48, .84],
+        ],
+        'paper_titration_physical_0': 8,
+        'paper_titration_optimized_0': '8_min',
+        'paper_titration_start_0': 41,
+        'paper_titration_type': 'Type 3D - SWVs and response only',
+        'paper_titration_trace_region': 'Full analysis crop',
+    }
+    api['_paper_titration_save_format_preset'](figure_type, state, path)
+    stored = api['_paper_titration_load_format_presets'](path)[figure_type]
+    assert stored == {
+        'paper_show_panel_letters': True,
+        'paper_titration_column_gap': .22,
+        'paper_titration_font': 11.0,
+        'paper_titration_row_layout_type_3d_swvs_and_response_only_0': [
+            [.01, .08, .30, .84], [.35, .08, .30, .84], [.69, .08, .30, .84],
+        ],
+    }
+
+    active = {
+        'paper_titration_font': 7.0,
+        'paper_titration_physical_0': 2,
+        'paper_titration_optimized_0': '2_max',
+        'paper_titration_start_0': 21,
+        'paper_titration_type': 'Type 4 - Concentration validation',
+    }
+    api['_paper_titration_apply_format_preset'](figure_type, active, path)
+    assert active['paper_titration_font'] == 11.0
+    assert active['paper_titration_physical_0'] == 2
+    assert active['paper_titration_optimized_0'] == '2_max'
+    assert active['paper_titration_start_0'] == 21
+    assert active['paper_titration_type'] == 'Type 4 - Concentration validation'
+
+    state['paper_titration_font'] = 9.0
+    api['_paper_titration_save_format_preset'](
+        figure_type, state, path, require_existing=True,
+    )
+    assert api['_paper_titration_load_format_presets'](path)[figure_type][
+        'paper_titration_font'
+    ] == 9.0
+
+    api['_paper_titration_preset_path'] = lambda: path
+    api['st'].session_state.clear()
+    api['st'].session_state.update({
+        'paper_titration_type': figure_type,
+        'paper_titration_font': 6.0,
+        'paper_titration_physical_0': 5,
+    })
+    api['_paper_titration_apply_selected_type_preset']()
+    assert api['st'].session_state['paper_titration_font'] == 9.0
+    assert api['st'].session_state['paper_titration_physical_0'] == 5
+
+
+def test_titration_canvases_are_namespaced_by_figure_type(api):
+    class Stub:
+        def __init__(self):
+            self.session_state = {}
+
+        def markdown(self, *_args, **_kwargs):
+            pass
+
+        def caption(self, *_args, **_kwargs):
+            pass
+
+    stub = Stub()
+    api['st'] = stub
+    editor_keys = []
+    editor_aspects = []
+    stub.session_state.update({
+        'paper_titration_aspect_manual_swv_mode': '1:1 (square)',
+        'paper_titration_aspect_optimized_swv_mode': 'Custom',
+        'paper_titration_aspect_optimized_swv_ratio': 2.0,
+        'paper_titration_aspect_response_mode': 'Automatic',
+    })
+
+    def editor(*, rects, key, panel_aspects, **_kwargs):
+        editor_keys.append(key)
+        editor_aspects.append(panel_aspects)
+        moved = [list(rect) for rect in rects]
+        moved[0][0] += .05
+        return {'event_id': len(editor_keys), 'rects': moved}
+
+    api['_figure_layout_editor'] = editor
+    type3d = 'Type 3D - SWVs and response only'
+    type4 = 'Type 4 - Concentration validation'
+    layout3d = api['_paper_titration_row_layout_editor'](
+        0, api['_paper_panel_roles'](type3d), type3d,
+    )
+    layout4 = api['_paper_titration_row_layout_editor'](
+        0, api['_paper_panel_roles'](type4), type4,
+    )
+
+    key3d = 'paper_titration_row_layout_type_3d_swvs_and_response_only_0'
+    key4 = 'paper_titration_row_layout_type_4_concentration_validation_0'
+    assert key3d in stub.session_state and key4 in stub.session_state
+    assert len(layout3d) == 3 and len(layout4) == 2
+    assert editor_keys == [
+        '_paper_titration_layout_editor_type_3d_swvs_and_response_only_0',
+        '_paper_titration_layout_editor_type_4_concentration_validation_0',
+    ]
+    assert editor_aspects[0] == [1.0, 2.0, None]
+
+
 @pytest.mark.parametrize('kind, roles', [
     ('Type 3', ['manual_swv', 'optimized_swv', 'response', 'langmuir']),
     ('Type 3D', ['manual_swv', 'optimized_swv', 'response']),
@@ -34,6 +153,22 @@ def test_native_template_column_order(api, kind, roles):
     assert api['_paper_panel_roles'](kind) == roles
     if kind == 'Type 3D':
         assert api['_paper_panel_roles'](kind, ['Predicted vs known']) == roles
+
+
+def test_builtin_type4a_preset_is_square_and_does_not_store_data_choices(api):
+    presets = api['_paper_titration_load_format_presets']()
+    preset = presets['Type 4A - Langmuir and concentration validation']
+    assert preset['paper_titration_aspect_accuracy_mode'] == '1:1 (square)'
+    assert preset['paper_validation_square_axes'] is True
+    assert len(preset[
+        'paper_titration_row_layout_type_4a_langmuir_and_concentration_validation_0'
+    ]) == 3
+    assert not any(
+        key.startswith(('paper_titration_physical_', 'paper_titration_optimized_',
+                        'paper_titration_manual_', 'paper_titration_start_',
+                        'paper_titration_end_'))
+        for key in preset
+    )
 
 
 @pytest.mark.parametrize('width, ratio', [(7., 1.), (14., 1.), (14., 2.), (7., .5)])
@@ -61,6 +196,13 @@ def test_custom_plot_box_shape_survives_composite_and_preserves_data(api, width,
     assert target.axes[0].get_ylim() == before_y
     for before, after in zip(before_data, target.axes[0].collections):
         np.testing.assert_array_equal(before, after.get_offsets())
+    assert output.axes[1].get_aspect() == 1.0
+    assert output.axes[1].get_anchor() == 'W'
+    guide = output._paper_panel_plot_guides[1]
+    assert guide['preserve_aspect'] is True
+    assert guide['anchor'] == 'left'
+    assert len(guide['source_box']) == 4
+    assert all(0 <= value <= 1 for value in guide['source_box'])
 
 
 def test_square_applies_to_main_axes_not_swv_colorbar(api):

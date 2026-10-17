@@ -4386,6 +4386,7 @@ def plot_titration_concentration_accuracy(
     channel_labels: Optional[Dict[Any, str]] = None,
     square_axes: bool = True,
     error_summary_position: str = "inside",
+    compact_legend: bool = False,
 ) -> Optional[plt.Figure]:
     usable_rows = [
         row for row in accuracy_rows
@@ -4639,13 +4640,31 @@ def plot_titration_concentration_accuracy(
         for handle, label in zip(handles, labels)
         if label in allowed_legend_labels
     ]
-    ax.legend(
+    compact_legend_kwargs = (
+        {
+            "loc": "upper center",
+            "bbox_to_anchor": (0.5, -0.24),
+        }
+        if compact_legend
+        else {"loc": "lower right"}
+    )
+    legend = ax.legend(
         [item[0] for item in limit_handles_and_labels],
         [item[1] for item in limit_handles_and_labels],
-        fontsize=8,
-        loc="lower right",
+        fontsize=7 if compact_legend else 8,
+        ncol=2 if compact_legend else 1,
+        frameon=not compact_legend,
+        columnspacing=.8 if compact_legend else 2.0,
+        handletextpad=.4 if compact_legend else .8,
+        labelspacing=.25 if compact_legend else .5,
+        borderaxespad=.3 if compact_legend else .5,
+        **compact_legend_kwargs,
     )
-    fig.tight_layout()
+    if compact_legend:
+        # The paper compositor normally relocates legends heuristically. This
+        # compact two-column legend is intentionally placed for square axes.
+        legend._swv_keep_location = True
+    fig.tight_layout(rect=(0.0, 0.11, 1.0, 1.0) if compact_legend else None)
     return fig
 
 

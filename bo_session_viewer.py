@@ -20187,11 +20187,20 @@ def _chronological_swv_stack_entries(
     for stack_index, (observation, item) in enumerate(entries):
         phase, path, channel = item["phase"], item["path"], _trace_channel_key(item)
         try:
-            if (include_analysis_landmarks or voltage_display_range == 'Shared correction window (union)') and not corrected:
+            raw_requires_landmarks = not corrected and (
+                include_analysis_landmarks
+                or normalize_to_peak
+                or offset_to_baseline
+                or crop_to_minima
+                or voltage_display_range == 'Shared correction window (union)'
+            )
+            if raw_requires_landmarks:
                 # The Q-score noise term is evaluated on the unmodified raw
                 # current between the correction minima.  Requesting the
                 # ``raw_current`` analysis view preserves that exact raw trace
-                # while also returning the mapped landmark indices.
+                # while also returning the mapped landmark indices.  The raw
+                # chronological stack needs the same landmarks whenever its
+                # display options use the peak bracket or minima baseline.
                 voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
                     path,
                     True,
@@ -20252,7 +20261,7 @@ def _chronological_swv_stack_entries(
             if voltage_display_range == 'Shared correction window (union)':
                 if not landmarks or hi <= lo:
                     raise ValueError("No valid correction bracket for shared display crop.")
-            elif crop_to_minima and corrected:
+            elif crop_to_minima:
                 if not landmarks or hi <= lo:
                     raise ValueError("No valid correction bracket for display crop.")
                 voltage, y = voltage[lo:hi + 1], y[lo:hi + 1]
@@ -34806,6 +34815,8 @@ def _composer_build_chronological_swv(
         current_axis_scale=spec.get("current_axis_scale", .72),
         crop_to_minima=spec.get("crop_to_minima", True),
         voltage_display_range=spec.get('voltage_display_range'),
+        voltage_min=spec.get("voltage_min"),
+        voltage_max=spec.get("voltage_max"),
         current_axis_top=spec.get("current_axis_top") or None,
         stack_legend_location=spec.get("stack_legend_location", "upper right"),
         stack_axis_gap=spec.get('stack_axis_gap', .08),
@@ -36235,6 +36246,8 @@ def _composer_type2_swv_anomalies(session, observations, state) -> dict[int, lis
         selected_phases=phases,
         crop_to_minima=display_range == 'Corrected peak bracket',
         voltage_display_range=str(display_range),
+        voltage_min=state.get(f'bo_composer_stack_voltage_min_{stack_index}') if display_range == 'Custom voltage range' else None,
+        voltage_max=state.get(f'bo_composer_stack_voltage_max_{stack_index}') if display_range == 'Custom voltage range' else None,
     )
     return _anomalous_swv_iterations(loaded)
 
@@ -36545,13 +36558,33 @@ def _composer_source_controls(index, source_spec, session, history, observations
         ))
         draft["current_axis_top"] = st.number_input("Current-axis maximum (0 = detected peak)", min_value=0., value=float(draft.get("current_axis_top") or 0.), format="%.6f")
         _composer_stack_spacing_controls(draft)
-        stack_ranges = ["Corrected peak bracket", "Full analyzed voltage range", "Shared correction window (union)"]
+        stack_ranges = [
+            "Corrected peak bracket",
+            "Full analyzed voltage range",
+            "Shared correction window (union)",
+            "Custom voltage range",
+        ]
         draft["voltage_display_range"] = st.radio(
             "Chronological voltage range", stack_ranges,
             index=stack_ranges.index(draft['voltage_display_range']) if draft.get('voltage_display_range') in stack_ranges else (0 if draft.get("crop_to_minima", True) else 1),
-            help="Shared uses the lowest and highest correction-window voltages across accepted traces. Full retains the analysis crop. Display only; no extrapolation or Q changes.",
+            help="Shared uses the lowest and highest correction-window voltages across accepted traces. Custom crops all traces to the limits below. Display only; no extrapolation or Q changes.",
         )
         draft["crop_to_minima"] = draft["voltage_display_range"] == stack_ranges[0]
+        if draft["voltage_display_range"] == "Custom voltage range":
+            saved_analysis = _bo_analysis_settings(session.get("config") or {})
+            voltage_cols = st.columns(2)
+            draft["voltage_min"] = float(voltage_cols[0].number_input(
+                "Voltage minimum (V)", -10.0, 10.0,
+                float(draft.get("voltage_min", saved_analysis.get("crop_min_v", -0.45))),
+                0.01,
+            ))
+            draft["voltage_max"] = float(voltage_cols[1].number_input(
+                "Voltage maximum (V)", -10.0, 10.0,
+                float(draft.get("voltage_max", saved_analysis.get("crop_max_v", 0.1))),
+                0.01,
+            ))
+            if draft["voltage_min"] >= draft["voltage_max"]:
+                st.error("Voltage minimum must be below voltage maximum.")
         draft["custom_title"] = st.text_input(
             "Panel title", value=str(draft.get("custom_title") or "Chronological SWVs")
         )
@@ -38217,7 +38250,12 @@ def _render_figure_composer(
                     key=f"bo_composer_stack_trace_key_{index}",
                     disabled=not spec["corrected"],
                 )
-                stack_ranges = ["Corrected peak bracket", "Full analyzed voltage range", "Shared correction window (union)"]
+                stack_ranges = [
+                    "Corrected peak bracket",
+                    "Full analyzed voltage range",
+                    "Shared correction window (union)",
+                    "Custom voltage range",
+                ]
                 range_key = f"bo_composer_stack_voltage_range_{index}"
                 st.session_state.setdefault(range_key, stack_ranges[
                     (0 if st.session_state[f"bo_composer_stack_bracket_{index}"] else 1)
@@ -38225,10 +38263,31 @@ def _render_figure_composer(
                 ])
                 spec["voltage_display_range"] = st.radio(
                     "Chronological voltage range", stack_ranges, key=range_key,
-                    help="Peak bracket crops each trace separately. Shared uses the lowest-to-highest correction-window voltage across accepted traces. Full keeps the saved analysis crop. No extrapolation; analysis and Q stay unchanged.",
+                    help="Peak bracket crops each trace separately. Shared uses the correction-window union. Custom applies the same manual voltage limits to every trace. Analysis and Q stay unchanged.",
                 )
                 spec["crop_to_minima"] = spec["voltage_display_range"] == stack_ranges[0]
                 st.session_state[f"bo_composer_stack_bracket_{index}"] = spec["crop_to_minima"]
+                if spec["voltage_display_range"] == "Custom voltage range":
+                    saved_analysis = _bo_analysis_settings(session.get("config") or {})
+                    voltage_cols = st.columns(2)
+                    spec["voltage_min"] = float(voltage_cols[0].number_input(
+                        "Voltage minimum (V)",
+                        min_value=-10.0,
+                        max_value=10.0,
+                        value=float(saved_analysis.get("crop_min_v", -0.45)),
+                        step=0.01,
+                        key=f"bo_composer_stack_voltage_min_{index}",
+                    ))
+                    spec["voltage_max"] = float(voltage_cols[1].number_input(
+                        "Voltage maximum (V)",
+                        min_value=-10.0,
+                        max_value=10.0,
+                        value=float(saved_analysis.get("crop_max_v", 0.1)),
+                        step=0.01,
+                        key=f"bo_composer_stack_voltage_max_{index}",
+                    ))
+                    if spec["voltage_min"] >= spec["voltage_max"]:
+                        st.error("Voltage minimum must be below voltage maximum.")
             elif kind == "Chronological buffer/target trend":
                 metrics = _q_relevant_metrics(PAIRED_TREND_METRICS, session["config"], True) or list(PAIRED_TREND_METRICS)
                 metric = st.selectbox("Metric", metrics, key=f"bo_composer_chrono_metric_{index}")

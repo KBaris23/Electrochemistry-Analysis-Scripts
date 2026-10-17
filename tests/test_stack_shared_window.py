@@ -36,3 +36,73 @@ def test_source_editor_preserves_shared_crop():
         'kind': 'Chronological SWV stack', 'crop_to_minima': False,
         'voltage_display_range': 'Shared correction window (union)'}})
     assert state['bo_composer_stack_voltage_range_0'] == 'Shared correction window (union)'
+
+
+def test_raw_stack_peak_bracket_uses_raw_samples_with_analysis_landmarks(monkeypatch):
+    calls = []
+
+    def arrays(path, corrected, analysis, trace_key):
+        calls.append((corrected, trace_key))
+        return (
+            np.array([-.5, -.4, -.3, -.2, -.1]),
+            np.array([10., 1., 4., 1., 10.]),
+            2,
+            1,
+            3,
+        )
+
+    monkeypatch.setattr(viewer, '_swv_trace_arrays', arrays)
+    entries = [(
+        {'iteration': 1},
+        {'phase': 'buffer', 'path': Path('raw.csv'), 'channel': '1'},
+    )]
+
+    rows, errors, _ = viewer._chronological_swv_stack_entries(
+        entries,
+        False,
+        ['1'],
+        {},
+        {},
+        crop_to_minima=True,
+        voltage_display_range='Corrected peak bracket',
+    )
+
+    assert not errors
+    assert calls == [(True, 'raw_current')]
+    np.testing.assert_array_equal(rows[0]['voltage'], [-.4, -.3, -.2])
+    np.testing.assert_array_equal(rows[0]['current'], [1., 4., 1.])
+
+
+def test_raw_stack_default_baseline_offset_does_not_drop_trace(monkeypatch):
+    calls = []
+
+    def arrays(path, corrected, analysis, trace_key):
+        calls.append((corrected, trace_key))
+        return (
+            np.array([-.5, -.4, -.3, -.2, -.1]),
+            np.array([3., 1., 4., 1., 3.]),
+            2,
+            1,
+            3,
+        )
+
+    monkeypatch.setattr(viewer, '_swv_trace_arrays', arrays)
+    entries = [(
+        {'iteration': 1},
+        {'phase': 'buffer', 'path': Path('raw.csv'), 'channel': '1'},
+    )]
+
+    rows, errors, _ = viewer._chronological_swv_stack_entries(
+        entries,
+        False,
+        ['1'],
+        {},
+        {},
+        offset_to_baseline=True,
+        voltage_display_range='Full analyzed voltage range',
+    )
+
+    assert not errors
+    assert calls == [(True, 'raw_current')]
+    assert len(rows) == 1
+    np.testing.assert_array_equal(rows[0]['current'], [2., 0., 3., 0., 2.])

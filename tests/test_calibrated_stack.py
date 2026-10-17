@@ -211,6 +211,16 @@ def test_trace_width_and_stack_controls_survive_source_edit():
     assert state['bo_composer_stack_depth_spacing_1'] == 1.4
     assert state['bo_composer_stack_voltage_range_1'] == 'Corrected peak bracket'
 
+    assert apply_source_edit(state, {'index': 1, 'spec': {
+        'kind': 'Chronological SWV stack',
+        'voltage_display_range': 'Custom voltage range',
+        'voltage_min': -.36,
+        'voltage_max': -.12,
+    }})
+    assert state['bo_composer_stack_voltage_range_1'] == 'Custom voltage range'
+    assert state['bo_composer_stack_voltage_min_1'] == -.36
+    assert state['bo_composer_stack_voltage_max_1'] == -.12
+
 
 def test_waveform_linewidth_is_user_controlled(monkeypatch):
     monkeypatch.setattr(viewer, '_trace_paths', lambda *a: [{'phase': 'buffer', 'path': 'example', 'channel': '1'}])

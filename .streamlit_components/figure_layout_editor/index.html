@@ -87,6 +87,33 @@
       box-shadow: 0 0 0 2px rgba(255, 255, 255, .9), 0 0 0 4px rgba(220, 38, 38, .35);
     }
     .panel.dragging { opacity: .86; }
+    .aspect-preview {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      display: none;
+      box-sizing: border-box;
+      transform: translate(-50%, -50%);
+      border: 2px dashed rgba(37, 99, 235, .72);
+      border-radius: 3px;
+      background: rgba(255, 255, 255, .34);
+      pointer-events: none;
+      z-index: 0;
+    }
+    .plot-size {
+      position: absolute;
+      right: 2px;
+      bottom: 1px;
+      padding: 0 2px;
+      border-radius: 2px;
+      background: rgba(255, 255, 255, .88);
+      color: #0f766e;
+      font: 600 9px/1.25 system-ui, sans-serif;
+      white-space: nowrap;
+    }
+    .panel.selected .aspect-preview {
+      border-color: rgba(220, 38, 38, .82);
+    }
     .label {
       position: absolute;
       top: 5px;
@@ -97,6 +124,7 @@
       font-size: 14px;
       font-weight: 700;
       pointer-events: none;
+      z-index: 2;
     }
     .dimensions {
       position: absolute;
@@ -108,6 +136,7 @@
       font-size: 10px;
       font-variant-numeric: tabular-nums;
       pointer-events: none;
+      z-index: 2;
     }
     .resize-handle {
       position: absolute;
@@ -327,6 +356,8 @@
       streamlitMessage("streamlit:setComponentValue", {value});
     }
     function aspectRatio(name) {
+      const explicit = Number(args.canvas_aspect);
+      if (Number.isFinite(explicit) && explicit > 0) return explicit;
       if (name === "Sweep workspace (9 x 10 in)") return 9 / 10;
       if (name === "16:9") return 16 / 9;
       if (name === "Row 4:1") return 4;
@@ -374,6 +405,67 @@
       element.style.height = `${rect[3] * 100}%`;
       element.querySelector(".dimensions").textContent =
         `x ${rect[0].toFixed(3)}  y ${rect[1].toFixed(3)}  w ${rect[2].toFixed(3)}  h ${rect[3].toFixed(3)}`;
+      const index = Number(element.dataset.index);
+      const desired = Number((args.panel_aspects || [])[index]);
+      const guide = (args.panel_plot_guides || [])[index];
+      const preview = element.querySelector(".aspect-preview");
+      const plotSize = element.querySelector(".plot-size");
+      const label = (args.labels || [])[index] || String(index + 1);
+      const panelAspect = (rect[2] * aspectRatio(args.aspect)) / rect[3];
+      const sourceBox = guide && Array.isArray(guide.source_box) && guide.source_box.length === 4
+        ? guide.source_box.map(Number) : null;
+      if (sourceBox && sourceBox.every(Number.isFinite) && preview) {
+        let imageLeft = 0, imageBottom = 0, imageWidth = 1, imageHeight = 1;
+        const imageAspect = Number(guide.image_aspect);
+        if (guide.preserve_aspect && Number.isFinite(imageAspect) && imageAspect > 0) {
+          if (imageAspect > panelAspect) {
+            imageHeight = panelAspect / imageAspect;
+            imageBottom = (1 - imageHeight) / 2;
+          } else {
+            imageWidth = imageAspect / panelAspect;
+            imageLeft = guide.anchor === "left" ? 0 : (1 - imageWidth) / 2;
+          }
+        }
+        const actual = [
+          imageLeft + sourceBox[0] * imageWidth,
+          imageBottom + sourceBox[1] * imageHeight,
+          sourceBox[2] * imageWidth,
+          sourceBox[3] * imageHeight,
+        ];
+        preview.style.display = "block";
+        preview.style.left = `${actual[0] * 100}%`;
+        preview.style.top = `${(1 - actual[1] - actual[3]) * 100}%`;
+        preview.style.width = `${actual[2] * 100}%`;
+        preview.style.height = `${actual[3] * 100}%`;
+        preview.style.transform = "none";
+        const canvasWidth = Number(args.canvas_width_in);
+        const canvasHeight = Number(args.canvas_height_in);
+        if (plotSize && Number.isFinite(canvasWidth) && Number.isFinite(canvasHeight)) {
+          const plotWidth = rect[2] * canvasWidth * actual[2];
+          const plotHeight = rect[3] * canvasHeight * actual[3];
+          plotSize.textContent = `${plotWidth.toFixed(2)}×${plotHeight.toFixed(2)} in`;
+        }
+        element.querySelector(".label").textContent = Number.isFinite(desired) && desired > 0
+          ? `${label} | ${desired.toFixed(2)}:1` : label;
+      } else if (Number.isFinite(desired) && desired > 0 && preview) {
+        let widthPercent = 90;
+        let heightPercent = widthPercent * panelAspect / desired;
+        if (heightPercent > 90) {
+          heightPercent = 90;
+          widthPercent = heightPercent * desired / panelAspect;
+        }
+        preview.style.display = "block";
+        preview.style.left = "50%";
+        preview.style.top = "50%";
+        preview.style.width = `${Math.max(8, widthPercent)}%`;
+        preview.style.height = `${Math.max(8, heightPercent)}%`;
+        preview.style.transform = "translate(-50%, -50%)";
+        if (plotSize) plotSize.textContent = "preview";
+        element.querySelector(".label").textContent = `${label} | ${desired.toFixed(2)}:1`;
+      } else {
+        if (preview) preview.style.display = "none";
+        element.querySelector(".label").textContent = label;
+      }
     }
     function updateSelectionAppearance() {
       canvas.querySelectorAll(".panel").forEach(panel => {
@@ -402,7 +494,7 @@
         const panel = document.createElement("div");
         panel.className = "panel";
         panel.dataset.index = String(index);
-        panel.innerHTML = '<span class="label"></span><span class="dimensions"></span>';
+        panel.innerHTML = '<span class="aspect-preview"><span class="plot-size"></span></span><span class="label"></span><span class="dimensions"></span>';
         ["nw", "n", "ne", "e", "se", "s", "sw", "w"].forEach(dir => {
           const handle = document.createElement("span");
           handle.className = "resize-handle";
@@ -416,7 +508,6 @@
           });
           panel.appendChild(handle);
         });
-        panel.querySelector(".label").textContent = (args.labels || [])[index] || String(index + 1);
         panel.title = "Drag to move; Ctrl/Cmd-click to select; right-click to align";
         updatePanel(panel, rect);
         panel.addEventListener("pointerdown", startGesture);
