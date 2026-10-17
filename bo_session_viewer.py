@@ -31511,6 +31511,8 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_find_peak_example",
     "bo_composer_stack_spacing_reset_",
     "bo_composer_move_",
+    "bo_composer_validation_auto_polish",
+    "bo_composer_validation_clear_exclusions",
 )
 
 
@@ -36294,7 +36296,7 @@ def _composer_validation_scope(session, observations, history):
     cleanup_cols = st.columns([1.7, 1.0])
     if cleanup_cols[0].button(
         'Auto-polish Type 2 SWVs',
-        key='bo_composer_validation_auto_polish',
+        key='bo_composer_validation_auto_polish_button',
         help=(
             'Conservatively selects iterations with strong spikes, jumps, roughness, '
             'or phase-specific shape anomalies. Source files and Q values are unchanged.'
@@ -36312,7 +36314,7 @@ def _composer_validation_scope(session, observations, history):
         state['bo_composer_validation_cleanup_report'] = anomaly_reasons
     if cleanup_cols[1].button(
         'Clear exclusions',
-        key='bo_composer_validation_clear_exclusions',
+        key='bo_composer_validation_clear_exclusions_button',
         help='Restores all Type 2 iterations; source data are never deleted.',
     ):
         state['bo_composer_validation_excluded_iterations'] = []

@@ -594,7 +594,6 @@
           "bo_composer_title_size_2": 12.0,
           "bo_composer_title_size_3": 12.0,
           "bo_composer_title_size_4": 12.0,
-          "bo_composer_validation_auto_polish": false,
           "bo_composer_validation_channel": "8_max",
           "bo_composer_validation_channel__preferred": "8_max",
           "bo_composer_validation_cleanup_report": {
@@ -713,7 +712,6 @@
               "shape outlier"
             ]
           },
-          "bo_composer_validation_clear_exclusions": false,
           "bo_composer_validation_excluded_iterations": [
             3,
             5,

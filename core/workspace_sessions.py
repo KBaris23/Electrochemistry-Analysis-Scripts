@@ -60,6 +60,8 @@ _EXCLUDED_PREFIXES = (
     "bo_composer_exports_", "bo_composer_download_",
     "bo_composer_capture_preview_", "bo_gif_", "bo_sim_",
     "bo_composer_stack_spacing_reset_",
+    "bo_composer_validation_auto_polish",
+    "bo_composer_validation_clear_exclusions",
 )
 _EXCLUDED_KEYS = {
     '_workspace_recovery_at', '_bo_lazy_tabs',
