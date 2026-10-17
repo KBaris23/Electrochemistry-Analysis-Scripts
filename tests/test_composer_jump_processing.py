@@ -14,6 +14,7 @@ def test_jump_options_reach_cached_analysis_and_invalidate_cache(tmp_path, monke
     def analyze(voltage, current, **kwargs):
         calls.append(kwargs)
         return dict(voltage=x, cropped_voltage=x, corrected_current=current,
+                    raw_current=current, local_baseline=np.zeros_like(current),
                     peak_idx_corr=10, left_min_idx=0, right_min_idx=19)
     monkeypatch.setattr(v, 'analyze_swv_arrays', analyze)
     monkeypatch.setattr(v, 'apply_bo_result_constraints', lambda *a: None)
@@ -43,6 +44,59 @@ def test_panel_jump_override_is_saved_and_does_not_mutate_bo_snapshot():
         assert 'jump_sensitivity' not in session['config']['analysis']
     assert not v._composer_trace_analysis({}, session, {})['correct_baseline_jumps']
     assert not v._composer_trace_analysis({**spec, 'corrected': False}, session, {})['correct_baseline_jumps']
+
+
+def test_type2_auto_polish_flags_spike_without_rejecting_smooth_family():
+    voltage = np.linspace(-.5, -.05, 180)
+    rows = []
+    for iteration in range(1, 12):
+        current = .08 * np.exp(-((voltage + .24 + iteration * .0005) / .07) ** 2)
+        rows.append(dict(iteration=iteration, phase='buffer', voltage=voltage, current=current))
+    spiked = rows[-1]['current'].copy()
+    spiked[80] += .30
+    rows[-1]['current'] = spiked
+    flagged = v._anomalous_swv_iterations(rows)
+    assert 11 in flagged
+    assert set(flagged) == {11}
+
+
+def test_type2_auto_polish_flags_subtle_isolated_baseline_step():
+    voltage = np.linspace(-.5, -.05, 180)
+    rows = []
+    for iteration in range(1, 12):
+        current = .08 * np.exp(-((voltage + .24) / .07) ** 2)
+        current += iteration * 1e-5 * np.sin(np.linspace(0, 3 * np.pi, len(voltage)))
+        rows.append(dict(iteration=iteration, phase='target', voltage=voltage, current=current))
+    stepped = rows[-1]['current'].copy()
+    stepped[48:] += .014
+    rows[-1]['current'] = stepped
+    flagged = v._anomalous_swv_iterations(rows)
+    assert 11 in flagged
+    assert 'isolated straight-line jump' in flagged[11]
+    assert set(flagged) == {11}
+
+
+def test_type2_auto_polish_flags_missing_voltage_segment_connector():
+    full_voltage = np.linspace(-.5, -.05, 180)
+    rows = [
+        dict(
+            iteration=iteration,
+            phase='buffer',
+            voltage=full_voltage,
+            current=.06 * np.exp(-((full_voltage + .24) / .07) ** 2),
+        )
+        for iteration in range(1, 11)
+    ]
+    keep = np.r_[np.arange(0, 55), np.arange(100, len(full_voltage))]
+    rows.append(dict(
+        iteration=11,
+        phase='buffer',
+        voltage=full_voltage[keep],
+        current=.06 * np.exp(-((full_voltage[keep] + .24) / .07) ** 2),
+    ))
+    flagged = v._anomalous_swv_iterations(rows)
+    assert set(flagged) == {11}
+    assert 'missing voltage segment / straight connector' in flagged[11]
 
 
 def test_custom_trend_title_replaces_automatic_title_and_legend_moves():

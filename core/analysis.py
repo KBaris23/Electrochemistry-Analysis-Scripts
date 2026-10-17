@@ -328,6 +328,32 @@ def _run_correction_pass(
     }
 
 
+def unsmoothed_corrected_trace(result: dict) -> np.ndarray:
+    """Subtract the analysis baselines from cropped, unsmoothed samples.
+
+    ``corrected_current`` is the historical *analysis* signal: its input may
+    already be Savitzky-Golay smoothed or wavelet denoised. Keep that signal
+    and its peak/Q metrics unchanged; never use it for an unsmoothed display.
+    Explicit baseline-jump correction is retained, but no denoising is used.
+    All successful correction passes contribute to the baseline.
+    """
+    source = result.get("jump_corrected_current")
+    if source is None:
+        source = result.get("raw_current")
+    if source is None or result.get("local_baseline") is None:
+        raise ValueError("Unsmoothed correction requires raw samples and the fitted baseline.")
+    current = np.asarray(source, dtype=float).copy()
+    for key in ("local_baseline", "second_pass_local_baseline", "third_pass_local_baseline"):
+        baseline = result.get(key)
+        if baseline is None:
+            continue
+        baseline = np.asarray(baseline, dtype=float)
+        if baseline.shape != current.shape:
+            raise ValueError("Raw samples and fitted baseline have different shapes.")
+        current -= baseline
+    return current
+
+
 def _wavelet_denoise_trace(y: np.ndarray) -> np.ndarray:
     signal = np.asarray(y, dtype=float)
     if signal.size < 8:

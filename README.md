@@ -24,11 +24,11 @@ saved-session names, and native application instructions.
 | CV processing | CV; supported CV files | CV traces, analysis, plots and exports |
 | Parameter sweep | BO Session; **survey** session | Types 1 / 1A / 1B / 1C: measured landscape, example SWVs and slices; Type 1C has two slices left, one combined points-and-planes cube, and two SWVs right |
 | BO validation | BO Session; **optimization** session | Type 2: cube, Q with running mean, buffer/target trend, chronological SWVs, parallel coordinates; Type 2A: cube and two trends |
-| Titration response | SWV → **Paper Figures**; titration and Langmuir enabled | Type 3: manual/optimized comparisons; Type 3A: cross-channel ON/OFF with independent manual references; Type 3B: same-channel ON/OFF with shared fits/difference; Type 3C: separate optimized/manual fits per row |
-| Concentration prediction | Same SWV channel/method/step selection | Type 4: concentration by measurement and predicted versus known; within-calibration assessment, not independent validation |
+| Titration response | SWV → **Paper Figures**; titration enabled (Langmuir optional for 3D) | Type 3: manual/optimized comparisons; Type 3A: cross-channel ON/OFF with independent manual references; Type 3B: same-channel ON/OFF with shared fits/difference; Type 3C: separate optimized/manual fits per row; Type 3D: manual SWVs, optimized SWVs, response versus measurement only |
+| Concentration prediction | Same SWV channel/method/step selection; Langmuir enabled | Type 4: concentration by measurement and predicted versus known; Type 4A: Langmuir first, then those two prediction panels; within-calibration assessment, not independent validation |
 
 **Why a preset is missing:** survey inputs offer the Type 1 family; optimization
-inputs offer the Type 2 family. Types 3/3A/3B/3C/4 are in SWV **Paper Figures**, not the
+inputs offer the Type 2 family. Types 3/3A/3B/3C/3D/4/4A are in SWV **Paper Figures**, not the
 BO preset menu. Saved custom presets additionally require compatible data fields
 and plot types. Select the correct session before loading a preset.
 
@@ -38,7 +38,7 @@ SWV **Quality audit** now exports a per-scan jump-screen table and the existing
 extreme-filter candidates. **Inspect analysed waveform > Preview waveform QC**
 compares the stored raw, corrected and smoothed arrays; screening does not remove
 or fill data. Paper Figures disables stale downloads after settings change;
-click **Generate paper figure** again. Its method colors are consistent across
+click **Generate preview** again. Its method colors are consistent across
 SWVs, responses and fits. Langmuir CSV exports distinguish R² on the fitted
 branch from R² across all selected accepted target doses: the existing fit stops
 at the largest absolute response, so these can differ substantially.
@@ -207,6 +207,11 @@ To adjust the chronological stack (Type 2), select its block and open **Edit pan
   Titration Paper Figures contain rasterized subplots even in PDF;
   set their panel raster DPI before generation. Transparent export and optional
   panel letters are supported.
+- **Titration Paper Figure exports:** **Generate preview** creates a sampled,
+  reduced-resolution PNG preview only. **Generate full-resolution exports**
+  enables **Export PNG**, **Export PDF**, **Export SVG**, and **Export all
+  (ZIP)**. Metadata is embedded in each figure; the ZIP also contains
+  `figure-metadata.json`. Export bytes are reused across unchanged reruns.
 - **Presets:** all named presets are editable, including Types 1/1A/1B/2/2A.
   File-backed presets are in the visible, Git-tracked
   `figure_composer_presets.json` under the app directory. Under **Reusable preset**,
@@ -307,7 +312,8 @@ For an SWV Paper Figure export:
    boundaries/selections, and Paper Figure controls. It deliberately clears
    stale analyzed results.
 4. Verify the source paths, click **Run Analysis**, return to **Paper Figures**,
-   click **Generate paper figure**, and download the final output/package.
+   click **Generate preview** to inspect it, then **Generate full-resolution
+   exports** and download the required format or ZIP package.
 
 The current upload controls accept PNG, JSON, and ZIP. Although PDF Subject and
 SVG Description fields also contain the recipe for archival provenance, upload
@@ -320,7 +326,7 @@ font rasterization or library changes can alter pixels.
 
 The current NP figures use the application templates and native scientific
 renderers. The reproducible workflow is **Saved analysis sessions → Open → render
-or Generate paper figure**. PNG metadata and JSON sidecars contain the figure
+or **Generate preview / Generate full-resolution exports**. PNG metadata and JSON sidecars contain the figure
 recipe; the source measurements must be available for recalculation.
 
 See [Recreating figures](docs/recreating-figures.md) for the exact click sequences,
@@ -349,14 +355,18 @@ rearrangement helper has been retired. No AI image-generation service is needed.
    between **Type 3** and **Type 4 — Concentration validation** in this same session.
    No additional session is needed for that concentration diagnostic. The
    `_validation` sessions above refer to BO experiments, not held-out concentration data.
-4. For Type 4, open **Concentration validation layout**: adjust
+4. For Type 4 or 4A, open **Concentration validation layout**: adjust
    **Predicted-vs-known width (%)** (default 45), **Validation panel gap** (0.04),
    and **RMS fold error position** (Above plot; Below/Inside are available).
-   Leave **Square predicted-vs-known axes** off to use the available width.
+   Under **Panel aspect ratios (optional)**, set **Predicted vs known concentration**
+   to **1:1 (square)** for a square plotting area, or **Custom** for a numeric
+   width/height ratio. **Automatic** preserves the template layout. Other panel
+   types have independent controls; choices persist in sessions and export metadata.
    Both log axes retain the same numeric limits; a rectangular plot's 1:1 line
    is not necessarily 45 degrees on screen. The canvas stays at 3.1 inches per row.
-5. Adjust **Titles, labels, and typography**, then **Generate paper figure →
-   Download PNG**; for BO click **Export PNG** (or PDF/SVG/**Export all**).
+5. Adjust **Titles, labels, and typography**, then **Generate preview**. When
+   ready, click **Generate full-resolution exports → Export PNG** (or
+   PDF/SVG/**Export all**); BO uses the same four export labels.
    Preview is optional. Reopening a recipe restores settings, not an already rendered preview.
 6. Save your edits through sidebar **Save as → Save**. Reuse the session name to
    update it or choose a new name to preserve a variant. Use these local sessions,

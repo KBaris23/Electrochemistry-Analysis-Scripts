@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 
 import bo_session_viewer as viewer
 from core.chronological_stack import draw_coordinate_stack
@@ -27,12 +28,65 @@ def test_depth_follows_buffer_iterations_and_rear_fades():
         assert np.isclose(tick.xy[1], lines[i, 'buffer'].get_ydata()[0])
         assert np.isclose(tick.xy[0] + .045, lines[i, 'buffer'].get_xdata()[0])
     assert [t.get_text() for t in ax.get_legend().get_texts()] == ['Buffer', 'Target']
-    assert ax.get_legend()._loc == 1  # upper right, matching the requested box
-    assert ax.get_legend().get_frame().get_facecolor()[:3] == (1., 1., 1.)
-    assert ax.get_legend().get_frame().get_alpha() == .82
+    assert ax.get_legend()._loc == 1  # retained user-selected corner
+    assert not ax.get_legend().get_frame_on()
+    assert ax.get_legend()._ncols == 2
     assert lines[2, 'buffer'].get_linestyle() == lines[2, 'target'].get_linestyle() == '-'
     assert all(line.get_linestyle() == '-' for line in ax.get_legend().get_lines())
     plt.close(fig)
+
+
+def test_projected_labels_remain_centered_parallel_and_outboard_after_resize():
+    fig, ax = plt.subplots()
+    try:
+        draw_coordinate_stack(fig, ax, rows())
+        for size in ((8., 6.), (12., 3.), (4., 8.)):
+            fig.set_size_inches(*size)
+            fig.canvas.draw()
+            labels = [text for text in ax.texts if getattr(text, '_bo_axis_label', False)]
+            assert len(labels) == 3
+            for text in labels:
+                assert not text.get_clip_on()
+                fraction = getattr(text, '_axis_position_fraction', .5)
+                np.testing.assert_allclose(
+                    text.xy,
+                    text._axis_start + (text._axis_end - text._axis_start) * fraction,
+                )
+                start, end = ax.transData.transform([text._axis_start, text._axis_end])
+                direction = end - start
+                direction /= np.linalg.norm(direction)
+                angle = np.radians(text.get_rotation())
+                assert abs(np.dot(direction, [np.cos(angle), np.sin(angle)])) > .999999
+                # Text offset is normal to the rendered axis, never along it.
+                assert abs(np.dot(direction, text.get_position())) < 1e-10
+                assert text.get_ha() == text.get_va() == 'center'
+            iteration_ticks = [text for text in ax.texts if getattr(text, '_bo_axis_tick', '') == 'iteration']
+            assert all(text.get_rotation() == 0. for text in iteration_ticks)
+            assert all(text.get_ha() == text.get_va() == 'center' for text in iteration_ticks)
+            for tick in [line for line in ax.lines if hasattr(line, '_point')]:
+                points = ax.transData.transform(np.column_stack(tick.get_data()))
+                start, end = ax.transData.transform([tick._axis_start, tick._axis_end])
+                assert abs(np.dot(points[1] - points[0], end - start)) < 1e-8
+                assert np.linalg.norm(points[1] - points[0]) == pytest.approx(3.6 * fig.dpi / 72)
+    finally:
+        plt.close(fig)
+
+
+def test_composer_label_overrides_keep_projected_alignment_and_spacing():
+    fig, ax = plt.subplots()
+    try:
+        draw_coordinate_stack(fig, ax, rows())
+        viewer._composer_axis_overrides(ax, dict(x_axis_title='Potential (V)', y_axis_title='Signal',
+                                                z_axis_title='Measurement number', iteration_label_padding=40.))
+        fig.canvas.draw()
+        labels = {text._bo_axis_name: text for text in ax.texts if hasattr(text, '_bo_axis_name')}
+        assert labels['x'].get_text() == 'Potential (V)'
+        assert labels['y'].get_text() == 'Signal'
+        assert labels['y'].get_rotation() == 90.
+        assert labels['z'].get_text() == 'Measurement number'
+        assert np.linalg.norm(labels['z'].get_position()) == pytest.approx(40.)
+    finally:
+        plt.close(fig)
 
 
 def test_failed_traces_are_skipped_and_every_reason_is_recorded(monkeypatch):

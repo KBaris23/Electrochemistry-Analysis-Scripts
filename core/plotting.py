@@ -552,13 +552,16 @@ def add_scan_vlines(
     linewidth: float = 1.0,
     alpha: float = 0.6,
     label_prefix: str = "",
+    label_mode: str = "boundary",
 ):
 
     if not vlines:
 
         return
 
-    for x, label in vlines:
+    ordered_vlines = [(float(x), str(label)) for x, label in vlines]
+
+    for x, _label in ordered_vlines:
 
         boundary = ax.axvline(
             x=x,
@@ -568,6 +571,25 @@ def add_scan_vlines(
             alpha=alpha,
         )
         boundary._swv_titration_vline = True
+
+    midpoint_labels = str(label_mode).strip().lower() in {
+        "step_midpoint",
+        "midpoint",
+        "centered",
+        "centered in steps (hide final label)",
+    }
+    if midpoint_labels:
+        labels_to_draw = [
+            ((left_x + right_x) / 2.0, left_label)
+            for (left_x, left_label), (right_x, _right_label)
+            in zip(ordered_vlines[:-1], ordered_vlines[1:])
+        ]
+    else:
+        labels_to_draw = ordered_vlines
+
+    for x, label in labels_to_draw:
+        if not str(label).strip():
+            continue
 
         label_artist = ax.text(
 
@@ -2653,6 +2675,9 @@ def plot_metric_vs_scan(
     annotation_offset_by_channel: Optional[Dict[Any, float]] = None,
     channel_labels: Optional[Dict[Any, str]] = None,
     measurement_start_at_one: bool = False,
+    vline_label_mode: str = "boundary",
+    show_titration_plateaus: bool = False,
+    titration_edge_trim_fraction: float = 0.15,
 
 ) -> Optional[plt.Figure]:
 
@@ -2844,6 +2869,23 @@ def plot_metric_vs_scan(
         ax._swv_response_direction = "signal-on"
         signal_off_ax._swv_response_direction = "signal-off"
 
+    plateau_rows_by_channel: Dict[Any, List[dict]] = {}
+    if show_titration_plateaus and x_key == "scan_number":
+        plateau_rows = build_titration_step_table(
+            all_results,
+            metric=metric,
+            vlines=vlines,
+            channels=channels,
+            vlines_by_channel=vlines_by_channel,
+            scan_range=scan_range,
+            edge_trim_fraction=titration_edge_trim_fraction,
+            baseline_mode="none",
+        )
+        for plateau_row in plateau_rows:
+            plateau_rows_by_channel.setdefault(
+                plateau_row.get("channel"), []
+            ).append(plateau_row)
+
     for ch in channels:
 
         ch_res = sorted([r for r in plot_results if r["channel"] == ch and r.get(x_key) is not None],
@@ -2959,6 +3001,55 @@ def plot_metric_vs_scan(
             )
             line._swv_preserve_color = _swv_method_blue(ch) is not None
         plotted_y_by_axis[plot_axis].append(y[np.isfinite(y)])
+
+        for plateau_row in plateau_rows_by_channel.get(ch, []):
+            try:
+                plateau_value = float(plateau_row["plateau_value"])
+                plateau_std = max(0.0, float(plateau_row["plateau_std"]))
+                plateau_start = float(plateau_row["scan_start_observed"])
+                plateau_end = float(plateau_row["scan_end_observed"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not np.isfinite(
+                [plateau_value, plateau_std, plateau_start, plateau_end]
+            ).all():
+                continue
+            plateau_midpoint = (plateau_start + plateau_end) / 2.0
+            segment = plot_axis.hlines(
+                plateau_value,
+                plateau_start,
+                plateau_end,
+                color="black",
+                linestyles="--",
+                linewidth=2.4,
+                alpha=0.95,
+                zorder=6,
+                label="_nolegend_",
+            )
+            segment._swv_titration_plateau = True
+            segment._swv_titration_plateau_segment = True
+            errorbar = plot_axis.errorbar(
+                [plateau_midpoint],
+                [plateau_value],
+                yerr=[[plateau_std], [plateau_std]],
+                fmt="none",
+                ecolor="black",
+                elinewidth=1.1,
+                capsize=3.0,
+                capthick=1.1,
+                alpha=0.95,
+                zorder=7,
+                label="_nolegend_",
+            )
+            _data_line, cap_lines, bar_collections = errorbar.lines
+            for artist in (*cap_lines, *bar_collections):
+                artist.set_linestyle("--")
+                artist._swv_titration_plateau = True
+                artist._swv_titration_plateau_errorbar = True
+            plotted_y_by_axis[plot_axis].append(np.asarray([
+                plateau_value - plateau_std,
+                plateau_value + plateau_std,
+            ]))
 
         if annotate_measurement_numbers and x_key == "measurement_time":
             channel_annotation_every = (annotation_every_by_channel or {}).get(ch, annotation_every)
@@ -3086,9 +3177,15 @@ def plot_metric_vs_scan(
                 max(0.15, vline_y_frac - mapping_index * 0.12),
                 color=mapping_color,
                 label_prefix=f"{readable}: " if multiple_mappings else "",
+                label_mode=vline_label_mode,
             )
     else:
-        add_scan_vlines(ax, filtered_vlines, vline_y_frac)
+        add_scan_vlines(
+            ax,
+            filtered_vlines,
+            vline_y_frac,
+            label_mode=vline_label_mode,
+        )
 
     if offset_to_response_baseline:
         ax.axhline(0.0, color="gray", lw=0.9, alpha=0.6, zorder=1)
@@ -3177,6 +3274,7 @@ def plot_titration_plateaus(
     response_baselines: Optional[Dict[Any, float]] = None,
     offset_to_response_baseline: bool = False,
     channel_colors: Optional[Dict[Any, Any]] = None,
+    vline_label_mode: str = "boundary",
 
 ) -> Optional[plt.Figure]:
 
@@ -3493,7 +3591,12 @@ def plot_titration_plateaus(
             for position, label in filtered_vlines
             if selected_start <= position <= selected_end
         ]
-    add_scan_vlines(ax, filtered_vlines, vline_y_frac)
+    add_scan_vlines(
+        ax,
+        filtered_vlines,
+        vline_y_frac,
+        label_mode=vline_label_mode,
+    )
     if offset_to_response_baseline:
         ax.axhline(0.0, color="gray", lw=0.9, alpha=0.6, zorder=1)
     if selected_bounds is not None:
@@ -4561,6 +4664,7 @@ def plot_titration_concentration_vs_measurement(
     channel_labels: Optional[Dict[Any, str]] = None,
     scan_range: Optional[Tuple[int, int]] = None,
     measurement_start_at_one: bool = False,
+    vline_label_mode: str = "boundary",
 ) -> Optional[plt.Figure]:
     """Plot per-SWV Langmuir concentration predictions by measurement number.
 
@@ -4904,12 +5008,14 @@ def plot_titration_concentration_vs_measurement(
                 max(0.2, max(float(vline_y_frac), 0.92) - mapping_index * .12),
                 color=colors.get(mapped_channels[0], "gray") if multiple_mappings else "gray",
                 label_prefix=f"{readable}: " if multiple_mappings else "",
+                label_mode=vline_label_mode,
             )
     else:
         add_scan_vlines(
             ax,
             visible_boundaries(vlines),
             max(float(vline_y_frac), 0.92),
+            label_mode=vline_label_mode,
         )
     ax.grid(False)
     handles, labels = ax.get_legend_handles_labels()

@@ -32,7 +32,7 @@ def test_explicit_shared_channel_overrides_saved_fallback_and_stale_checkpoint(m
     assert state['bo_composer_width_0'] == .45
 
 
-@pytest.mark.parametrize('figure_type', ['Type 3', 'Type 3B', 'Type 3C', 'Type 4'])
+@pytest.mark.parametrize('figure_type', ['Type 3', 'Type 3B', 'Type 3C', 'Type 3D', 'Type 4', 'Type 4A'])
 def test_paper_studio_channels_and_methods_follow_all_ten_channels(figure_type):
     # The app is a top-level Streamlit script. Isolate its actual selection block
     # so this test needs no private data, fitting, or figure rendering.

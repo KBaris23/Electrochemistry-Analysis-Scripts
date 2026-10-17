@@ -59,11 +59,11 @@ fitted binding curve.
    missing inputs before proceeding; missing files must not be replaced by images.
 3. For sweep/validation, open **Figure Composer** and click **Render figure
    (fast preview)**. For titration, open **Paper Figures** and click **Generate
-   paper figure**. The saved session already selects its figure type and methods.
-4. Inspect the preview. Use **150 DPI** and download **PNG** and **Metadata**.
-   In Paper Figures leave **Include PDF and SVG exports** off for this review.
-   Composer's full ZIP includes vector formats; download the individual PNG and
-   metadata when only the review files are wanted.
+   preview**. The saved session already selects its figure type and methods.
+4. Inspect the preview. For final titration output click **Generate
+   full-resolution exports**, then use **Export PNG**, **Export PDF**, **Export
+   SVG**, or **Export all (ZIP)**. Figure metadata is embedded in all three
+   formats; the ZIP also contains `figure-metadata.json`.
 
 If moving the sessions to another computer, copy the recipes and their named
 cache files into that computer's local session directory. Update unavailable
@@ -89,7 +89,7 @@ For titration:
    settings, concentration boundaries, methods, and figure controls, and clears
    stale analyzed results.
 3. Verify source paths and click **Run Analysis**. Return to **Paper Figures**,
-   confirm the recorded template, then click **Generate paper figure**.
+   confirm the recorded template, then click **Generate preview**.
 4. Save a named session, optionally including its derived cache, for future reopen.
 
 The NP Type 3A controls are part of the application and are stored in both export
@@ -97,12 +97,46 @@ metadata and `np_titration_type3a`. Types 3B/3C retain their same-channel shared
 paired-fit layouts. Historical paper drafts sometimes used “Type 3A” for a
 different paired layout; use the recorded application template for those drafts.
 
+## Additional templates and optional panel shapes
+
+In **SWV → Paper Figures**, select:
+
+- **Type 3D - SWVs and response only**: manual SWVs, optimized SWVs, then response
+  versus measurement number. No Langmuir or extra diagnostic columns are included;
+  Langmuir fitting may be switched off. Channel, method, range, and response-display
+  choices work as in Type 3.
+- **Type 4A - Langmuir and concentration validation**: Langmuir, predicted
+  concentration versus measurement number, then predicted versus known concentration.
+  The fit uses the same calibration selection and baseline as the prediction panels.
+  Enable Langmuir fitting first. Like Type 4, this assesses the calibration data;
+  it is not independent validation.
+
+To make just the accuracy panel square, expand **Panel aspect ratios (optional)**
+and set **Predicted vs known concentration** to **1:1 (square)**. Each panel type
+has its own choice: **Automatic** (unchanged template default), **1:1 (square)**,
+or **Custom** width/height from 0.25 to 4. For example, 2 makes the plotting area
+twice as wide as tall. Choices apply to that panel type across comparison rows.
+They change the physical plotting area, not the numeric axis limits, data, or
+overall figure canvas. Titles, legends, and colorbars sit outside that area, so
+the entire exported image need not be square. Use the existing canvas and width
+controls to allocate more room when needed.
+
+Click **Generate preview** after changing these settings, then **Generate
+full-resolution exports** for the final files. Save a named
+analysis session and download the PNG plus metadata; both restoration routes
+above retain the new template and aspect choices. Old sessions with square
+predicted-versus-known axes retain that choice. The NP sessions listed above can
+be used as starting points; selecting a new template does not overwrite existing
+exported figures or create an additional named session automatically.
+
 ## Checks and troubleshooting
 
 - A missing Type 1 template usually means an optimization session was opened
-  instead of a survey. Type 2 uses optimization sessions. Types 3/3A/3B/3C/4 live
-  in SWV **Paper Figures**, with titration intervals and Langmuir fitting enabled.
-- A stale figure download requires **Generate paper figure** or **Render figure**
+  instead of a survey. Type 2 uses optimization sessions. Types 3/3A/3B/3C/3D/4/4A
+  live in SWV **Paper Figures**, with titration intervals enabled. All except
+  Type 3D also require Langmuir fitting.
+- A stale figure download requires **Generate preview** / **Generate
+  full-resolution exports** or **Render figure**
   after controls change. The application deliberately invalidates stale renders.
 - Raw files are required to recalculate SWVs. PNG metadata cannot reconstruct
   missing raw samples. Keep the BO session files and their referenced trace CSVs.

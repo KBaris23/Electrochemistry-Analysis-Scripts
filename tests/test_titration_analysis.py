@@ -213,6 +213,87 @@ def test_mixed_response_peak_plot_uses_direction_specific_axes_and_colors():
     assert "Channel 2 (signal-off)" in legend_labels
 
 
+def test_midpoint_titration_labels_keep_boundaries_and_hide_closing_label():
+    rows = [
+        _result(1, scan_number, float(scan_number))
+        for scan_number in range(1, 7)
+    ]
+    vlines = [(1, "buffer"), (4, "10 uM"), (7, "end")]
+
+    figure = plot_metric_vs_scan(
+        rows,
+        metric="peak_current_selected",
+        channels=[1],
+        vlines=vlines,
+        vline_label_mode="Centered in steps (hide final label)",
+    )
+
+    axis = figure.axes[0]
+    boundaries = [
+        line for line in axis.lines
+        if getattr(line, "_swv_titration_vline", False)
+    ]
+    labels = [
+        text for text in axis.texts
+        if getattr(text, "_swv_titration_vline", False)
+    ]
+    assert len(boundaries) == 3
+    assert [label.get_text() for label in labels] == ["buffer", "10 uM"]
+    assert np.allclose([label.get_position()[0] for label in labels], [2.5, 5.5])
+
+
+def test_metric_plot_plateau_overlay_is_disconnected_and_has_std_error_bars():
+    rows = [
+        _result(1, scan_number, value)
+        for scan_number, value in enumerate(
+            [0.0, 1.0, 2.0, 4.0, 5.0, 6.0],
+            start=1,
+        )
+    ]
+    vlines = [(1, "buffer"), (4, "10 uM"), (7, "end")]
+
+    figure = plot_metric_vs_scan(
+        rows,
+        metric="peak_current_selected",
+        channels=[1],
+        vlines=vlines,
+        show_titration_plateaus=True,
+        titration_edge_trim_fraction=0.0,
+    )
+
+    axis = figure.axes[0]
+    plateau_segments = [
+        collection for collection in axis.collections
+        if getattr(collection, "_swv_titration_plateau_segment", False)
+    ]
+    plateau_errors = [
+        collection for collection in axis.collections
+        if getattr(collection, "_swv_titration_plateau_errorbar", False)
+    ]
+    assert len(plateau_segments) == 2
+    assert len(plateau_errors) == 2
+    assert all(
+        np.allclose(collection.get_colors()[0][:3], [0.0, 0.0, 0.0])
+        for collection in plateau_segments + plateau_errors
+    )
+    assert all(
+        collection.get_linestyles()[0][1] is not None
+        for collection in plateau_segments + plateau_errors
+    )
+    assert np.allclose(
+        plateau_segments[0].get_segments()[0],
+        [[1.0, 1.0], [3.0, 1.0]],
+    )
+    assert np.allclose(
+        plateau_segments[1].get_segments()[0],
+        [[4.0, 5.0], [6.0, 5.0]],
+    )
+    assert not np.isclose(
+        plateau_segments[0].get_segments()[0][-1, 0],
+        plateau_segments[1].get_segments()[0][0, 0],
+    )
+
+
 def test_explicit_channel_palette_is_stable_when_plotting_a_subset():
     rows = [
         {

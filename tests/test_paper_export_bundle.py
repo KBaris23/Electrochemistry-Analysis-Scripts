@@ -23,30 +23,41 @@ def app_functions():
     return namespace
 
 
-@pytest.mark.parametrize('include_vector', [False, True])
-def test_paper_exports_include_final_metadata_and_optional_vectors(include_vector):
+def test_paper_exports_include_final_metadata_and_all_formats():
     api = app_functions()
     downloads = {}
     class Column:
         def download_button(self, label, data, **kwargs):
             downloads[kwargs['file_name']] = data
     api['st'] = SimpleNamespace(
-        session_state={'paper_titration_export_dpi': 150, 'paper_titration_export_vector': include_vector},
+        session_state={'paper_titration_export_dpi': 150},
         columns=lambda n: [Column() for _ in range(n)], pyplot=lambda *a, **k: None)
     fig, ax = plt.subplots(figsize=(2, 1))
     ax.plot([0, 1], [0, 1])
     api['_paper_figure_downloads'](fig, 'example', {'recipe': {'correction': True}})
-    assert {'example.png', 'example.pdf', 'example.svg', 'example.metadata.json', 'example.zip'} <= downloads.keys()
+    assert {'example.png', 'example.pdf', 'example.svg', 'example.zip'} == downloads.keys()
     with ZipFile(BytesIO(downloads['example.zip'])) as archive:
-        expected = {'example.png', 'example.metadata.json'}
-        if include_vector:
-            expected.update({'example.pdf', 'example.svg'})
+        expected = {'example.png', 'example.pdf', 'example.svg', 'figure-metadata.json'}
         assert set(archive.namelist()) == expected
         assert archive.testzip() is None
     with Image.open(BytesIO(downloads['example.png'])) as image:
         assert json.loads(image.info['SWV Figure Metadata'])['recipe']['correction'] is True
-    if include_vector:
-        assert b'correction' in downloads['example.svg']
-        assert b'correction' in downloads['example.pdf']
-    else:
-        assert downloads['example.svg'] == downloads['example.pdf'] == b''
+    assert b'correction' in downloads['example.svg']
+    assert b'correction' in downloads['example.pdf']
+
+
+def test_preview_only_renders_png_without_export_packaging():
+    api = app_functions()
+    downloads = {}
+    class Column:
+        def download_button(self, label, data, **kwargs):
+            downloads[kwargs['file_name']] = data
+    api['st'] = SimpleNamespace(
+        session_state={'paper_titration_export_dpi': 600},
+        columns=lambda n: [Column() for _ in range(n)], pyplot=lambda *a, **k: None)
+    fig, ax = plt.subplots(figsize=(2, 1))
+    ax.plot([0, 1], [0, 1])
+    api['_paper_figure_downloads'](
+        fig, 'preview', {'render_quality': 'preview', 'panel_raster_dpi_used': 110}
+    )
+    assert downloads == {}

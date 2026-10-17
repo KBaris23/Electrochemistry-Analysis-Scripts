@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import io
 import hashlib
 import json
+import time
 import math
 import os
 from pathlib import Path
@@ -69,6 +70,7 @@ from core.processing import (
 )
 from bo_session_viewer import (
     _bo_swv_settings_key,
+    _figure_layout_editor,
     _queue_plot_for_composer,
     _render_add_to_composer_button,
     bo_swv_optimization_direction_map,
@@ -152,7 +154,7 @@ def _render_workspace_manager() -> None:
         if open_col.button("Open", disabled=not selected, use_container_width=True):
             try:
                 payload, cached_results = load_workspace(labels[selected])
-                cache_note = ""
+                cache_note = "; settings only—click Run Analysis to rebuild results"
                 saved_signature = payload.get("source_signature")
                 if cached_results is not None and saved_signature is not None:
                     saved_folders = payload["state"].get("folders", [])
@@ -166,6 +168,12 @@ def _render_workspace_manager() -> None:
                     ):
                         cached_results = None
                         cache_note = "; cached results skipped because source files changed"
+                    else:
+                        cache_note = "; restored cached analysis results"
+                elif cached_results is not None:
+                    cache_note = "; restored legacy cached analysis results"
+                elif payload.get("results_cache"):
+                    cache_note = "; cached-results file is missing—click Run Analysis"
                 # Restore before widgets are instantiated on the next rerun.
                 st.session_state['_workspace_pending_restore'] = (
                     payload['state'], cached_results, selected, cache_note,
@@ -186,11 +194,17 @@ def _render_workspace_manager() -> None:
         )
         if save_col.button("Save", use_container_width=True):
             try:
+                # The selected SWV metric pass is itself derived analysis. Save
+                # those completed rows when available so reopening the session
+                # does not immediately recompute them from the base batch rows.
+                results_for_cache = st.session_state.get("swv_annotated_results")
+                if results_for_cache is None:
+                    results_for_cache = st.session_state.get("results")
                 recipe, cache = save_workspace(
                     session_dir,
                     session_name,
                     st.session_state,
-                    results=st.session_state.get("results"),
+                    results=results_for_cache,
                     cache_results=cache_results,
                     source_signature=(
                         _analysis_input_signature(
@@ -212,11 +226,13 @@ def _render_workspace_manager() -> None:
         )
         st.caption(f"New saves and recovery are local to this computer: {session_dir}")
         st.caption("Older analysis_sessions recipes in this checkout remain available; those old files may still be synchronized by OneDrive. They are not moved or deleted automatically.")
-    # Browser close events cannot reliably run Python.  Persist the compact
-    # recipe on every ordinary Streamlit rerun instead; named saves remain the
-    # durable checkpoints and may optionally include computed results.
+    # Recovery recipes can contain large rescoring profiles. Do not serialize
+    # them on every tab/channel click; named Save always remains immediate.
     try:
-        save_workspace(session_dir, RECOVERY_STEM, st.session_state, cache_results=False)
+        now = time.monotonic()
+        if now - st.session_state.get('_workspace_recovery_at', float('-inf')) >= 30:
+            save_workspace(session_dir, RECOVERY_STEM, st.session_state, cache_results=False)
+            st.session_state['_workspace_recovery_at'] = now
     except OSError:
         pass
 
@@ -1901,6 +1917,182 @@ def _paper_collect_legend(source: plt.Figure) -> None:
             }[location]
 
 
+def _paper_panel_roles(figure_type: str, extra_columns=()) -> list[str]:
+    """Ordered columns for native paper templates (also used by aspect controls)."""
+    if figure_type.startswith("Type 4A"):
+        return ["langmuir", "concentration", "accuracy"]
+    if figure_type.startswith("Type 4"):
+        return ["concentration", "accuracy"]
+    roles = ["manual_swv", "optimized_swv", "response"]
+    if figure_type.startswith("Type 3D"):
+        return roles
+    roles.append("langmuir")
+    if not figure_type.startswith(("Type 3A", "Type 3B", "Type 3C")):
+        extras = {"SNR by concentration": "snr", "Concentration by measurement": "concentration",
+                  "Predicted vs known": "accuracy"}
+        roles.extend(extras[name] for name in extra_columns if name in extras)
+    return roles
+
+
+def _paper_default_row_layout(panel_count: int) -> list[list[float]]:
+    """Compact left-to-right defaults for one titration comparison row."""
+    panel_count = max(1, int(panel_count))
+    outer_x, gap, bottom, height = .015, .018, .08, .84
+    width = (1.0 - 2 * outer_x - gap * (panel_count - 1)) / panel_count
+    return [
+        [round(outer_x + index * (width + gap), 4), bottom, round(width, 4), height]
+        for index in range(panel_count)
+    ]
+
+
+def _paper_normalize_row_layout(values, panel_count: int) -> list[list[float]]:
+    defaults = _paper_default_row_layout(panel_count)
+    if not isinstance(values, (list, tuple)) or len(values) != panel_count:
+        return defaults
+    output = []
+    for raw, default in zip(values, defaults):
+        if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+            output.append(default)
+            continue
+        try:
+            left, bottom, width, height = map(float, raw)
+        except (TypeError, ValueError):
+            output.append(default)
+            continue
+        if not all(np.isfinite(item) for item in (left, bottom, width, height)):
+            output.append(default)
+            continue
+        left = min(max(left, 0.0), .95)
+        bottom = min(max(bottom, 0.0), .95)
+        width = min(max(width, .05), 1.0 - left)
+        height = min(max(height, .05), 1.0 - bottom)
+        output.append([round(left, 4), round(bottom, 4), round(width, 4), round(height, 4)])
+    return output
+
+
+def _paper_titration_row_layout_editor(row_index: int, roles: list[str]) -> list[list[float]]:
+    """Visible drag/resize template repeated for every comparison row."""
+    role_names = {
+        "manual_swv": "Manual SWVs",
+        "optimized_swv": "Optimized SWVs",
+        "response": "Response",
+        "langmuir": "Langmuir",
+        "concentration": "Concentration vs measurement",
+        "accuracy": "Predicted vs known",
+        "snr": "SNR",
+    }
+    state_key = f"paper_titration_row_layout_{row_index}"
+    event_key = f"_paper_titration_row_layout_event_{row_index}"
+    rects = _paper_normalize_row_layout(
+        st.session_state.get(state_key), len(roles)
+    )
+    st.markdown("**Repeated comparison-row canvas**")
+    result = _figure_layout_editor(
+        rects=rects,
+        labels=[role_names.get(role, role.replace("_", " ").title()) for role in roles],
+        aspect="Row 4:1",
+        key=f"_paper_titration_layout_editor_{row_index}",
+        allow_overlap=False,
+        default=None,
+    )
+    if isinstance(result, dict):
+        event_id = result.get("event_id")
+        if event_id is not None and event_id != st.session_state.get(event_key):
+            candidate = _paper_normalize_row_layout(result.get("rects"), len(roles))
+            st.session_state[state_key] = candidate
+            st.session_state[event_key] = event_id
+            rects = candidate
+    st.caption(
+        "Drag panels to move them or resize from an edge/corner. This one layout "
+        "is repeated identically for every comparison row in the generated figure."
+    )
+    return rects
+
+
+def _paper_panel_aspect_controls(roles: list[str]) -> None:
+    """Optional per-kind plot-box geometry; existing presets remain automatic."""
+    labels = {"manual_swv": "Manual SWVs", "optimized_swv": "Optimized SWVs",
+              "response": "Response vs measurement", "langmuir": "Langmuir",
+              "concentration": "Predicted concentration vs measurement",
+              "accuracy": "Predicted vs known concentration", "snr": "SNR"}
+    # Preserve optional choices while a different template hides their widgets.
+    for role in labels:
+        for suffix in ("mode", "ratio"):
+            key = f"paper_titration_aspect_{role}_{suffix}"
+            if key in st.session_state:
+                st.session_state[key] = st.session_state[key]
+    with st.expander("Panel aspect ratios (optional)", expanded=False):
+        st.caption("These control the plotting area, not the data limits. Width / height = 1 "
+                   "is square; 2 is twice as wide as tall. Automatic keeps the template layout.")
+        for role in dict.fromkeys(roles):
+            key = f"paper_titration_aspect_{role}"
+            # Migrate old sessions without changing their square-axis choice.
+            if role == "accuracy" and f"{key}_mode" not in st.session_state:
+                st.session_state[f"{key}_mode"] = (
+                    "1:1 (square)" if st.session_state.get("paper_validation_square_axes", False)
+                    else "Automatic")
+            cols = st.columns([2, 1])
+            mode = cols[0].selectbox(labels[role], ["Automatic", "1:1 (square)", "Custom"],
+                                     key=f"{key}_mode")
+            if mode == "Custom":
+                cols[1].number_input(f"{labels[role]} width / height", .25, 4., 1., .05,
+                                     key=f"{key}_ratio")
+            if role == "accuracy":
+                st.session_state["paper_validation_square_axes"] = mode == "1:1 (square)"
+
+
+def _paper_apply_panel_aspect(source: Optional[plt.Figure], role: str) -> None:
+    """Set physical axes shape before rasterization; leave colorbars untouched."""
+    if source is None or not source.axes:
+        return
+    key = f"paper_titration_aspect_{role}"
+    mode = st.session_state.get(f"{key}_mode", "Automatic")
+    if mode == "Automatic":
+        return
+    ratio = 1.0 if mode == "1:1 (square)" else float(st.session_state.get(f"{key}_ratio", 1.))
+    if not np.isfinite(ratio) or ratio <= 0:
+        raise ValueError("Panel width / height must be a positive finite number.")
+    axis = source.axes[0]
+    axis.set_aspect("auto")
+    axis.set_box_aspect(1.0 / ratio)
+
+
+def _paper_apply_swv_axis_controls(source: Optional[plt.Figure]) -> None:
+    """Apply the shared SWV voltage crop and deterministic tick counts."""
+    if source is None or not source.axes:
+        return
+    axis = source.axes[0]
+    if st.session_state.get("paper_titration_swv_common_voltage_crop", False):
+        try:
+            voltage_min = float(st.session_state.get("paper_titration_swv_voltage_min"))
+            voltage_max = float(st.session_state.get("paper_titration_swv_voltage_max"))
+        except (TypeError, ValueError):
+            voltage_min = voltage_max = np.nan
+        if (
+            np.isfinite(voltage_min)
+            and np.isfinite(voltage_max)
+            and not np.isclose(voltage_min, voltage_max)
+        ):
+            axis.set_xlim(*sorted((voltage_min, voltage_max)))
+
+    def tick_count(key: str) -> Optional[int]:
+        value = st.session_state.get(key, "Automatic")
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count >= 2 else None
+
+    x_count = tick_count("paper_titration_swv_x_tick_count")
+    y_count = tick_count("paper_titration_swv_y_tick_count")
+    if x_count:
+        x_min, x_max = axis.get_xlim()
+        axis.set_xticks(np.linspace(x_min, x_max, x_count))
+    if y_count:
+        y_min, y_max = axis.get_ylim()
+        axis.set_yticks(np.linspace(y_min, y_max, y_count))
+
+
 def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cell_h: float) -> None:
     """Size one source figure to its grid cell so every panel prints the same point sizes."""
     _paper_collect_legend(source)
@@ -1976,6 +2168,7 @@ def _paper_stack_vertically(
     cell_w: float,
     cell_h: float,
     raster_dpi: int = 300,
+    panel_role: str = "",
 ) -> Optional[plt.Figure]:
     """Two or more figures sharing one grid cell, stacked top to bottom."""
     usable = [figure for figure in figures if figure is not None]
@@ -1983,6 +2176,7 @@ def _paper_stack_vertically(
         return None
     images = []
     for figure in usable:
+        _paper_apply_panel_aspect(figure, panel_role)
         _paper_style_source(figure, font_size, cell_w, cell_h / len(usable))
         images.append(_paper_figure_image(figure, dpi=raster_dpi))
         plt.close(figure)
@@ -2043,6 +2237,18 @@ def _paper_response_panel(
         measurement_start_at_one=bool(st.session_state.get("paper_titration_measurements_from_one", True)),
         channel_colors=colors,
         channel_labels={optimized: optimized_label, manual: unoptimized_label},
+        vline_label_mode=str(st.session_state.get(
+            "paper_titration_vline_label_mode", "At boundaries"
+        )),
+        show_titration_plateaus=(
+            change
+            and bool(st.session_state.get(
+                "paper_titration_show_response_plateaus", False
+            ))
+        ),
+        titration_edge_trim_fraction=float(st.session_state.get(
+            "swv_titration_edge_trim_fraction", 0.15
+        )),
     )
     if figure is not None:
         figure._paper_keep_legend = True
@@ -2118,6 +2324,9 @@ def _paper_composite_figure(
     width_ratios: Optional[List[float]] = None,
     column_gap: float = .16,
     row_gap: float = .18,
+    panel_roles: Optional[List[str]] = None,
+    row_layouts: Optional[List[List[List[float]]]] = None,
+    capture_sources: bool = True,
 ) -> plt.Figure:
     """Arrange existing analysis figures into a consistently labelled paper grid.
 
@@ -2126,27 +2335,54 @@ def _paper_composite_figure(
     """
     total_height = max(row_height, rows * row_height)
     output = plt.figure(figsize=(width, total_height), facecolor="white")
-    grid = output.add_gridspec(
-        rows, columns, wspace=column_gap, hspace=row_gap, width_ratios=width_ratios,
-        top=.98, bottom=0.04, left=0.04, right=0.99,
-    )
+    use_row_layouts = bool(row_layouts) and len(row_layouts) >= rows
+    grid = None
+    if not use_row_layouts:
+        grid = output.add_gridspec(
+            rows, columns, wspace=column_gap, hspace=row_gap, width_ratios=width_ratios,
+            top=.98, bottom=0.04, left=0.04, right=0.99,
+        )
     captured_sources: List[plt.Figure] = []
     for index in range(rows * columns):
-        axis = output.add_subplot(grid[index // columns, index % columns])
+        row_index, column_index = divmod(index, columns)
+        if use_row_layouts:
+            row_rects = _paper_normalize_row_layout(row_layouts[row_index], columns)
+            left, bottom, panel_width, panel_height = row_rects[column_index]
+            outer_left, outer_right = .02, .99
+            outer_bottom, outer_top = .02, .99
+            row_slot_height = (outer_top - outer_bottom) / rows
+            row_base = outer_bottom + (rows - 1 - row_index) * row_slot_height
+            axis = output.add_axes([
+                outer_left + left * (outer_right - outer_left),
+                row_base + bottom * row_slot_height,
+                panel_width * (outer_right - outer_left),
+                panel_height * row_slot_height,
+            ])
+        else:
+            axis = output.add_subplot(grid[row_index, column_index])
         axis.set_axis_off()
         source = figures[index] if index < len(figures) else None
         if source is None:
             axis.text(.5, .5, "No data", ha="center", va="center", fontsize=font_size)
         else:
             if restyle and not getattr(source, "_paper_prestyled", False):
-                if width_ratios is None:
+                if panel_roles:
+                    panel_role = panel_roles[index % columns]
+                    if panel_role in {"manual_swv", "optimized_swv"}:
+                        _paper_apply_swv_axis_controls(source)
+                    _paper_apply_panel_aspect(source, panel_role)
+                if use_row_layouts:
+                    cell_w = width * panel_width * (outer_right - outer_left)
+                    cell_h = total_height * panel_height * row_slot_height
+                elif width_ratios is None:
                     cell_w, cell_h = width / columns * .92, row_height * .92
                 else:
                     box = grid[index // columns, index % columns].get_position(output)
                     cell_w, cell_h = box.width * width, box.height * total_height
                 _paper_style_source(source, font_size, cell_w, cell_h)
-            captured_sources.append(copy.deepcopy(source))
-            axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
+            if capture_sources:
+                captured_sources.append(copy.deepcopy(source))
+            axis.imshow(_paper_figure_image(source, dpi=raster_dpi), aspect="auto")
             plt.close(source)
         axis.text(
             -.02, 1.02, chr(ord("A") + index) if st.session_state.get("paper_show_panel_letters", False) else "", transform=axis.transAxes,
@@ -2166,6 +2402,7 @@ def _paper_directional_titration_figure(
     raster_dpi: int = 300,
     column_gap: float = .16,
     row_gap: float = .18,
+    capture_sources: bool = True,
 ) -> plt.Figure:
     """Two directional Type-3 rows plus one Langmuir panel spanning both rows."""
     total_height = max(row_height * 2, 4.8)
@@ -2192,9 +2429,14 @@ def _paper_directional_titration_figure(
             axis.text(.5, .5, "No data", ha="center", va="center", fontsize=font_size)
         else:
             if not getattr(source, "_paper_prestyled", False):
+                role = ["manual_swv", "optimized_swv", "response"][index % 3] if index < 6 else "langmuir"
+                if role in {"manual_swv", "optimized_swv"}:
+                    _paper_apply_swv_axis_controls(source)
+                _paper_apply_panel_aspect(source, role)
                 source_height = cell_h * (2.0 if index == 6 else 1.0)
                 _paper_style_source(source, font_size, cell_w, source_height)
-            captured_sources.append(copy.deepcopy(source))
+            if capture_sources:
+                captured_sources.append(copy.deepcopy(source))
             axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
             plt.close(source)
         axis.text(
@@ -2210,7 +2452,7 @@ def _paper_figure_downloads(
     stem: str,
     metadata: Optional[dict] = None,
 ) -> None:
-    """Offer a figure together with its final-state regeneration record."""
+    """Show a fast preview or offer the complete reproducible export bundle."""
     metadata = dict(metadata or getattr(figure, "_paper_metadata", {}) or {})
     metadata.setdefault("schema", "swv-paper-figure/v1")
     metadata.setdefault("figure_stem", stem)
@@ -2222,109 +2464,106 @@ def _paper_figure_downloads(
     })
     metadata_bytes = json.dumps(metadata, indent=2, sort_keys=True, default=str).encode("utf-8")
     png = io.BytesIO()
-    pdf = io.BytesIO()
-    svg = io.BytesIO()
     export_dpi = int(st.session_state.get("paper_titration_export_dpi", 150))
-    include_vector = bool(st.session_state.get("paper_titration_export_vector", False))
-    figure.savefig(png, format="png", dpi=export_dpi, bbox_inches="tight", transparent=True)
-    try:
-        from PIL import Image, PngImagePlugin
+    preview_only = metadata.get("render_quality") == "preview"
+    png_dpi = (
+        min(export_dpi, int(metadata.get("panel_raster_dpi_used", 110)))
+        if preview_only else export_dpi
+    )
+    cache_key = (png_dpi, preview_only, metadata_bytes)
+    export_cache = getattr(figure, "_paper_export_cache", {})
+    cached = export_cache.get(cache_key, {})
+    if cached.get("png"):
+        png = io.BytesIO(cached["png"])
+    else:
+        figure.savefig(png, format="png", dpi=png_dpi, bbox_inches="tight", transparent=True)
+        try:
+            from PIL import Image, PngImagePlugin
 
-        png.seek(0)
-        with Image.open(png) as image:
-            png_with_metadata = io.BytesIO()
-            png_info = PngImagePlugin.PngInfo()
-            png_info.add_text("SWV Figure Metadata", metadata_bytes.decode("utf-8"))
-            image.save(png_with_metadata, format="PNG", pnginfo=png_info, dpi=(export_dpi, export_dpi))
-        png = png_with_metadata
-    except Exception:
-        png.seek(0)
-    if include_vector:
+            png.seek(0)
+            with Image.open(png) as image:
+                png_with_metadata = io.BytesIO()
+                png_info = PngImagePlugin.PngInfo()
+                png_info.add_text("SWV Figure Metadata", metadata_bytes.decode("utf-8"))
+                image.save(
+                    png_with_metadata, format="PNG", pnginfo=png_info,
+                    dpi=(png_dpi, png_dpi),
+                )
+            png = png_with_metadata
+        except Exception:
+            png.seek(0)
+        cached["png"] = png.getvalue()
+    if callable(getattr(st, "subheader", None)):
+        st.subheader("Titration figure preview")
+    # Render the already-exported PNG rather than handing Streamlit a live
+    # Matplotlib object.  Paper figures persist across reruns in session state;
+    # a raster preview remains reliable even after Matplotlib has closed the
+    # figure's manager, and it is exactly what the PNG download will contain.
+    if callable(getattr(st, "image", None)):
+        st.image(png.getvalue(), use_container_width=True)
+    else:  # Lightweight test doubles and older Streamlit releases.
+        st.pyplot(figure, use_container_width=True)
+
+    if preview_only:
+        export_cache[cache_key] = cached
+        figure._paper_export_cache = export_cache
+        if callable(getattr(st, "caption", None)):
+            st.caption(
+                "Fast preview uses sampled SWV traces and reduced raster resolution. "
+                "Use Generate full-resolution exports for PNG, PDF, SVG, and ZIP."
+            )
+        plt.close(figure)
+        return
+
+    if cached.get("pdf") and cached.get("svg") and cached.get("zip"):
+        pdf = io.BytesIO(cached["pdf"])
+        svg = io.BytesIO(cached["svg"])
+        package = io.BytesIO(cached["zip"])
+    else:
+        pdf = io.BytesIO()
+        svg = io.BytesIO()
         figure.savefig(
             pdf, format="pdf", bbox_inches="tight", transparent=True,
             metadata={"Title": stem, "Subject": metadata_bytes.decode("utf-8")},
         )
-        figure.savefig(svg, format="svg", bbox_inches="tight", transparent=True,
-                       metadata={"Description": metadata_bytes.decode("utf-8")})
-    package = io.BytesIO()
-    archive_folder = str(metadata.get("output_subfolder") or "").strip("/\\")
-    archive_prefix = f"{archive_folder}/" if archive_folder else ""
-    with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(f"{archive_prefix}{stem}.png", png.getvalue())
-        if include_vector:
+        figure.savefig(
+            svg, format="svg", bbox_inches="tight", transparent=True,
+            metadata={"Description": metadata_bytes.decode("utf-8")},
+        )
+        package = io.BytesIO()
+        archive_folder = str(metadata.get("output_subfolder") or "").strip("/\\")
+        archive_prefix = f"{archive_folder}/" if archive_folder else ""
+        with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(f"{archive_prefix}{stem}.png", png.getvalue())
             archive.writestr(f"{archive_prefix}{stem}.pdf", pdf.getvalue())
             archive.writestr(f"{archive_prefix}{stem}.svg", svg.getvalue())
-        archive.writestr(f"{archive_prefix}{stem}.metadata.json", metadata_bytes)
-    st.pyplot(figure, use_container_width=True)
-    left, middle, svg_column, meta_column, package_column = st.columns(5)
-    left.download_button(
-        "Download PNG", png.getvalue(), file_name=f"{stem}.png", mime="image/png",
+            archive.writestr(f"{archive_prefix}figure-metadata.json", metadata_bytes)
+        cached.update(pdf=pdf.getvalue(), svg=svg.getvalue(), zip=package.getvalue())
+    export_cache[cache_key] = cached
+    figure._paper_export_cache = export_cache
+
+    png_column, pdf_column, svg_column, package_column = st.columns(4)
+    png_column.download_button(
+        "Export PNG", png.getvalue(), file_name=f"{stem}.png", mime="image/png",
         key=f"{stem}_png", use_container_width=True,
     )
-    middle.download_button(
-        "Download PDF", pdf.getvalue(), file_name=f"{stem}.pdf", mime="application/pdf",
+    pdf_column.download_button(
+        "Export PDF", pdf.getvalue(), file_name=f"{stem}.pdf", mime="application/pdf",
         key=f"{stem}_pdf", use_container_width=True,
-        disabled=not include_vector,
     )
     svg_column.download_button(
-        "Download SVG", svg.getvalue(), file_name=f"{stem}.svg", mime="image/svg+xml",
+        "Export SVG", svg.getvalue(), file_name=f"{stem}.svg", mime="image/svg+xml",
         key=f"{stem}_svg", use_container_width=True,
-        disabled=not include_vector,
-    )
-    meta_column.download_button(
-        "Download Metadata", metadata_bytes, file_name=f"{stem}.metadata.json",
-        mime="application/json", key=f"{stem}_metadata", use_container_width=True,
     )
     package_column.download_button(
-        "Download Package", package.getvalue(), file_name=f"{stem}.zip",
+        "Export all (ZIP)", package.getvalue(), file_name=f"{stem}.zip",
         mime="application/zip", key=f"{stem}_package", use_container_width=True,
     )
-    source_figures = list(getattr(figure, "_paper_source_figures", []) or [])
-    if source_figures and st.button(
-        "Edit source panels in Figure Composer",
-        key=f"{stem}_open_composer",
-        type="primary",
-        use_container_width=True,
-        help=(
-            "Sends every source panel to the same drag-and-resize Composer used "
-            "by BO figures. Each panel keeps editable axes, lines, markers, and text."
-        ),
-    ):
-        try:
-            current_count = int(st.session_state.get("bo_composer_count", 0) or 0)
-            pending_count = len(st.session_state.get("bo_composer_pending_captures", []) or [])
-            capacity = max(0, 24 - current_count - pending_count)
-            if capacity == 0:
-                raise ValueError(
-                    "Figure Composer already has 24 panels. Delete panels there "
-                    "before sending another titration figure."
-                )
-            selected_sources = source_figures[:capacity]
-            for index, source in enumerate(selected_sources):
-                title = next(
-                    (
-                        axis.get_title()
-                        for axis in source.axes
-                        if str(axis.get_title() or "").strip()
-                    ),
-                    f"Titration panel {index + 1}",
-                )
-                _queue_plot_for_composer(
-                    None,
-                    label=title,
-                    file_stem=f"{stem}_panel_{index + 1}",
-                    figure=copy.deepcopy(source),
-                    settings={"text_size": float(st.session_state.get("paper_titration_font", 8.0))},
-                )
-            if len(selected_sources) < len(source_figures):
-                st.session_state["paper_composer_transfer_notice"] = (
-                    f"Added the first {len(selected_sources)} of {len(source_figures)} "
-                    "source panels because Composer supports at most 24 panels."
-                )
-            st.session_state["analysis_view"] = "Figure Composer"
-            st.rerun()
-        except ValueError as exc:
-            st.warning(str(exc))
+    if callable(getattr(st, "caption", None)):
+        st.caption(
+            "PNG, PDF, and SVG embed the recreation metadata. The ZIP also contains "
+            "figure-metadata.json for direct metadata loading."
+        )
     plt.close(figure)
 
 
@@ -2407,7 +2646,11 @@ def _apply_paper_recipe(payload: dict) -> None:
 
     titration = recipe.get("titration") or {}
     st.session_state["swv_enable_titration_analysis"] = True
-    st.session_state["swv_fit_titration_langmuir"] = True
+    st.session_state["swv_fit_titration_langmuir"] = (
+        bool(recipe.get("analysis_state", {}).get("swv_fit_titration_langmuir", False))
+        if str(recipe["controls"].get("paper_titration_type", "")).startswith("Type 3D")
+        else True
+    )
     if titration.get("baseline_mode") == "preceding_buffer":
         st.session_state["swv_titration_baseline_mode"] = "Immediately preceding buffer"
     if titration.get("concentration_unit"):
@@ -4897,6 +5140,25 @@ if pending_workspace is not None:
         st.session_state.results_folder_key = _analysis_selection_key(
             restored_state.get('analysis_mode', 'SWV'), restored_state.get('folders', []),
         )
+        cached_rows_are_annotated = (
+            restored_state.get('analysis_mode', 'SWV') == 'SWV'
+            and bool(restored_state.get('swv_annotation_signature'))
+            and any(
+                isinstance(row, dict) and 'peak_current_selected' in row
+                for row in restored_results
+            )
+        )
+        if cached_rows_are_annotated:
+            st.session_state.swv_annotation_signature = restored_state.get(
+                'swv_annotation_signature'
+            )
+            st.session_state.swv_annotated_results = restored_results
+        elif restored_state.get('analysis_mode', 'SWV') == 'SWV':
+            # Older cache files contain the base batch rows only. Force exactly
+            # one derived-metric pass instead of restoring a signature whose
+            # corresponding annotated rows were not saved.
+            st.session_state.swv_annotation_signature = None
+            st.session_state.swv_annotated_results = None
     # JSON turns tuples into lists; these identity keys must retain their
     # original tuple structure or the next rerun resets restored controls.
     def _workspace_tuple(value):
@@ -7464,9 +7726,9 @@ if view == "Paper Figures":
             st.success(
                 f"Loaded recipe: {st.session_state['paper_recipe_loaded_name']}"
             )
-    if analysis_mode != "SWV" or not titration_ready or not fit_titration_langmuir:
+    if analysis_mode != "SWV" or not titration_ready:
         st.warning(
-            "Run SWV analysis, enable titration intervals, and enable Langmuir fitting first."
+            "Run SWV analysis and enable titration intervals first."
         )
     else:
         restored_channel_vlines = st.session_state.get("_paper_recipe_channel_vlines")
@@ -7484,7 +7746,9 @@ if view == "Paper Figures":
                 "Type 3A - Cross-channel signal-on/off",
                 "Type 3B - Signal-on/off shared Langmuir",
                 "Type 3C - Signal-on/off paired Langmuirs",
+                "Type 3D - SWVs and response only",
                 "Type 4 - Concentration validation",
+                "Type 4A - Langmuir and concentration validation",
             ],
             horizontal=True,
             key="paper_titration_type",
@@ -7493,9 +7757,13 @@ if view == "Paper Figures":
                 "shared optimized-only Langmuir panel spanning the fourth column. "
                 "Type 3C instead gives each row its own optimized-vs-unoptimized fit. "
                 "Type 3A permits different physical channels and separate manual references "
-                "for the ON and OFF rows, with a shared fit panel."
+                "for the ON and OFF rows, with a shared fit panel. "
+                "Type 3D omits fitting panels. Type 4A adds Langmuir before the two prediction panels."
             ),
         )
+        if not figure_type.startswith("Type 3D") and not fit_titration_langmuir:
+            st.warning("Enable Langmuir fitting for this template, or choose Type 3D for SWVs and response only.")
+            st.stop()
         is_directional_type3 = figure_type.startswith(("Type 3A", "Type 3B", "Type 3C"))
         has_paired_directional_langmuirs = figure_type.startswith("Type 3C")
         if figure_type.startswith("Type 4"):
@@ -7506,9 +7774,8 @@ if view == "Paper Figures":
                           key="paper_validation_column_gap")
                 st.selectbox("RMS fold error position", ["Above plot", "Below plot", "Inside plot"],
                              key="paper_validation_error_position")
-                st.checkbox("Square predicted-vs-known axes", value=False,
-                            key="paper_validation_square_axes",
-                            help="Off uses the available panel width. Both axes stay logarithmic with identical numeric limits; the 1:1 line need not be 45 degrees on screen.")
+                st.caption("Choose a square or custom plotting area under Panel aspect ratios below. "
+                           "For Type 4A, the width split above applies to the two prediction panels.")
         st.button('Use reference titration style', on_click=_paper_reference_style,
                   help='Overlaid plasma SWVs, every trace, zero correction anchors, and buffer-referenced response. Keeps your channel, methods and scan range.')
         control_cols = st.columns(4)
@@ -7530,10 +7797,7 @@ if view == "Paper Figures":
             help="1 plots every trace; larger values thin dense overlays without changing fits.",
         ))
         st.checkbox("Show panel letters", value=False, key="paper_show_panel_letters")
-        export_cols = st.columns(2)
-        export_cols[0].selectbox("Export PNG DPI", [150, 300, 600], key="paper_titration_export_dpi")
-        export_cols[1].checkbox("Include PDF and SVG exports", value=False,
-                               key="paper_titration_export_vector")
+        st.selectbox("Export PNG DPI", [150, 300, 600], key="paper_titration_export_dpi")
         default_output_dataset = (
             Path(str(folders[0])).name if folders else "dataset"
         )
@@ -7619,6 +7883,29 @@ if view == "Paper Figures":
                     'from SWV, response, fit, and validation panels. The source files remain unchanged.'
                 ),
             )
+            crop_enabled = st.checkbox(
+                "Use one voltage crop for all manual and optimized SWV panels",
+                value=False,
+                key="paper_titration_swv_common_voltage_crop",
+            )
+            swv_axis_cols = st.columns(4)
+            swv_axis_cols[0].number_input(
+                "Voltage minimum (V)", value=float(crop_min), step=.01, format="%.3f",
+                key="paper_titration_swv_voltage_min", disabled=not crop_enabled,
+            )
+            swv_axis_cols[1].number_input(
+                "Voltage maximum (V)", value=float(crop_max), step=.01, format="%.3f",
+                key="paper_titration_swv_voltage_max", disabled=not crop_enabled,
+            )
+            tick_options = ["Automatic", *range(2, 13)]
+            swv_axis_cols[2].selectbox(
+                "X-axis tick count", tick_options,
+                key="paper_titration_swv_x_tick_count",
+            )
+            swv_axis_cols[3].selectbox(
+                "Y-axis tick count", tick_options,
+                key="paper_titration_swv_y_tick_count",
+            )
             paper_response_change = st.radio('Response display',
                 ['Change from preceding buffer', 'Absolute peak current'],
                 key='paper_titration_response_measure', horizontal=True,
@@ -7656,8 +7943,13 @@ if view == "Paper Figures":
             ],
             key="paper_titration_extra_columns",
             help="Appended after the Langmuir column for every comparison row.",
-            disabled=is_directional_type3,
+            disabled=not figure_type.startswith("Type 3 -"),
         )
+        if not figure_type.startswith("Type 3 -"):
+            # A disabled widget can still contain an earlier template's choices.
+            paper_extra_columns = []
+        paper_panel_roles = _paper_panel_roles(figure_type, paper_extra_columns)
+        _paper_panel_aspect_controls(paper_panel_roles)
         st.checkbox(
             "Use the full analyzed range in SWV overlay panels",
             value=False,
@@ -7732,6 +8024,27 @@ if view == "Paper Figures":
                 "Show buffer labels", value=True,
                 key="paper_titration_show_buffer_labels",
             )
+            label_cols = st.columns(2)
+            label_cols[0].selectbox(
+                "Titration label placement",
+                ["At boundaries", "Centered in steps (hide final label)"],
+                key="paper_titration_vline_label_mode",
+                help=(
+                    "Centered mode keeps every vertical boundary unchanged, removes "
+                    "the closing/end label, and places each remaining interval label "
+                    "at the midpoint of its titration step."
+                ),
+            )
+            label_cols[1].checkbox(
+                "Show disconnected plateaus and error bars",
+                value=False,
+                key="paper_titration_show_response_plateaus",
+                help=(
+                    "On change-in-peak versus measurement panels, overlays one "
+                    "unconnected horizontal median per titration step with a "
+                    "midpoint error bar showing the trimmed plateau standard deviation."
+                ),
+            )
             st.checkbox(
                 "Number displayed measurements from 1", value=True,
                 key="paper_titration_measurements_from_one",
@@ -7739,13 +8052,14 @@ if view == "Paper Figures":
                      "Missing measurements retain their gaps; source IDs and fitted values are unchanged.",
             )
             st.caption(
-                "For different limits, sizes, and placement on every individual panel, "
-                "generate the figure and choose Edit source panels in Figure Composer."
+                "One drag/resize row-template canvas appears below the comparison "
+                "selectors. Its panel layout is repeated for every generated row."
             )
         physical_channels = sorted({
             row.get("original_channel", row.get("channel")) for row in titration_results
         }, key=_channel_display_sort_key)
         comparisons = []
+        comparison_row_layouts = []
         from core.paper_titration import restore_method_selection
         paper_rows = 1
         directional_selection = None
@@ -7919,6 +8233,13 @@ if view == "Paper Figures":
                         key=f"paper_titration_end_{row_index}",
                     ))
                     comparisons.append((physical, optimized, manual, (min(start, end), max(start, end))))
+            if comparisons:
+                repeated_row_layout = _paper_titration_row_layout_editor(
+                    0, paper_panel_roles
+                )
+                comparison_row_layouts = [
+                    copy.deepcopy(repeated_row_layout) for _ in comparisons
+                ]
         can_generate = bool(directional_selection) if is_directional_type3 else bool(comparisons)
         if not is_directional_type3:
             # Match the blue optimized / orange reference SWV stacks throughout
@@ -7953,7 +8274,31 @@ if view == "Paper Figures":
             'lod': show_titration_lod, 'uloq': show_titration_uloq,
         }
         paper_signature = hashlib.sha256(json.dumps(paper_recipe, sort_keys=True, default=str).encode()).hexdigest()
-        if can_generate and st.button("Generate paper figure", type="primary", use_container_width=True):
+        action_columns = st.columns([3, 2])
+        preview_clicked = action_columns[0].button(
+            "Generate preview", type="primary", use_container_width=True,
+            disabled=not can_generate,
+        )
+        final_clicked = action_columns[1].button(
+            "Generate full-resolution exports", use_container_width=True,
+            disabled=not can_generate,
+            help="Uses the selected Panel raster DPI and takes longer than the preview.",
+        )
+        generation_status = st.empty()
+        generated_this_run = False
+        generate_clicked = preview_clicked or final_clicked
+        render_raster_dpi = (
+            min(110, paper_raster_dpi) if preview_clicked else paper_raster_dpi
+        )
+        render_trace_stride = (
+            max(6, paper_trace_stride) if preview_clicked else paper_trace_stride
+        )
+        capture_render_sources = not preview_clicked
+        if can_generate and generate_clicked:
+            generation_status.info(
+                f"Generating {'fast preview' if preview_clicked else 'full-resolution figure'} "
+                f"for {len(comparisons) if comparisons else 2} comparison row(s)…"
+            )
             _PAPER_LEGEND_STORE.clear()
             panels: List[Optional[plt.Figure]] = []
             paper_source_results = titration_results
@@ -8021,6 +8366,25 @@ if view == "Paper Figures":
                 )
             paper_y_label = 'Change in Peak Current (uA)' if paper_response_change else 'Peak Current (uA)'
             paper_fit_baseline = 'preceding_buffer' if paper_response_change else titration_baseline_mode
+
+            def comparison_langmuir(physical, optimized, manual, display_range, baseline_mode):
+                return plot_titration_langmuir(
+                    paper_source_results, metric="peak_current_selected",
+                    vlines=titration_active_vlines, channels=[optimized, manual],
+                    vlines_by_channel=titration_vlines_by_channel,
+                    scan_range=(display_range if paper_fit_display_range else None),
+                    title=langmuir_title_template.replace("{channel}", str(physical)),
+                    ylabel=paper_y_label, edge_trim_fraction=titration_edge_trim_fraction,
+                    concentration_unit=titration_concentration_unit, baseline_mode=baseline_mode,
+                    included_step_labels=titration_included_step_labels,
+                    remove_extreme_outliers=remove_extreme_titration_outliers,
+                    show_lod=show_titration_lod, show_uloq=show_titration_uloq,
+                    response_directions=consistent_response_directions,
+                    channel_colors=consistent_channel_colors,
+                    offset_to_response_baseline=paper_response_change,
+                    channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
+                )
+
             if is_directional_type3:
                 physical, signal_on, signal_off, manual, display_range, off_physical, off_manual = directional_selection
                 directional_colors = {
@@ -8046,12 +8410,12 @@ if view == "Paper Figures":
                     if paper_swv_display == "Stacked (offset)":
                         return _paper_stacked_traces(
                             rows, y_key="smoothed_corrected_current", title=title,
-                            colormap_name=colormap, stride=paper_trace_stride,
+                            colormap_name=colormap, stride=(render_trace_stride if 'render_trace_stride' in locals() else paper_trace_stride),
                             offset_fraction=paper_offset_fraction,
                         )
                     return plot_overlaid_traces(
                         rows, y_key="smoothed_corrected_current", title=title,
-                        colormap_name='plasma', trace_modulo=paper_trace_stride,
+                        colormap_name='plasma', trace_modulo=(render_trace_stride if 'render_trace_stride' in locals() else paper_trace_stride),
                         show_anchors=True, show_zero_baseline=True,
                     )
 
@@ -8120,8 +8484,10 @@ if view == "Paper Figures":
                     composite = _paper_composite_figure(
                         [panel for row in row_figures for panel in row],
                         2, 4, width=paper_width, row_height=paper_row_height,
-                        font_size=paper_font, raster_dpi=paper_raster_dpi,
+                        font_size=paper_font, raster_dpi=(render_raster_dpi if 'render_raster_dpi' in locals() else paper_raster_dpi),
                         column_gap=paper_column_gap, row_gap=paper_row_gap,
+                        panel_roles=paper_panel_roles,
+                        capture_sources=(capture_render_sources if 'capture_render_sources' in locals() else True),
                     )
                     st.session_state["paper_titration_render"] = (
                         "type3_signal_on_off_paired", composite, 2,
@@ -8165,8 +8531,9 @@ if view == "Paper Figures":
                     composite = _paper_directional_titration_figure(
                         row_figures, shared_langmuir, width=paper_width,
                         row_height=paper_row_height, font_size=paper_font,
-                        raster_dpi=paper_raster_dpi,
+                        raster_dpi=(render_raster_dpi if 'render_raster_dpi' in locals() else paper_raster_dpi),
                         column_gap=paper_column_gap, row_gap=paper_row_gap,
+                        capture_sources=(capture_render_sources if 'capture_render_sources' in locals() else True),
                     )
                     st.session_state["paper_titration_render"] = (
                         "type3_signal_on_off", composite, 2, paper_width, paper_font
@@ -8198,14 +8565,14 @@ if view == "Paper Figures":
                             panels.append(_paper_stacked_traces(
                                 row_map[method_key], y_key="smoothed_corrected_current",
                                 title=(optimized_trace_title if method_key == optimized else unoptimized_trace_title).replace("{channel}", str(physical)),
-                                colormap_name=colormap, stride=paper_trace_stride,
+                                colormap_name=colormap, stride=(render_trace_stride if 'render_trace_stride' in locals() else paper_trace_stride),
                                 offset_fraction=paper_offset_fraction,
                             ))
                         else:
                             panels.append(plot_overlaid_traces(
                                 row_map[method_key], y_key="smoothed_corrected_current",
                                 title=(optimized_trace_title if method_key == optimized else unoptimized_trace_title).replace("{channel}", str(physical)),
-                                colormap_name='plasma', trace_modulo=paper_trace_stride,
+                                colormap_name='plasma', trace_modulo=(render_trace_stride if 'render_trace_stride' in locals() else paper_trace_stride),
                                 show_anchors=True, show_zero_baseline=True,
                             ))
 
@@ -8223,6 +8590,18 @@ if view == "Paper Figures":
                             measurement_start_at_one=bool(st.session_state.get("paper_titration_measurements_from_one", True)),
                             channel_colors=consistent_channel_colors,
                             channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
+                            vline_label_mode=str(st.session_state.get(
+                                "paper_titration_vline_label_mode", "At boundaries"
+                            )),
+                            show_titration_plateaus=(
+                                paper_response_change
+                                and bool(st.session_state.get(
+                                    "paper_titration_show_response_plateaus", False
+                                ))
+                            ),
+                            titration_edge_trim_fraction=float(st.session_state.get(
+                                "swv_titration_edge_trim_fraction", 0.15
+                            )),
                         )
                         if response_figure is not None:
                             response_figure._paper_keep_legend = True
@@ -8236,36 +8615,20 @@ if view == "Paper Figures":
                                 response_panel([optimized], f"Channel {physical} Optimized Response"),
                                 response_panel([manual], f"Channel {physical} Unoptimized Response"),
                             ],
-                            paper_font, paper_width / (4 + len(paper_extra_columns)) * 0.92,
+                            paper_font, paper_width / len(paper_panel_roles) * 0.92,
                             paper_row_height * 0.92,
-                            raster_dpi=paper_raster_dpi,
+                            raster_dpi=(render_raster_dpi if 'render_raster_dpi' in locals() else paper_raster_dpi),
+                            panel_role="response",
                         )
                         panels.append(stacked_response)
                     else:
                         panels.append(response_panel(
                             [optimized, manual], response_title_template.replace("{channel}", str(physical)),
                         ))
-                    panels.append(plot_titration_langmuir(
-                        paper_source_results,
-                        metric="peak_current_selected",
-                        vlines=titration_active_vlines,
-                        channels=[optimized, manual],
-                        vlines_by_channel=titration_vlines_by_channel,
-                        scan_range=(display_range if paper_fit_display_range else None),
-                        title=langmuir_title_template.replace("{channel}", str(physical)),
-                        ylabel=paper_y_label,
-                        edge_trim_fraction=titration_edge_trim_fraction,
-                        concentration_unit=titration_concentration_unit,
-                        baseline_mode=paper_fit_baseline,
-                        included_step_labels=titration_included_step_labels,
-                        remove_extreme_outliers=remove_extreme_titration_outliers,
-                        show_lod=show_titration_lod,
-                        show_uloq=show_titration_uloq,
-                        response_directions=consistent_response_directions,
-                        channel_colors=consistent_channel_colors,
-                        offset_to_response_baseline=paper_response_change,
-                        channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
-                    ))
+                    if not figure_type.startswith("Type 3D"):
+                        panels.append(comparison_langmuir(
+                            physical, optimized, manual, display_range, paper_fit_baseline,
+                        ))
                     # Fit range is explicit: either the whole selected titration
                     # or this row's displayed measurement interval.
                     if paper_extra_columns:
@@ -8319,6 +8682,9 @@ if view == "Paper Figures":
                                     optimized: optimized_display_label,
                                     manual: unoptimized_display_label,
                                 },
+                                vline_label_mode=str(st.session_state.get(
+                                    "paper_titration_vline_label_mode", "At boundaries"
+                                )),
                             ))
                         else:
                             extra_accuracy = collect_titration_measurement_accuracy_rows(
@@ -8338,16 +8704,26 @@ if view == "Paper Figures":
                                 channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
                             ))
                 composite = _paper_composite_figure(
-                    panels, len(comparisons), 4 + len(paper_extra_columns),
+                    panels, len(comparisons), len(paper_panel_roles),
                     width=paper_width, row_height=paper_row_height, font_size=paper_font,
-                    raster_dpi=paper_raster_dpi,
+                    raster_dpi=(render_raster_dpi if 'render_raster_dpi' in locals() else paper_raster_dpi),
                     column_gap=paper_column_gap, row_gap=paper_row_gap,
+                    panel_roles=paper_panel_roles,
+                    row_layouts=(comparison_row_layouts if 'comparison_row_layouts' in locals() else None),
+                    capture_sources=(capture_render_sources if 'capture_render_sources' in locals() else True),
                 )
                 st.session_state["paper_titration_render"] = (
-                    "type3", composite, paper_rows, paper_width, paper_font
+                    "type3d" if figure_type.startswith("Type 3D") else "type3",
+                    composite, paper_rows, paper_width, paper_font
                 )
             else:
                 for physical, optimized, manual, display_range in comparisons:
+                    if figure_type.startswith("Type 4A"):
+                        # Use the prediction calibration's baseline and fit range,
+                        # not an independently selected response fit.
+                        panels.append(comparison_langmuir(
+                            physical, optimized, manual, display_range, titration_baseline_mode,
+                        ))
                     accuracy_rows = collect_titration_measurement_accuracy_rows(
                         paper_source_results,
                         metric_cfg={"Peak current": ("peak_current_selected", "Peak Height (uA)")},
@@ -8379,6 +8755,9 @@ if view == "Paper Figures":
                             vlines=paper_display_vlines,
                             vlines_by_channel=paper_display_vlines_by_channel,
                             channel_labels={optimized: optimized_display_label, manual: unoptimized_display_label},
+                            vline_label_mode=str(st.session_state.get(
+                                "paper_titration_vline_label_mode", "At boundaries"
+                            )),
                         )
 
                     if paper_response_display == "Stacked":
@@ -8393,9 +8772,10 @@ if view == "Paper Figures":
                                     f"Channel {physical} Unoptimized Concentration by Measurement",
                                 ),
                             ],
-                            paper_font, paper_width / 2 * 0.92,
+                            paper_font, paper_width / len(paper_panel_roles) * 0.92,
                             paper_row_height * 0.92,
-                            raster_dpi=paper_raster_dpi,
+                            raster_dpi=(render_raster_dpi if 'render_raster_dpi' in locals() else paper_raster_dpi),
+                            panel_role="concentration",
                         ))
                     else:
                         panels.append(concentration_panel(
@@ -8414,16 +8794,21 @@ if view == "Paper Figures":
                         error_summary_position=str(st.session_state.get("paper_validation_error_position", "Above plot")).split()[0].lower(),
                     ))
                 composite = _paper_composite_figure(
-                    panels, len(comparisons), 2, width=paper_width,
+                    panels, len(comparisons), len(paper_panel_roles), width=paper_width,
                     row_height=paper_row_height, font_size=paper_font,
-                    raster_dpi=paper_raster_dpi,
-                    width_ratios=[100 - st.session_state.get("paper_validation_width_percent", 45),
+                    raster_dpi=(render_raster_dpi if 'render_raster_dpi' in locals() else paper_raster_dpi),
+                    width_ratios=([50] if figure_type.startswith("Type 4A") else []) +
+                                 [100 - st.session_state.get("paper_validation_width_percent", 45),
                                   st.session_state.get("paper_validation_width_percent", 45)],
                     column_gap=float(st.session_state.get("paper_validation_column_gap", paper_column_gap)),
                     row_gap=paper_row_gap,
+                    panel_roles=paper_panel_roles,
+                    row_layouts=(comparison_row_layouts if 'comparison_row_layouts' in locals() else None),
+                    capture_sources=(capture_render_sources if 'capture_render_sources' in locals() else True),
                 )
                 st.session_state["paper_titration_render"] = (
-                    "type4", composite, paper_rows, paper_width, paper_font
+                    "type4a" if figure_type.startswith("Type 4A") else "type4",
+                    composite, paper_rows, paper_width, paper_font
                 )
             selected_optimized_methods = {
                 item[1] for item in comparisons
@@ -8464,6 +8849,8 @@ if view == "Paper Figures":
                 "schema": "swv-paper-figure/v2",
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "figure_type": figure_type,
+                "render_quality": "preview" if preview_clicked else "full-resolution",
+                "panel_raster_dpi_used": int(render_raster_dpi),
                 "recipe_hash": paper_signature,
                 "recipe": paper_recipe,
                 "source_manifest": _paper_source_manifest(
@@ -8485,12 +8872,26 @@ if view == "Paper Figures":
                 },
             }
             st.session_state['paper_titration_render_signature'] = paper_signature
+            generated_this_run = True
+            generation_status.success(
+                "Preview generated below."
+                if preview_clicked else
+                "Full-resolution figure generated; preview and downloads are below."
+            )
+            generated_render = st.session_state.get("paper_titration_render")
+            if generated_render:
+                _paper_figure_downloads(
+                    generated_render[1], f"paper_{generated_render[0]}_titration"
+                )
         rendered = st.session_state.get("paper_titration_render")
-        if rendered:
+        if rendered and not generated_this_run:
             if st.session_state.get('paper_titration_render_signature') == paper_signature:
                 _paper_figure_downloads(rendered[1], f"paper_{rendered[0]}_titration")
             else:
-                st.info('Settings changed. Click Generate paper figure to refresh the preview and downloads.')
+                st.info(
+                    'Settings changed. Click Generate preview or Generate full-resolution '
+                    'exports to refresh the figure.'
+                )
 
 
 

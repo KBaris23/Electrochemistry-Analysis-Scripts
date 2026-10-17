@@ -73,7 +73,7 @@ def fit_panel_bounds(fig, groups, pad_points=2):
                     line.set_markersize(line.get_markersize()*scale)
             for text in texts:
                 text.set_position(point(text.get_position()))
-                text.set_fontsize(text.get_fontsize()*scale)
+                text.set_fontsize(getattr(text, '_composer_fixed_fontsize', text.get_fontsize()*scale))
             for artist in artists:
                 if isinstance(artist, Rectangle):
                     lo = point(artist.get_xy())

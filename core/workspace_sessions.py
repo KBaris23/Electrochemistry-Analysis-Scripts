@@ -49,6 +49,8 @@ def available_workspaces(local_directory: str | Path, legacy_directory: str | Pa
     return dict(sorted(result.items()))
 RECOVERY_STEM = "recovery"
 _EXCLUDED_PREFIXES = (
+    "bo_scoring_restore_",
+    "_bo_runtime_",
     "FormSubmitter:", "_workspace_pending_",
     "bo_composer_preset_", "bo_composer_final_export_button", "bo_composer_move_",
     "bo_composer_import_",
@@ -60,6 +62,7 @@ _EXCLUDED_PREFIXES = (
     "bo_composer_stack_spacing_reset_",
 )
 _EXCLUDED_KEYS = {
+    '_workspace_recovery_at', '_bo_lazy_tabs',
     "paper_recipe_upload", "paper_recipe_apply", "_pending_paper_recipe",
     "bo_composer_find_peak_example", "bo_hp_response_render_button",
     "bo_real_update_plots", "bo_surrogate_update_large_plots",

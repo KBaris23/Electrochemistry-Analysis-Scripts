@@ -21,7 +21,8 @@ class FigureExports:
     def __init__(self, render, encode, metadata, dpi, stem):
         self.render = render
         self.encode = encode
-        self.metadata = copy.deepcopy(metadata)
+        # Large rescoring recipes are only copied/serialized on actual export.
+        self.metadata = metadata if callable(metadata) else copy.deepcopy(metadata)
         self.dpi = dpi
         self.stem = stem
         self._figure = None
@@ -34,6 +35,8 @@ class FigureExports:
             if fmt in self._files:
                 return self._files[fmt]
             if self._figure is None:
+                if callable(self.metadata):
+                    self.metadata = self.metadata()
                 figure = self.render()
                 self.metadata['render_audit'] = {
                     'panels': list(getattr(figure, '_composer_panel_audit', ())),

@@ -18,7 +18,7 @@ metadata instructions. Every required template is available in the application.
 | Type 4 concentration | `np_titration_type4` | Same four-channel titration calibration |
 
 For sweep/validation open **Figure Composer** and render/export. For titration
-open **Paper Figures** and click **Generate paper figure**. Fits and responses use
+open **Paper Figures** and click **Generate preview**. Fits and responses use
 source measurements **41–160**, displayed as **1–120**: buffer alternating with
 **80, 160, 320, 640, 1280, 2560 µM**. SWV overlays retain the full analyzed range.
 Extreme filtering and **Ignore the first target response** stay off. Type 4 is a
@@ -62,7 +62,9 @@ To make these again without starting over:
 
 1. Restart the app, then **Saved analysis sessions > Saved session > Open**: `kana_try_titration`, `amp0_titration` or `vanco_titration`.
 2. Choose **View > Paper Figures** and the channel/type listed below. Click **Use reference titration style** (important when reopening older saved settings). This keeps your methods/range but selects **Overlaid**, stride **1**, **Zero correction anchors**, **Accepted SWVs only**, and **Change from preceding buffer**. Keep extreme filtering OFF for the main figures.
-3. Use **Generate paper figure > Download Package**. The ZIP already uses `dataset/maximize/` or `dataset/minimize/` when one direction applies, and otherwise the dataset root. Detailed per-figure settings are in sections 6–7.
+3. Use **Generate preview**, then **Generate full-resolution exports > Export all
+   (ZIP)**. The ZIP already uses `dataset/maximize/` or `dataset/minimize/` when
+   one direction applies, and otherwise the dataset root.
 
 | Figure | Open PNG | Assessment |
 |---|---|---|
@@ -118,7 +120,7 @@ In BO Figure Composer, choose **Shared channel** for Type 1/1A/1B or **Validatio
 
 Titration and its concentration diagnostic can use **the same SWV analysis session**: switch **Paper Figures → Type 3 / Type 4**. Separate Type 4 recipe names are conveniences, not separate acquisitions. Type 4 currently reuses the calibration fit; it is not independent validation. A genuinely separate validation experiment needs its own source-data session.
 
-For the compact concentration layout, choose **Type 4 → Concentration validation layout**: right-panel width **45%**, gap **0.04**, **RMS fold error position → Above plot**, and **Square predicted-vs-known axes OFF**. The right panel uses its width, error summaries sit outside the data, and the canvas remains 3.1 inches per row. Above/Below/Inside, width and gap are editable and recorded in figure metadata. This changes formatting only, not fits, error bars or predictions. Click **Generate paper figure → Download PNG**, then save your local session. See the main README's **Reopen the prepared paper figures without entering paths** for the complete click sequence.
+For the compact concentration layout, choose **Type 4 → Concentration validation layout**: right-panel width **45%**, gap **0.04**, **RMS fold error position → Above plot**, and **Square predicted-vs-known axes OFF**. The right panel uses its width, error summaries sit outside the data, and the canvas remains 3.1 inches per row. Above/Below/Inside, width and gap are editable and recorded in figure metadata. This changes formatting only, not fits, error bars or predictions. Click **Generate preview**, then **Generate full-resolution exports → Export PNG**, and save your local session. See the main README's **Reopen the prepared paper figures without entering paths** for the complete click sequence.
 
 Raw paths must remain accessible. Moving a recipe alone does not make its data portable. Use the app's Open control; do not assume a Windows double-click association or save prompt when closing the browser. Keep a named save, not only autosaved recovery.
 
@@ -167,9 +169,9 @@ For exact formatting, upload the saved `.figure.json` or `.figure.zip` after loa
 | Run | Sidebar group | Composer direction | Linked channel |
 |---|---:|---|---|
 | Kana setup 5 | 3 | maximize | `3_max` |
-| Amp0 preferred preliminary | 6 | minimize | `6_min` |
+| Amp0 paired-to-titration choice | 6 | minimize | `6_min` |
 | Amp0 earlier candidate | 10 | minimize | `10_min` |
-| Vanco | 4 | minimize | `6_min` |
+| Vanco paired-to-titration choice | 4 | minimize | `6_min` |
 | Kana station 2 | 10 | maximize | `10_max` |
 
 For each row:
@@ -230,11 +232,11 @@ Display start 21 removes the first 20 **method** scans (initial buffer/target pa
 
 ## 6. Figure C: generate Type 3 or 3B
 
-Open **SWV > Paper Figures**. Common settings: **14 in width, 10 pt font, panel raster DPI 300, Overlaid SWVs, stride 1, plasma colorbar, Overlaid response curves, no extra columns, panel letters OFF**. Click **Use reference titration style**; keep **Corrected peak region (between minima)**, **Zero correction anchors ON**, **Accepted SWVs only ON**, and **Change from preceding buffer**. All waveform panels use smoothed + corrected current; bounds come from the final correction pass. PNG exports at 600 DPI; constituent panels retain their selected raster DPI. Use **Download PNG** only for this preliminary round. Save Type 3/4 under `dataset/maximize/` or `dataset/minimize/`; save mixed-direction Type 3B at `dataset/`. Never create a separate `titrations/` folder or a channel-named subfolder.
+Open **SWV > Paper Figures**. Common settings: **14 in width, 10 pt font, panel raster DPI 300, Overlaid SWVs, stride 1, plasma colorbar, Overlaid response curves, no extra columns, panel letters OFF**. Click **Use reference titration style**; keep **Corrected peak region (between minima)**, **Zero correction anchors ON**, **Accepted SWVs only ON**, and **Change from preceding buffer**. All waveform panels use smoothed + corrected current; bounds come from the final correction pass. PNG exports at 600 DPI; constituent panels retain their selected raster DPI. Use **Generate preview** while formatting, then **Generate full-resolution exports → Export PNG**. Save Type 3/4 under `dataset/maximize/` or `dataset/minimize/`; save mixed-direction Type 3B at `dataset/`.
 
 ### Kana ch3: recovered earlier channel, Type 3
 
-Select **Type 3 - SWV and titration response**, one row, physical **ch3**, optimized **500 Hz / 50 mV / 1 mV (maximize)**, manual **200 Hz / 36 mV / 2 mV**, display **21-200**. Click **Generate paper figure > Download Package**. The primary file belongs at `kana_try/maximize/ch3_type3.png`.
+Select **Type 3 - SWV and titration response**, one row, physical **ch3**, optimized **500 Hz / 50 mV / 1 mV (maximize)**, manual **200 Hz / 36 mV / 2 mV**, display **21-200**. Click **Generate preview**, then **Generate full-resolution exports > Export all (ZIP)**. The primary file belongs at `kana_try/maximize/ch3_type3.png`.
 
 Your older SVG under `<PAPER_FIGURES>\08_Q_scoring_scheme` matches this method/segment. Its 179 values match current app-export values essentially exactly (squared correlation approximately 1). It omits method scan **189**, physical scan **565**, which is currently accepted but flagged by the existing extreme filter. Primary figures retain it. A separate filtered Type 3 is in `kana_try/maximize/filtered_sensitivity_ch3_type3.png`; no replacement point was synthesized. The original exclusion rationale cannot be proved from the SVG alone.
 
@@ -334,3 +336,19 @@ PNG/PDF/SVG and one `.metadata.json`; selection/processing audits are per figure
 Kana channels 3 and 5 also have two-row Type 3A titrations (app Type 3C).
 This is a presentation selection, not independent assay validation. Amp0
 titrations remain exploratory. Raw files and local saved sessions were unchanged.
+
+## Validation-channel audit (2026-10-17)
+
+Applying the requested presentation criteria—best observation after iteration
+25, no frequency/amplitude/step coordinate within 10% of a sampled cube edge,
+and a usable chronological stack—gives these primary candidates:
+
+| Dataset | Candidate | Best iteration | Best parameters | Audit |
+|---|---|---:|---|---|
+| Amp0 | **Channel 8 minimize** | 31 | 434 Hz, 130 mV, 9 mV | Interior optimum; 202/300 accepted stack traces. Channel 5 maximize is the cleaner-stack alternate (259/300; iteration 43; 331/70/2). |
+| Vanco | **Channel 2 minimize** (BO group 1) | 48 | 322 Hz, 60 mV, 4 mV | Fully interior late optimum and the cleanest inspected stack. |
+| Nanoporous | **Channel 5 maximize** | 28 | 281 Hz, 40 mV, 2 mV | Highest recorded channel optimum (Q = 11.812), fully interior, with an inspected usable stack. |
+
+These are figure-presentation candidates, not evidence of superior assay
+performance. Amp0 channel 6 and vanco channel 6 remain useful when matching the
+existing titration panels matters more than the cube-interior criterion.

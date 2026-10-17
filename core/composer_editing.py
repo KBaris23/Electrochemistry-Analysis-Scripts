@@ -6,15 +6,110 @@ The UI queues an edit, and Composer applies it before creating its widgets.
 import copy
 
 
+def preset_with_current_selections(config, current):
+    """Apply reusable formatting without importing another figure's data choices.
+
+    Metadata/session replay still uses the complete configuration directly.
+    Match panels by kind and occurrence so Type 1A/1B/1C layout changes work.
+    """
+    merged = copy.deepcopy({k: v for k, v in config.items() if k != 'rescore_profile'})
+    saved = merged.setdefault('state', {})
+    current_by_kind = {}
+    for i in range(int(current.get('bo_composer_count', 0))):
+        current_by_kind.setdefault(current.get(f'bo_composer_kind_{i}'), []).append(i)
+    occurrences = {}
+    choices = {'channels', 'observation_iteration', 'slice_axis', 'slice_value', 'group_id'}
+    for index in range(int(saved.get('bo_composer_count', 0))):
+        kind = saved.get(f'bo_composer_kind_{index}')
+        ordinal = occurrences.get(kind, 0)
+        occurrences[kind] = ordinal + 1
+        candidates = current_by_kind.get(kind, [])
+        if not candidates:
+            continue
+        old = candidates[min(ordinal, len(candidates) - 1)]
+        fields = {field: widget for field, widget in SOURCE_FIELDS.get(kind, {}).items() if field in choices}
+        if kind == 'Measured 3D tensor':
+            fields.update(highlight_iterations='real_highlight_iterations',
+                          highlight_labels='real_highlight_labels', slice_sweep_values='real_slice_values')
+        for field, widget in fields.items():
+            old_key = f'bo_composer_{widget}_{old}'
+            if old_key in current:
+                saved[f'bo_composer_{widget}_{index}'] = copy.deepcopy(current[old_key])
+                panels = merged.get('panels', [])
+                if index < len(panels):
+                    panels[index][field] = copy.deepcopy(current[old_key])
+
+    # Linked controls regenerate panel choices on each run, so preserve their
+    # source of truth too, not just the individual dropdown values.
+    prefixes = ('bo_composer_type1_compact', 'bo_composer_type1')
+    old_prefix = next((p for p in prefixes if current.get(p + '_linked_controls')), None)
+    new_prefix = next((p for p in prefixes if saved.get(p + '_linked_controls')), None)
+    if old_prefix and new_prefix:
+        for suffix in ('channel', 'slice_values'):
+            if old_prefix + '_' + suffix in current:
+                saved[new_prefix + '_' + suffix] = copy.deepcopy(current[old_prefix + '_' + suffix])
+        channel = saved.get(new_prefix + '_channel')
+        saved[new_prefix + '_channel__preferred'] = channel
+        iterations = [current.get(f'bo_composer_trace_iteration_{i}') for i in (1, 2)]
+        if new_prefix.endswith('_compact'):
+            manual = {str(i): {'channel': str(channel), 'iteration': value}
+                      for i, value in zip((1, 2), iterations) if value is not None}
+            saved[new_prefix + '_manual_iterations'] = manual
+            saved[new_prefix + '_choices_by_channel'] = {str(channel): copy.deepcopy(manual)}
+            for role, value in zip(('signal_on', 'signal_off'), iterations):
+                if value is not None:
+                    saved[new_prefix + '_' + role + '_iteration'] = value
+        elif all(value is not None for value in iterations):
+            saved[new_prefix + '_iterations'] = iterations
+    if current.get('bo_composer_validation_linked') and saved.get('bo_composer_validation_linked'):
+        for key in ('bo_composer_validation_channel', 'bo_composer_direction'):
+            if key in current:
+                saved[key] = copy.deepcopy(current[key])
+        saved['bo_composer_validation_channel__preferred'] = saved.get('bo_composer_validation_channel')
+    return merged
+
+
+def reset_swv_sizes(state, index):
+    """Restore the reference sweep's SWV size settings, without changing data."""
+    defaults = dict(text_size=10, title_size=12., axis_label_size=10., tick_size=8.8,
+                    legend_size=8.5, x_axis_size=10., y_axis_size=10., z_axis_size=10.,
+                    trace_width=1.5)
+    for field, value in defaults.items():
+        state[f'bo_composer_{field}_{index}'] = value
+    # Do not let a stale open-editor checkpoint undo this explicit action.
+    state.pop('bo_composer_editor_last', None)
+    state.pop('bo_composer_editor_checkpoint', None)
+
+
+def restore_compact_swv_appearance(state, index, canvas_size=(14., 10.)):
+    """Explicit button action: restore compact reference sizing, never raw data."""
+    reset_swv_sizes(state, index)
+    state[f'bo_composer_swv_title_style_{index}'] = 'Compact signal role'
+    state[f'bo_composer_custom_title_{index}'] = ''
+    state[f'bo_composer_hide_title_{index}'] = False
+    state[f'bo_composer_auto_fit_title_{index}'] = True
+    # Reference slot is 2.61 x 1.70 inches on a 14 x 10 inch canvas.
+    width = min(.95, max(.05, 2.61 / float(canvas_size[0])))
+    height = min(.95, max(.05, 1.70 / float(canvas_size[1])))
+    state[f'bo_composer_width_{index}'] = width
+    state[f'bo_composer_height_{index}'] = height
+    for field, dimension in (('left', width), ('bottom', height)):
+        key = f'bo_composer_{field}_{index}'
+        state[key] = min(max(float(state.get(key, .05)), 0.), 1. - dimension)
+
+
 def set_linked_trace_iteration(state, index, iteration, channel):
     """Persist an explicit linked trace choice before template synchronization."""
     if index not in (1, 2):
         return
     count = int(state.get('bo_composer_count', 0))
     if state.get('bo_composer_type1_compact_linked_controls') and count in (5, 6):
-        state.setdefault('bo_composer_type1_compact_manual_iterations', {})[str(index)] = {
+        choice = {
             'channel': str(channel), 'iteration': int(iteration),
         }
+        state.setdefault('bo_composer_type1_compact_manual_iterations', {})[str(index)] = choice
+        state.setdefault('bo_composer_type1_compact_choices_by_channel', {}).setdefault(
+            str(channel), {})[str(index)] = dict(choice)
     elif state.get('bo_composer_type1_linked_controls') and count == 8:
         iterations = list(state.get('bo_composer_type1_iterations') or [iteration])
         iterations = (iterations + [iterations[-1]] * 2)[:2]
@@ -26,8 +121,10 @@ def compact_example_iterations(state, channel, on_iteration, off_iteration, opti
     """Automatic choices unless this channel has a valid explicit override."""
     selected = [on_iteration, off_iteration]
     manual = state.get('bo_composer_type1_compact_manual_iterations', {})
+    channel_manual = (state.get('bo_composer_type1_compact_choices_by_channel', {}).get(str(channel), {})
+                      if manual else {})
     for index in (1, 2):
-        override = manual.get(str(index), {})
+        override = channel_manual.get(str(index), manual.get(str(index), {}))
         if override.get('channel') == str(channel) and override.get('iteration') in options:
             selected[index - 1] = override['iteration']
     return tuple(selected)
@@ -110,6 +207,7 @@ SOURCE_FIELDS = {
         "phase": "measured_phase", "average_channels": "measured_average",
         "x": "measured_x", "y": "measured_y", "z": "measured_z",
         "show_highlight_labels": "show_highlight_labels",
+        "q_colorbar_inset": "q_colorbar_inset",
     },
     "Measured 2D map": {
         "channels": "real_channels", "metric": "real_metric", "phase": "real_phase",
