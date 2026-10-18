@@ -2220,10 +2220,50 @@ def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cel
                     annotation.set_fontsize(max(3.5, font_size * .55))
             else:
                 annotation.set_fontsize(max(4.0, font_size * .8))
-    try:
-        source.tight_layout()
-    except Exception:
-        pass
+    compact_axes = [
+        axis for axis in source.axes
+        if axis.get_legend() is not None
+        and getattr(axis.get_legend(), "_swv_keep_location", False)
+    ]
+    if len(source.axes) == 1 and compact_axes:
+        # Predicted-vs-known panels keep a compact two-column legend below a
+        # physically square data area. Running tight_layout() again after the
+        # source is resized lets that outside legend collapse the axes and can
+        # even pull it into the x label (especially in short multi-row figures).
+        # Lay out this one known panel in physical inches instead. The result is
+        # stable when its canvas slot changes and does not alter any template.
+        axis = compact_axes[0]
+        figure_width = max(float(source.get_figwidth()), 1.0)
+        figure_height = max(float(source.get_figheight()), 1.0)
+        left_margin = min(0.72, figure_width * 0.26)
+        right_margin = min(0.12, figure_width * 0.05)
+        bottom_margin = min(0.76, figure_height * 0.35)
+        top_margin = min(0.30, figure_height * 0.14)
+        available_width = max(0.25, figure_width - left_margin - right_margin)
+        available_height = max(0.25, figure_height - bottom_margin - top_margin)
+        side = min(available_width, available_height)
+        axis_left = left_margin + (available_width - side) / 2.0
+        axis.set_position([
+            axis_left / figure_width,
+            bottom_margin / figure_height,
+            side / figure_width,
+            side / figure_height,
+        ])
+        legend = axis.get_legend()
+        legend_top = max(0.12, bottom_margin - 0.38)
+        legend.set_bbox_to_anchor(
+            ((axis_left + side / 2.0) / figure_width, legend_top / figure_height),
+            transform=source.transFigure,
+        )
+        if hasattr(legend, "set_loc"):
+            legend.set_loc("upper center")
+        else:
+            legend._loc = "upper center"
+    else:
+        try:
+            source.tight_layout()
+        except Exception:
+            pass
 
 
 def _paper_figure_image(source: plt.Figure, dpi: int = 300) -> np.ndarray:
@@ -2641,6 +2681,8 @@ def _paper_composite_figure(
     panel_roles: Optional[List[str]] = None,
     row_layouts: Optional[List[List[List[float]]]] = None,
     capture_sources: bool = True,
+    panel_aspects: Optional[List[Optional[float]]] = None,
+    show_panel_letters: Optional[bool] = None,
 ) -> plt.Figure:
     """Arrange existing analysis figures into a consistently labelled paper grid.
 
@@ -2657,7 +2699,12 @@ def _paper_composite_figure(
             top=.98, bottom=0.04, left=0.04, right=0.99,
         )
     captured_sources: List[plt.Figure] = []
+    export_templates: List[Optional[plt.Figure]] = []
     panel_plot_guides: list[Optional[dict]] = []
+    resolved_show_panel_letters = (
+        bool(st.session_state.get("paper_show_panel_letters", False))
+        if show_panel_letters is None else bool(show_panel_letters)
+    )
     for index in range(rows * columns):
         row_index, column_index = divmod(index, columns)
         if use_row_layouts:
@@ -2680,6 +2727,7 @@ def _paper_composite_figure(
         if source is None:
             axis.text(.5, .5, "No data", ha="center", va="center", fontsize=font_size)
             panel_plot_guides.append(None)
+            export_templates.append(None)
         else:
             panel_role = panel_roles[index % columns] if panel_roles else ""
             if restyle and not getattr(source, "_paper_prestyled", False):
@@ -2698,10 +2746,15 @@ def _paper_composite_figure(
                 _paper_style_source(source, font_size, cell_w, cell_h)
             if capture_sources:
                 captured_sources.append(copy.deepcopy(source))
+                export_templates.append(copy.deepcopy(source))
+            else:
+                export_templates.append(None)
             source_box = _paper_source_plot_box(source)
             image = _paper_figure_image(source, dpi=raster_dpi)
             requested_aspect = (
-                _paper_panel_aspect_ratio(panel_role) if panel_role else None
+                panel_aspects[index % columns]
+                if panel_aspects is not None and index % columns < len(panel_aspects)
+                else (_paper_panel_aspect_ratio(panel_role) if panel_role else None)
             )
             preserve_image_aspect = requested_aspect is not None
             # Explicit square/custom axes used to be stretched back to the
@@ -2723,11 +2776,42 @@ def _paper_composite_figure(
             })
             plt.close(source)
         axis.text(
-            -.02, 1.02, chr(ord("A") + index) if st.session_state.get("paper_show_panel_letters", False) else "", transform=axis.transAxes,
+            -.02, 1.02, chr(ord("A") + index) if resolved_show_panel_letters else "", transform=axis.transAxes,
             ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
         )
     output._paper_source_figures = captured_sources
     output._paper_panel_plot_guides = panel_plot_guides
+    if capture_sources:
+        captured_aspects = [
+            (
+                panel_aspects[index]
+                if panel_aspects is not None and index < len(panel_aspects)
+                else _paper_panel_aspect_ratio(role)
+            )
+            for index, role in enumerate(panel_roles or [])
+        ]
+
+        def export_factory(target_raster_dpi: int):
+            return _paper_composite_figure(
+                [copy.deepcopy(source) if source is not None else None for source in export_templates],
+                rows,
+                columns,
+                width=width,
+                row_height=row_height,
+                font_size=font_size,
+                restyle=False,
+                raster_dpi=int(target_raster_dpi),
+                width_ratios=copy.deepcopy(width_ratios),
+                column_gap=column_gap,
+                row_gap=row_gap,
+                panel_roles=copy.deepcopy(panel_roles),
+                row_layouts=copy.deepcopy(row_layouts),
+                capture_sources=False,
+                panel_aspects=captured_aspects,
+                show_panel_letters=resolved_show_panel_letters,
+            )
+
+        output._paper_export_factory = export_factory
     return output
 
 
@@ -2742,6 +2826,8 @@ def _paper_directional_titration_figure(
     column_gap: float = .16,
     row_gap: float = .18,
     capture_sources: bool = True,
+    restyle: bool = True,
+    show_panel_letters: Optional[bool] = None,
 ) -> plt.Figure:
     """Two directional Type-3 rows plus one Langmuir panel spanning both rows."""
     total_height = max(row_height * 2, 4.8)
@@ -2761,13 +2847,19 @@ def _paper_directional_titration_figure(
     ]
     cell_w, cell_h = width / 4 * .92, row_height * .92
     captured_sources: List[plt.Figure] = []
+    export_templates: List[Optional[plt.Figure]] = []
+    resolved_show_panel_letters = (
+        bool(st.session_state.get("paper_show_panel_letters", False))
+        if show_panel_letters is None else bool(show_panel_letters)
+    )
     for index, (slot, source) in enumerate(zip(targets, sources)):
         axis = output.add_subplot(slot)
         axis.set_axis_off()
         if source is None:
             axis.text(.5, .5, "No data", ha="center", va="center", fontsize=font_size)
+            export_templates.append(None)
         else:
-            if not getattr(source, "_paper_prestyled", False):
+            if restyle and not getattr(source, "_paper_prestyled", False):
                 role = ["manual_swv", "optimized_swv", "response"][index % 3] if index < 6 else "langmuir"
                 if role in {"manual_swv", "optimized_swv"}:
                     _paper_apply_swv_axis_controls(source)
@@ -2776,13 +2868,38 @@ def _paper_directional_titration_figure(
                 _paper_style_source(source, font_size, cell_w, source_height)
             if capture_sources:
                 captured_sources.append(copy.deepcopy(source))
+                export_templates.append(copy.deepcopy(source))
+            else:
+                export_templates.append(None)
             axis.imshow(_paper_figure_image(source, dpi=raster_dpi))
             plt.close(source)
         axis.text(
-            -.02, 1.02, chr(ord("A") + index) if st.session_state.get("paper_show_panel_letters", False) else "", transform=axis.transAxes,
+            -.02, 1.02, chr(ord("A") + index) if resolved_show_panel_letters else "", transform=axis.transAxes,
             ha="left", va="bottom", fontsize=font_size + 2, weight="bold",
         )
     output._paper_source_figures = captured_sources
+    if capture_sources:
+        def export_factory(target_raster_dpi: int):
+            copied = [
+                copy.deepcopy(source) if source is not None else None
+                for source in export_templates
+            ]
+            copied_rows = [copied[:3], copied[3:6]]
+            return _paper_directional_titration_figure(
+                copied_rows,
+                copied[6] if len(copied) > 6 else None,
+                width=width,
+                row_height=row_height,
+                font_size=font_size,
+                raster_dpi=int(target_raster_dpi),
+                column_gap=column_gap,
+                row_gap=row_gap,
+                capture_sources=False,
+                restyle=False,
+                show_panel_letters=resolved_show_panel_letters,
+            )
+
+        output._paper_export_factory = export_factory
     return output
 
 
@@ -2801,9 +2918,63 @@ def _paper_figure_downloads(
         "view": "Paper Figures",
         "instruction": "Load the listed folders, restore controls, then generate the recorded figure type.",
     })
+
+    def serialize_exports(export_figure, export_metadata, *, png_dpi):
+        """Create one complete, metadata-bearing export bundle."""
+        encoded_metadata = json.dumps(
+            export_metadata, indent=2, sort_keys=True, default=str
+        ).encode("utf-8")
+        png_buffer = io.BytesIO()
+        export_figure.savefig(
+            png_buffer, format="png", dpi=int(png_dpi),
+            bbox_inches="tight", transparent=True,
+        )
+        try:
+            from PIL import Image, PngImagePlugin
+
+            png_buffer.seek(0)
+            with Image.open(png_buffer) as image:
+                png_with_metadata = io.BytesIO()
+                png_info = PngImagePlugin.PngInfo()
+                png_info.add_text(
+                    "SWV Figure Metadata", encoded_metadata.decode("utf-8")
+                )
+                image.save(
+                    png_with_metadata, format="PNG", pnginfo=png_info,
+                    dpi=(int(png_dpi), int(png_dpi)),
+                )
+            png_buffer = png_with_metadata
+        except Exception:
+            png_buffer.seek(0)
+        pdf_buffer = io.BytesIO()
+        svg_buffer = io.BytesIO()
+        export_figure.savefig(
+            pdf_buffer, format="pdf", bbox_inches="tight", transparent=True,
+            metadata={"Title": stem, "Subject": encoded_metadata.decode("utf-8")},
+        )
+        export_figure.savefig(
+            svg_buffer, format="svg", bbox_inches="tight", transparent=True,
+            metadata={"Description": encoded_metadata.decode("utf-8")},
+        )
+        package_buffer = io.BytesIO()
+        archive_folder = str(export_metadata.get("output_subfolder") or "").strip("/\\")
+        archive_prefix = f"{archive_folder}/" if archive_folder else ""
+        with zipfile.ZipFile(package_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(f"{archive_prefix}{stem}.png", png_buffer.getvalue())
+            archive.writestr(f"{archive_prefix}{stem}.pdf", pdf_buffer.getvalue())
+            archive.writestr(f"{archive_prefix}{stem}.svg", svg_buffer.getvalue())
+            archive.writestr(f"{archive_prefix}figure-metadata.json", encoded_metadata)
+        plt.close(export_figure)
+        return {
+            "png": png_buffer.getvalue(),
+            "pdf": pdf_buffer.getvalue(),
+            "svg": svg_buffer.getvalue(),
+            "zip": package_buffer.getvalue(),
+        }
+
     metadata_bytes = json.dumps(metadata, indent=2, sort_keys=True, default=str).encode("utf-8")
     png = io.BytesIO()
-    export_dpi = int(st.session_state.get("paper_titration_export_dpi", 150))
+    export_dpi = int(st.session_state.get("paper_titration_export_dpi", 600))
     preview_only = metadata.get("render_quality") == "preview"
     png_dpi = (
         min(export_dpi, int(metadata.get("panel_raster_dpi_used", 110)))
@@ -2846,10 +3017,55 @@ def _paper_figure_downloads(
     if preview_only:
         export_cache[cache_key] = cached
         figure._paper_export_cache = export_cache
+        export_factory = getattr(figure, "_paper_export_factory", None)
+        if callable(export_factory) and callable(getattr(st, "columns", None)):
+            full_export_cache = {}
+            full_raster_dpi = int(st.session_state.get(
+                "paper_titration_raster_dpi", 600
+            ))
+
+            def full_exports():
+                if not full_export_cache:
+                    full_metadata = dict(metadata)
+                    full_metadata["render_quality"] = "full-resolution"
+                    full_metadata["panel_raster_dpi_used"] = full_raster_dpi
+                    high_resolution_figure = export_factory(full_raster_dpi)
+                    full_export_cache.update(serialize_exports(
+                        high_resolution_figure,
+                        full_metadata,
+                        png_dpi=export_dpi,
+                    ))
+                return full_export_cache
+
+            png_column, pdf_column, svg_column, package_column = st.columns(4)
+            png_column.download_button(
+                "Export PNG", lambda: full_exports()["png"],
+                file_name=f"{stem}.png", mime="image/png",
+                key=f"{stem}_preview_png", use_container_width=True,
+                on_click="ignore",
+            )
+            pdf_column.download_button(
+                "Export PDF", lambda: full_exports()["pdf"],
+                file_name=f"{stem}.pdf", mime="application/pdf",
+                key=f"{stem}_preview_pdf", use_container_width=True,
+                on_click="ignore",
+            )
+            svg_column.download_button(
+                "Export SVG", lambda: full_exports()["svg"],
+                file_name=f"{stem}.svg", mime="image/svg+xml",
+                key=f"{stem}_preview_svg", use_container_width=True,
+                on_click="ignore",
+            )
+            package_column.download_button(
+                "Export all (ZIP)", lambda: full_exports()["zip"],
+                file_name=f"{stem}.zip", mime="application/zip",
+                key=f"{stem}_preview_package", use_container_width=True,
+                on_click="ignore",
+            )
         if callable(getattr(st, "caption", None)):
             st.caption(
-                "Fast preview uses sampled SWV traces and reduced raster resolution. "
-                "Use Prepare PNG/PDF/SVG exports below for the full-resolution files."
+                "The preview is low resolution. Each export button builds the "
+                "full-resolution file only when clicked; subsequent formats reuse it."
             )
         plt.close(figure)
         return
@@ -2859,25 +3075,12 @@ def _paper_figure_downloads(
         svg = io.BytesIO(cached["svg"])
         package = io.BytesIO(cached["zip"])
     else:
-        pdf = io.BytesIO()
-        svg = io.BytesIO()
-        figure.savefig(
-            pdf, format="pdf", bbox_inches="tight", transparent=True,
-            metadata={"Title": stem, "Subject": metadata_bytes.decode("utf-8")},
-        )
-        figure.savefig(
-            svg, format="svg", bbox_inches="tight", transparent=True,
-            metadata={"Description": metadata_bytes.decode("utf-8")},
-        )
-        package = io.BytesIO()
-        archive_folder = str(metadata.get("output_subfolder") or "").strip("/\\")
-        archive_prefix = f"{archive_folder}/" if archive_folder else ""
-        with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(f"{archive_prefix}{stem}.png", png.getvalue())
-            archive.writestr(f"{archive_prefix}{stem}.pdf", pdf.getvalue())
-            archive.writestr(f"{archive_prefix}{stem}.svg", svg.getvalue())
-            archive.writestr(f"{archive_prefix}figure-metadata.json", metadata_bytes)
-        cached.update(pdf=pdf.getvalue(), svg=svg.getvalue(), zip=package.getvalue())
+        bundle = serialize_exports(figure, metadata, png_dpi=png_dpi)
+        png = io.BytesIO(bundle["png"])
+        pdf = io.BytesIO(bundle["pdf"])
+        svg = io.BytesIO(bundle["svg"])
+        package = io.BytesIO(bundle["zip"])
+        cached.update(bundle)
     export_cache[cache_key] = cached
     figure._paper_export_cache = export_cache
 
@@ -8178,7 +8381,7 @@ if view == "Paper Figures":
             key="paper_titration_width",
         ))
         paper_raster_dpi = int(control_cols[2].number_input(
-            "Panel raster DPI", 150, 600, value=300, step=50,
+            "Panel raster DPI", 150, 600, value=600, step=50,
             key="paper_titration_raster_dpi",
             help="Resolution used inside the composite. Higher settings create larger exports.",
         ))
@@ -8187,7 +8390,10 @@ if view == "Paper Figures":
             help="1 plots every trace; larger values thin dense overlays without changing fits.",
         ))
         st.checkbox("Show panel letters", value=False, key="paper_show_panel_letters")
-        st.selectbox("Export PNG DPI", [150, 300, 600], key="paper_titration_export_dpi")
+        st.selectbox(
+            "Export PNG DPI", [150, 300, 600], index=2,
+            key="paper_titration_export_dpi",
+        )
         default_output_dataset = (
             Path(str(folders[0])).name if folders else "dataset"
         )
@@ -8672,19 +8878,19 @@ if view == "Paper Figures":
             "Generate preview", type="primary", use_container_width=True,
             disabled=not can_generate,
         )
-        final_clicked = bool(
-            st.session_state.pop("_paper_titration_export_requested", False)
-        )
+        # Kept only to discard a stale request left by an older app version.
+        st.session_state.pop("_paper_titration_export_requested", None)
         generation_status = st.empty()
         generated_this_run = False
-        generate_clicked = preview_clicked or final_clicked
+        generate_clicked = preview_clicked
         render_raster_dpi = (
-            min(110, paper_raster_dpi) if preview_clicked else paper_raster_dpi
+            min(100, paper_raster_dpi) if preview_clicked else paper_raster_dpi
         )
-        render_trace_stride = (
-            max(6, paper_trace_stride) if preview_clicked else paper_trace_stride
-        )
-        capture_render_sources = not preview_clicked
+        # A low raster DPI makes the preview fast. Keep all requested traces in
+        # the captured source panels so a download can rebuild the same figure
+        # at full quality without a second analysis pass.
+        render_trace_stride = paper_trace_stride
+        capture_render_sources = True
         if can_generate and generate_clicked:
             generation_status.info(
                 f"Generating {'fast preview' if preview_clicked else 'full-resolution figure'} "
@@ -9288,30 +9494,15 @@ if view == "Paper Figures":
                 )
         rendered = st.session_state.get("paper_titration_render")
         if rendered and not generated_this_run:
-            if st.session_state.get('paper_titration_render_signature') == paper_signature:
-                _paper_figure_downloads(rendered[1], f"paper_{rendered[0]}_titration")
-            else:
-                st.info(
-                    'Settings changed. Click Generate preview to refresh the figure.'
-                )
-        rendered = st.session_state.get("paper_titration_render")
-        render_matches = (
-            rendered
-            and st.session_state.get('paper_titration_render_signature') == paper_signature
-        )
-        render_metadata = (
-            getattr(rendered[1], "_paper_metadata", {}) if render_matches else {}
-        )
-        if render_matches and render_metadata.get("render_quality") == "preview":
-            st.button(
-                "Prepare PNG/PDF/SVG exports",
-                on_click=_paper_request_titration_exports,
-                use_container_width=True,
-                help=(
-                    "Renders the selected full-resolution figure once; the individual "
-                    "PNG, PDF, SVG, and ZIP download buttons then appear here."
-                ),
+            render_is_current = (
+                st.session_state.get('paper_titration_render_signature') == paper_signature
             )
+            _paper_figure_downloads(rendered[1], f"paper_{rendered[0]}_titration")
+            if not render_is_current:
+                st.info(
+                    'Settings changed. The last preview remains visible; click '
+                    'Generate preview when you are ready to refresh it.'
+                )
 
 
 

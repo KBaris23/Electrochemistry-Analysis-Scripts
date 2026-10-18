@@ -38,7 +38,7 @@ def test_paper_studio_channels_and_methods_follow_all_ten_channels(figure_type):
     # so this test needs no private data, fitting, or figure rendering.
     source = Path('app.py').read_text(encoding='utf-8')
     start = source.index('        physical_channels = sorted({', source.index('if view == "Paper Figures":'))
-    end = source.index('        if not is_directional_type3:', start)
+    end = source.index('            if comparisons:\n                repeated_row_layout', start)
     block = textwrap.dedent(source[start:end])
     setup = f'''
 import streamlit as st
@@ -68,7 +68,7 @@ st.session_state.setdefault('paper_titration_physical_0', 3)
 def test_cross_channel_type3a_restores_both_manual_references():
     source = Path('app.py').read_text(encoding='utf-8')
     start = source.index('        physical_channels = sorted({', source.index('if view == "Paper Figures":'))
-    end = source.index('        if not is_directional_type3:', start)
+    end = source.index('            if comparisons:\n                repeated_row_layout', start)
     block = textwrap.dedent(source[start:end])
     setup = '''
 import streamlit as st

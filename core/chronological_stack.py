@@ -131,7 +131,9 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
     voltage_label = axis_title('Voltage (V)', 'voltage', 21.)
     current_label = axis_title('Normalized Current' if normalized else 'Current (µA)',
                                'current', 26., position=.75)
-    label = axis_title('Iteration Number', 'iteration', 34.)
+    # The midpoint is also a labelled iteration tick. Keep the axis title on
+    # the first quarter of the diagonal so it cannot sit on that tick.
+    label = axis_title('Iteration Number', 'iteration', 34., position=.25)
     label._bo_stack_depth_label = True
     for item in (voltage_label, current_label, label):
         item._bo_axis_label = True

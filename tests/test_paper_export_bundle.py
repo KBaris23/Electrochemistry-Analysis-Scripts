@@ -61,3 +61,51 @@ def test_preview_only_renders_png_without_export_packaging():
         fig, 'preview', {'render_quality': 'preview', 'panel_raster_dpi_used': 110}
     )
     assert downloads == {}
+
+
+def test_preview_offers_deferred_full_resolution_format_downloads():
+    api = app_functions()
+    downloads = {}
+    factory_calls = []
+
+    class Column:
+        def download_button(self, label, data, **kwargs):
+            downloads[kwargs['file_name']] = data
+
+    api['st'] = SimpleNamespace(
+        session_state={
+            'paper_titration_export_dpi': 600,
+            'paper_titration_raster_dpi': 600,
+        },
+        columns=lambda n: [Column() for _ in range(n)],
+        pyplot=lambda *a, **k: None,
+    )
+    preview, axis = plt.subplots(figsize=(2, 1))
+    axis.plot([0, 1], [0, 1])
+
+    def full_resolution_factory(dpi):
+        factory_calls.append(dpi)
+        figure, full_axis = plt.subplots(figsize=(2, 1))
+        full_axis.plot([0, 1], [1, 0])
+        return figure
+
+    preview._paper_export_factory = full_resolution_factory
+    api['_paper_figure_downloads'](
+        preview,
+        'preview',
+        {'render_quality': 'preview', 'panel_raster_dpi_used': 100},
+    )
+
+    assert set(downloads) == {
+        'preview.png', 'preview.pdf', 'preview.svg', 'preview.zip',
+    }
+    assert all(callable(data) for data in downloads.values())
+    assert factory_calls == []
+    assert downloads['preview.png']().startswith(b'\x89PNG')
+    assert factory_calls == [600]
+    assert downloads['preview.pdf']().startswith(b'%PDF')
+    assert factory_calls == [600]
+    with ZipFile(BytesIO(downloads['preview.zip']())) as archive:
+        assert set(archive.namelist()) == {
+            'preview.png', 'preview.pdf', 'preview.svg', 'figure-metadata.json',
+        }

@@ -205,6 +205,44 @@ def test_custom_plot_box_shape_survives_composite_and_preserves_data(api, width,
     assert all(0 <= value <= 1 for value in guide['source_box'])
 
 
+def test_compact_accuracy_legend_stays_below_label_in_short_rows(api):
+    state = api['st'].session_state
+    state.update(
+        paper_titration_aspect_accuracy_mode='1:1 (square)',
+        paper_validation_square_axes=True,
+        paper_title_font_size=8.5,
+        paper_axis_label_font_size=8.0,
+        paper_tick_font_size=7.0,
+        paper_legend_font_size=6.5,
+    )
+    rows = [
+        dict(channel=channel, known_concentration=known,
+             predicted_concentration=known * factor)
+        for channel, factor in [('optimized', 1.2), ('manual', .8)]
+        for known in (.2, .4, .8, 1.6, 3.2, 6.4, 12.8, 25.6)
+    ]
+    figure = plot_titration_concentration_accuracy(
+        rows,
+        compact_legend=True,
+        channel_labels={
+            'optimized': 'Optimized Method',
+            'manual': 'Manual Method',
+        },
+    )
+    api['_paper_apply_panel_aspect'](figure, 'accuracy')
+    api['_paper_style_source'](figure, 8.0, 2.8, 2.184)
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    axis = figure.axes[0]
+    axis_box = axis.get_window_extent(renderer)
+    label_box = axis.xaxis.label.get_window_extent(renderer)
+    legend_box = axis.get_legend().get_window_extent(renderer)
+
+    assert axis_box.width == pytest.approx(axis_box.height)
+    assert axis_box.width >= 100
+    assert legend_box.y1 < label_box.y0
+
+
 def test_square_applies_to_main_axes_not_swv_colorbar(api):
     api['st'].session_state['paper_titration_aspect_manual_swv_mode'] = '1:1 (square)'
     figure, axis = plt.subplots()

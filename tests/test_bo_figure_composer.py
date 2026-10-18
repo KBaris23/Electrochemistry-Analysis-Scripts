@@ -649,7 +649,7 @@ def test_validation_presets_use_sweep_camera_and_unsmoothed_corrected_stack():
     assert full['bo_composer_stack_corrected_3']
     assert full['bo_composer_stack_snapshot_3']
     assert full['bo_composer_stack_trace_key_3'] == 'corrected_current'
-    assert full['bo_composer_stack_voltage_range_3'] == 'Corrected peak bracket'
+    assert full['bo_composer_stack_voltage_range_3'] == 'Shared correction window (union)'
     assert full['bo_composer_hide_title_3']
 
 

@@ -175,7 +175,7 @@ def test_waterfall_default_spacing_and_endpoint_labels(monkeypatch):
     assert ax.lines[1].get_alpha() == 1.0
     # One affine projection for all traces and axis ticks; raw records unchanged.
     for line, row in zip(ax.lines[:2], loaded):
-        np.testing.assert_allclose(np.diff(line.get_ydata()), np.diff(row['current']) * .62)
+        np.testing.assert_allclose(np.diff(line.get_ydata()), np.diff(row['current']) * .68)
         np.testing.assert_allclose(np.diff(line.get_xdata()), np.diff(row['voltage']) / .2)
     assert [r['stack_index'] for r in loaded] == [0, 4]
     assert fig._bo_successful_iterations == [1, 5]

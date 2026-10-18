@@ -38557,7 +38557,7 @@ def _render_figure_composer(
                 spec["path"] = st.text_input(
                     "Image path",
                     value="",
-                    placeholder=r"C:\Users\Asus\Downloads\Titration.jpg",
+                    placeholder=r"C:\path\to\figure.png",
                     key=f"bo_composer_image_path_{index}",
                 )
             zoom_options = ["None"] + [

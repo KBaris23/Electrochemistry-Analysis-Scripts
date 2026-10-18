@@ -789,7 +789,7 @@
       "name": "Type 2 - BO validation",
       "schema": "swv.figure-composer/1",
       "source": {
-        "data_path": "C:\\TEMP\\BO\\500um_planar_BO_try_again_20260918_112055\\planar_BO_kana_20260918_112056\\bo_sessions\\bo_113013_8dd581",
+        "data_path": "",
         "group_id": null,
         "session_id": "bo_20260918_113013_8dd581"
       },
@@ -2002,7 +2002,7 @@
       "name": "Type 1C - Sweep comparison (cube center)",
       "schema": "swv.figure-composer/1",
       "source": {
-        "data_path": "C:\\TEMP\\BO\\500um_planar_BO_try_again_20260918_112055\\parameter_sweep_20260921_110003\\bo_sessions\\bo_111904_a0d8ad",
+        "data_path": "",
         "group_id": null,
         "session_id": "bo_20260921_111904_a0d8ad"
       }

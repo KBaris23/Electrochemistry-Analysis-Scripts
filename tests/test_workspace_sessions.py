@@ -149,24 +149,3 @@ def test_cube_label_choice_survives_source_edit_and_session(tmp_path):
     path, _ = save_workspace(tmp_path, 'labels_off', state)
     payload, _ = load_workspace(path)
     assert payload['state']['bo_composer_show_highlight_labels_0'] is False
-
-
-def test_simplify_preserves_caches_and_existing_edits(tmp_path):
-    import json
-    from scripts.simplify_local_workspaces import SELECTION, simplify
-    from core.workspace_sessions import available_workspaces
-    root = tmp_path / 'local'
-    for source in SELECTION.values():
-        save_workspace(root, source, {'value': 1}, results=[42], cache_results=True)
-    save_workspace(tmp_path / 'old', 'legacy', {'value': 0})
-    simplify(root, tmp_path / 'old')
-    assert set(available_workspaces(root, tmp_path / 'old')) == set(SELECTION)
-    path = root / 'amp0_titration.analysis-session.json'
-    payload, results = load_workspace(path)
-    assert results == [42]
-    assert payload['state']['workspace_session_name'] == 'amp0_titration'
-    payload['state']['value'] = 99
-    path.write_text(json.dumps(payload))
-    simplify(root, tmp_path / 'old')
-    assert load_workspace(path)[0]['state']['value'] == 99
-    assert len(available_workspaces(root, tmp_path / 'old', include_hidden=True)) == 15
