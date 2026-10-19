@@ -60,7 +60,7 @@ from core import (
 )
 from core.analysis import analyze_swv_arrays
 from core.plotting import (
-    add_titration_on_off_difference, prepare_titration_swv_traces,
+    CONCENTRATION_DISPLAY_MODES, add_titration_on_off_difference, prepare_titration_swv_traces,
     titration_measurement_changes,
 )
 from core.processing import (
@@ -2602,6 +2602,9 @@ def _paper_response_panel(
         ),
         titration_edge_trim_fraction=float(st.session_state.get(
             "swv_titration_edge_trim_fraction", 0.15
+        )),
+        titration_plateau_alpha=float(st.session_state.get(
+            "paper_titration_plateau_alpha", 0.65
         )),
     )
     if figure is not None:
@@ -8369,6 +8372,112 @@ if view == "Paper Figures":
                              key="paper_validation_error_position")
                 st.caption("Choose a square or custom plotting area under Panel aspect ratios below. "
                            "For Type 4A, the width split above applies to the two prediction panels.")
+                if st.session_state.get(
+                    "paper_concentration_display_mode"
+                ) not in (None, *CONCENTRATION_DISPLAY_MODES):
+                    st.session_state["paper_concentration_display_mode"] = (
+                        CONCENTRATION_DISPLAY_MODES[0]
+                    )
+                concentration_display_mode = st.selectbox(
+                    "High-response / inverse display",
+                    CONCENTRATION_DISPLAY_MODES,
+                    key="paper_concentration_display_mode",
+                    help=(
+                        "Current behavior is unchanged. Other choices are display-only: they do not "
+                        "refit Langmuir curves, modify cached analysis, or replace exported raw values."
+                    ),
+                )
+                stability_cols = st.columns(3)
+                concentration_display_epsilon = float(stability_cols[0].number_input(
+                    "Occupancy epsilon (smaller = higher fallback)",
+                    min_value=0.0001,
+                    max_value=0.25,
+                    value=0.02,
+                    step=0.005,
+                    format="%.4f",
+                    key="paper_concentration_display_epsilon",
+                    disabled=concentration_display_mode not in {
+                        CONCENTRATION_DISPLAY_MODES[3],
+                        CONCENTRATION_DISPLAY_MODES[5],
+                    },
+                    help=(
+                        "Controls epsilon-clipped central estimates in the inverse mode, or only "
+                        "the uncertainty endpoints in the explicit hybrid mode."
+                    ),
+                ))
+                concentration_regularization = float(stability_cols[1].number_input(
+                    "Regularization strength",
+                    min_value=0.0,
+                    max_value=0.1,
+                    value=0.0001,
+                    step=0.0001,
+                    format="%.5f",
+                    key="paper_concentration_regularization",
+                    disabled=concentration_display_mode != CONCENTRATION_DISPLAY_MODES[4],
+                    help="Penalty strength for the optional bounded forward-model estimate.",
+                ))
+                concentration_display_boundary = float(stability_cols[2].number_input(
+                    f"Display boundary ({titration_concentration_unit}; 0 = automatic)",
+                    min_value=0.0,
+                    max_value=1.0e12,
+                    value=0.0,
+                    step=10.0,
+                    format="%.4g",
+                    key="paper_concentration_display_boundary",
+                    disabled=concentration_display_mode == CONCENTRATION_DISPLAY_MODES[0],
+                    help=(
+                        "Optional explicit ceiling/boundary for flagged, capped and regularized "
+                        "points, and for clipped-mode error-bar endpoints. Zero keeps the "
+                        "automatic ULOQ/data boundary."
+                    ),
+                ))
+                if concentration_display_mode == CONCENTRATION_DISPLAY_MODES[1]:
+                    st.info(
+                        "Orange triangles identify only the non-invertible measurements placed "
+                        "at the display boundary by this explicit flag mode."
+                    )
+                elif concentration_display_mode != CONCENTRATION_DISPLAY_MODES[0]:
+                    st.info(
+                        "This is a display-only stability view; it adds no special warning markers. "
+                        "RMS fold error remains calculated from the unchanged, physically invertible "
+                        "estimates so it stays comparable with the default figure. Report the selected "
+                        "mode and parameter if used in a figure."
+                    )
+                if concentration_display_mode in {
+                    CONCENTRATION_DISPLAY_MODES[3],
+                    CONCENTRATION_DISPLAY_MODES[5],
+                }:
+                    fallback_multiple = (
+                        (1.0 - concentration_display_epsilon)
+                        / concentration_display_epsilon
+                    )
+                    if concentration_display_mode == CONCENTRATION_DISPLAY_MODES[5]:
+                        st.caption(
+                            "Hybrid mode copies the default central points exactly, including "
+                            "the measurement panel's uncensored buffer values. Only error-bar "
+                            f"endpoints are clipped ({fallback_multiple:.1f} × fitted Kd ceiling). "
+                            "Missing default points stay missing."
+                        )
+                    else:
+                        st.caption(
+                            "Epsilon-clipped inverse changes central estimates as well as "
+                            f"uncertainty endpoints ({fallback_multiple:.1f} × fitted Kd ceiling)."
+                        )
+                elif concentration_display_mode in CONCENTRATION_DISPLAY_MODES[1:3]:
+                    st.caption(
+                        "Flag/cap placement uses the visible Display boundary control; zero "
+                        "selects the automatic ULOQ/data-derived boundary."
+                    )
+                elif concentration_display_mode == CONCENTRATION_DISPLAY_MODES[4]:
+                    st.caption(
+                        "Regularized mode uses both the visible penalty strength and display "
+                        "boundary controls."
+                    )
+        else:
+            concentration_display_mode = CONCENTRATION_DISPLAY_MODES[0]
+            concentration_display_epsilon = 0.02
+            concentration_regularization = 0.0001
+            concentration_display_boundary = 0.0
         st.button('Use reference titration style', on_click=_paper_reference_style,
                   help='Overlaid plasma SWVs, every trace, zero correction anchors, and buffer-referenced response. Keeps your channel, methods and scan range.')
         control_cols = st.columns(4)
@@ -8622,7 +8731,7 @@ if view == "Paper Figures":
                 "Show buffer labels", value=True,
                 key="paper_titration_show_buffer_labels",
             )
-            label_cols = st.columns(2)
+            label_cols = st.columns(3)
             label_cols[0].selectbox(
                 "Titration label placement",
                 ["At boundaries", "Centered in steps (hide final label)"],
@@ -8641,6 +8750,17 @@ if view == "Paper Figures":
                     "On change-in-peak versus measurement panels, overlays one "
                     "unconnected horizontal median per titration step with a "
                     "midpoint error bar showing the trimmed plateau standard deviation."
+                ),
+            )
+            label_cols[2].slider(
+                "Plateau/error-bar opacity", .05, 1.0, .65, .05,
+                key="paper_titration_plateau_alpha",
+                disabled=not bool(st.session_state.get(
+                    "paper_titration_show_response_plateaus", False
+                )),
+                help=(
+                    "Controls the shared opacity of the black dashed plateau "
+                    "segments and their error bars, which are drawn above the data."
                 ),
             )
             st.checkbox(
@@ -8862,7 +8982,7 @@ if view == "Paper Figures":
                              'paper_titration_', 'paper_output_', 'paper_optimized_',
                              'paper_unoptimized_', 'paper_response_', 'paper_langmuir_',
                              'paper_validation_', 'paper_title_', 'paper_axis_',
-                             'paper_tick_', 'paper_legend_',
+                             'paper_tick_', 'paper_legend_', 'paper_concentration_',
                          )) or key == 'paper_show_panel_letters')
                          and not key.startswith('paper_titration_render')},
             'analysis_key': st.session_state.get('analysis_cache_key'),
@@ -9199,6 +9319,9 @@ if view == "Paper Figures":
                             titration_edge_trim_fraction=float(st.session_state.get(
                                 "swv_titration_edge_trim_fraction", 0.15
                             )),
+                            titration_plateau_alpha=float(st.session_state.get(
+                                "paper_titration_plateau_alpha", 0.65
+                            )),
                         )
                         if response_figure is not None:
                             response_figure._paper_keep_legend = True
@@ -9355,6 +9478,18 @@ if view == "Paper Figures":
                             vline_label_mode=str(st.session_state.get(
                                 "paper_titration_vline_label_mode", "At boundaries"
                             )),
+                            concentration_display_mode=str(st.session_state.get(
+                                "paper_concentration_display_mode", "Current behavior (default)"
+                            )),
+                            concentration_display_epsilon=float(st.session_state.get(
+                                "paper_concentration_display_epsilon", 0.02
+                            )),
+                            concentration_regularization=float(st.session_state.get(
+                                "paper_concentration_regularization", 0.0001
+                            )),
+                            concentration_display_boundary=float(st.session_state.get(
+                                "paper_concentration_display_boundary", 0.0
+                            )),
                         )
 
                     if paper_response_display == "Stacked":
@@ -9393,6 +9528,18 @@ if view == "Paper Figures":
                         square_axes=bool(st.session_state.get("paper_validation_square_axes", False)),
                         error_summary_position=str(st.session_state.get("paper_validation_error_position", "Inside plot")).split()[0].lower(),
                         compact_legend=True,
+                        concentration_display_mode=str(st.session_state.get(
+                            "paper_concentration_display_mode", "Current behavior (default)"
+                        )),
+                        concentration_display_epsilon=float(st.session_state.get(
+                            "paper_concentration_display_epsilon", 0.02
+                        )),
+                        concentration_regularization=float(st.session_state.get(
+                            "paper_concentration_regularization", 0.0001
+                        )),
+                        concentration_display_boundary=float(st.session_state.get(
+                            "paper_concentration_display_boundary", 0.0
+                        )),
                     ))
                 composite = _paper_composite_figure(
                     panels, len(comparisons), len(paper_panel_roles), width=paper_width,

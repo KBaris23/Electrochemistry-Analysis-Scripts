@@ -498,8 +498,18 @@ def _read_json(path: Path) -> dict:
     return value
 
 
-def discover_bo_session_folders(folder: str | Path) -> list[Path]:
-    """Return BO session folders found at or under an experiment folder."""
+def discover_bo_session_folders(
+    folder: str | Path,
+    *,
+    recursive_fallback: bool = True,
+) -> list[Path]:
+    """Return BO session folders found at or under an experiment folder.
+
+    ``recursive_fallback=False`` is intended for incidental provenance lookups
+    from large raw-data folders.  The ordinary BO-session picker retains the
+    legacy recursive fallback, while display reruns only inspect the folder,
+    its direct children, and its conventional ``bo_sessions`` container.
+    """
     root = Path(folder).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"BO experiment/session folder does not exist: {root}")
@@ -551,7 +561,7 @@ def discover_bo_session_folders(folder: str | Path) -> list[Path]:
         except OSError:
             pass
 
-    if not discovered:
+    if not discovered and recursive_fallback:
         # Preserve support for older, more deeply nested experiment layouts. A
         # directory containing bo_state.json is a terminal session root: prune
         # it so discovery never traverses its simulation/surrogate artifacts.
@@ -1099,7 +1109,10 @@ def bo_swv_optimization_direction_map(
             if not candidate.is_dir():
                 continue
             try:
-                session_roots.update(discover_bo_session_folders(candidate))
+                session_roots.update(discover_bo_session_folders(
+                    candidate,
+                    recursive_fallback=False,
+                ))
             except (OSError, ValueError):
                 continue
 
@@ -17676,6 +17689,12 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
             payload = _read_json(record)
         except Exception:
             continue
+        recorded_folders = payload.get("folders") or []
+        recorded_file_names = {
+            Path(str(raw_path)).name.casefold()
+            for raw_path in recorded_folders
+            if raw_path and str(raw_path).strip()
+        }
         results_csv = _resolve_recorded_path(root, payload.get("results_csv"))
         if results_csv:
             try:
@@ -17684,6 +17703,20 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
                     recorded_path = row.get("file_path")
                     if recorded_path is None or pd.isna(recorded_path) or not str(recorded_path).strip():
                         recorded_path = row.get("file_name")
+                    # A BO output stem can be reused after a resumed/repeated
+                    # acquisition, overwriting the external results CSV while
+                    # the copied analysis record still correctly freezes the
+                    # original input folders.  Never mix those later rows into
+                    # the saved observation merely because the CSV basename is
+                    # unchanged.
+                    if (
+                        recorded_file_names
+                        and recorded_path is not None
+                        and not pd.isna(recorded_path)
+                        and Path(str(recorded_path)).name.casefold()
+                        not in recorded_file_names
+                    ):
+                        continue
                     add(
                         recorded_path,
                         phase=phase,
@@ -17703,7 +17736,7 @@ def _trace_paths(session: dict, observation: dict) -> list[dict]:
                     )
             except Exception:
                 pass
-        for raw in payload.get("folders") or []:
+        for raw in recorded_folders:
             add(raw, phase=phase, source_rank=20)
 
     for raw in observation.get("archived_measurements") or []:
@@ -34408,6 +34441,97 @@ def _composer_real_points(spec: dict, observations: list[dict]) -> pd.DataFrame:
     )
 
 
+COMPOSER_SELECTED_POINT_COLOR_MODES = (
+    "Signal-on/off colors (default)",
+    "Original Q dot color",
+    "Custom colors",
+)
+
+
+def _composer_selected_point_colors(
+    spec: Mapping[str, Any],
+    selected_values: Sequence[Any],
+    highlight_index: int,
+    *,
+    cmap,
+    norm,
+    default_palette: Sequence[str],
+) -> list[str]:
+    """Resolve selected-point colors without changing the underlying Q scale."""
+    mode = str(spec.get("highlight_color_mode") or COMPOSER_SELECTED_POINT_COLOR_MODES[0])
+    values = list(selected_values)
+    if mode == COMPOSER_SELECTED_POINT_COLOR_MODES[1]:
+        resolved = []
+        for value in values:
+            numeric = _finite_float(value)
+            resolved.append(
+                to_hex(cmap(norm(numeric)))
+                if numeric is not None else "#777777"
+            )
+        return resolved
+    palette = (
+        list(spec.get("highlight_colors") or [])
+        if mode == COMPOSER_SELECTED_POINT_COLOR_MODES[2]
+        else list(default_palette)
+    )
+    if not palette:
+        palette = list(default_palette) or ["#c62828", "#2439b2"]
+    return [str(palette[highlight_index % len(palette)])] * len(values)
+
+
+def _composer_linked_swv_marker_color(
+    trace_spec: Mapping[str, Any],
+    specs: Sequence[Mapping[str, Any]],
+    observations: list[dict],
+    iteration: int,
+    marker_index: int,
+) -> str:
+    """Match a compact SWV badge to its linked cube highlight marker."""
+    default_palette = ("#c62828", "#2439b2")
+    trace_channels = {str(value) for value in trace_spec.get("channels", [])}
+    for cube_spec in specs:
+        if cube_spec.get("kind") != "Measured 3D tensor":
+            continue
+        cube_channels = {str(value) for value in cube_spec.get("channels", [])}
+        if trace_channels and cube_channels and trace_channels.isdisjoint(cube_channels):
+            continue
+        highlighted = [
+            int(value)
+            for value in cube_spec.get("highlight_iterations", [])
+            if _finite_float(value) is not None
+        ]
+        if iteration not in highlighted:
+            continue
+        points = _composer_real_points(dict(cube_spec), observations)
+        if points.empty or "iteration" not in points or "value" not in points:
+            continue
+        iterations = pd.to_numeric(points["iteration"], errors="coerce")
+        selected_values = pd.to_numeric(
+            points.loc[iterations == iteration, "value"], errors="coerce"
+        ).to_numpy(float)
+        all_values = pd.to_numeric(points["value"], errors="coerce").to_numpy(float)
+        finite_values = all_values[np.isfinite(all_values)]
+        if not len(selected_values) or not finite_values.size:
+            continue
+        limits = (
+            np.nanpercentile(finite_values, [1, 99])
+            if cube_spec.get("clip_extremes")
+            else [np.nanmin(finite_values), np.nanmax(finite_values)]
+        )
+        cmap = plt.get_cmap(str(cube_spec.get("colorscale", "Viridis")).lower())
+        colors = _composer_selected_point_colors(
+            cube_spec,
+            selected_values,
+            highlighted.index(iteration),
+            cmap=cmap,
+            norm=Normalize(*map(float, limits)),
+            default_palette=default_palette,
+        )
+        if colors:
+            return colors[0]
+    return default_palette[marker_index % len(default_palette)]
+
+
 def _composer_iteration_path_frame(points: pd.DataFrame) -> pd.DataFrame | None:
     """One chronological path per optimizer group, from the plotted points.
 
@@ -34512,7 +34636,18 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
             int(value) for value in spec.get("highlight_iterations", [])
             if _finite_float(value) is not None
         ]
-        highlight_colors = list(spec.get("highlight_colors", ["#d62728", "#17becf"]))
+        point_values = pd.to_numeric(points.get("value"), errors="coerce").to_numpy(float)
+        finite_point_values = point_values[np.isfinite(point_values)]
+        color_limits = (
+            np.nanpercentile(finite_point_values, [1, 99])
+            if spec.get("clip_extremes") and finite_point_values.size
+            else (
+                [np.nanmin(finite_point_values), np.nanmax(finite_point_values)]
+                if finite_point_values.size else [0.0, 1.0]
+            )
+        )
+        point_cmap = plt.get_cmap(str(spec.get("colorscale", "Viridis")).lower())
+        point_norm = Normalize(*map(float, color_limits))
         highlight_labels = list(spec.get("highlight_labels", []))
         if not spec.get("show_highlight_labels", True):
             highlight_labels = []
@@ -34522,6 +34657,14 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
             ]
             if selected.empty:
                 continue
+            selected_colors = _composer_selected_point_colors(
+                spec,
+                pd.to_numeric(selected["value"], errors="coerce").tolist(),
+                highlight_index,
+                cmap=point_cmap,
+                norm=point_norm,
+                default_palette=("#d62728", "#17becf"),
+            )
             figure.add_trace(go.Scatter3d(
                 x=selected[spec["x"]],
                 y=selected[spec["y"]],
@@ -34529,12 +34672,12 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
                 mode="markers+text" if highlight_index < len(highlight_labels) else "markers",
                 marker={
                     "size": max(10, int(spec.get("dot_size", 6)) + 5),
-                    "color": highlight_colors[highlight_index % len(highlight_colors)],
+                    "color": selected_colors,
                     "line": {"color": "white", "width": 2},
                 },
                 text=(highlight_labels[highlight_index] if highlight_index < len(highlight_labels) else None),
                 textposition="top center",
-                textfont={"size": 10, "color": highlight_colors[highlight_index % len(highlight_colors)]},
+                textfont={"size": 10, "color": selected_colors[0]},
                 name=f"Selected iteration {iteration}",
                 hovertemplate=f"Selected iteration {iteration}<extra></extra>",
                 showlegend=False,
@@ -35262,12 +35405,18 @@ def _composer_draw_cube(fig, slot, spec, observations):
     highlighted_positions = []
     for n, iteration in enumerate(spec.get("highlight_iterations", [])):
         mask = points["iteration"].to_numpy() == iteration
-        color = spec.get("highlight_colors", ["#d62728", "#17becf"])[n % 2]
-        color = ["#c62828", "#2439b2"][n % 2]
+        selected_colors = _composer_selected_point_colors(
+            spec,
+            values[mask],
+            n,
+            cmap=cmap,
+            norm=norm,
+            default_palette=("#c62828", "#2439b2"),
+        )
         marker = ["o", "D"][n % 2]
         ax.scatter(*[a[mask] for a in coords], s=(float(spec.get("dot_size",6))+5)**2,
-                   c=color, marker=marker, edgecolors="white", linewidths=1.3, depthshade=False, zorder=50)
-        for position in zip(*[a[mask] for a in coords]):
+                   c=selected_colors, marker=marker, edgecolors="white", linewidths=1.3, depthshade=False, zorder=50)
+        for position, color in zip(zip(*[a[mask] for a in coords]), selected_colors):
             highlighted_positions.append((position, int(iteration), color, marker))
     best = spec.get('best_iteration')
     if best is not None:
@@ -35776,8 +35925,15 @@ def _build_composer_figure_inner(
                     legend.get_frame().set_linewidth(.4)
                 if spec.get("trace_role") and spec.get("show_example_markers", True):
                     marker_index = 1 if "off" in str(spec["trace_role"]).lower() else 0
+                    marker_color = _composer_linked_swv_marker_color(
+                        spec,
+                        specs,
+                        observations,
+                        int(trace_observation.get("iteration", -1)),
+                        marker_index,
+                    )
                     ax.plot([.96], [.92], transform=ax.transAxes,
-                            marker=["o", "D"][marker_index], color=["#c62828","#2439b2"][marker_index],
+                            marker=["o", "D"][marker_index], color=marker_color,
                             markersize=7, markeredgecolor="white", markeredgewidth=1, zorder=20)
             legend = ax.get_legend()
             if legend is not None:
@@ -36733,6 +36889,23 @@ def _composer_choose_linked_iteration(index: int, key: str) -> None:
         # Do not replay the previous editor checkpoint over an explicit choice.
         state.pop('bo_composer_editor_last', None)
         state.pop('bo_composer_editor_checkpoint', None)
+
+
+def _composer_slice_planes_changed(index: int, key: str) -> None:
+    """Make an explicit cube-plane edit the linked template's source of truth."""
+    state = st.session_state
+    count = int(state.get("bo_composer_count", 0))
+    shared_key = None
+    if state.get("bo_composer_type1_compact_linked_controls") and (
+        (count == 5 and index == 0) or (count == 6 and index == 3)
+    ):
+        shared_key = "bo_composer_type1_compact_slice_values"
+    elif state.get("bo_composer_type1_linked_controls") and count == 8 and index == 3:
+        shared_key = "bo_composer_type1_slice_values"
+    if shared_key:
+        state[shared_key] = list(state.get(key, []))
+        state.pop("bo_composer_editor_last", None)
+        state.pop("bo_composer_editor_checkpoint", None)
 
 
 def _composer_linked_example_controls(iteration_options):
@@ -37960,17 +38133,58 @@ def _render_figure_composer(
                                 f"bo_composer_real_highlight_labels_{index}", []
                             )
                         )
+                        spec["highlight_color_mode"] = st.selectbox(
+                            "Selected-point colors",
+                            COMPOSER_SELECTED_POINT_COLOR_MODES,
+                            key=f"bo_composer_measured_highlight_color_mode_{index}",
+                            help=(
+                                "Default keeps the signal-on red and signal-off navy markers. "
+                                "Original Q dot color reuses each selected point's color from "
+                                "the cube colormap; Custom colors lets you choose both markers."
+                            ),
+                        )
+                        saved_highlight_colors = list(st.session_state.get(
+                            f"bo_composer_measured_highlight_colors_{index}",
+                            ["#c62828", "#2439b2"],
+                        ))
+                        while len(saved_highlight_colors) < 2:
+                            saved_highlight_colors.append(
+                                ["#c62828", "#2439b2"][len(saved_highlight_colors)]
+                            )
+                        if spec["highlight_color_mode"] == COMPOSER_SELECTED_POINT_COLOR_MODES[2]:
+                            highlight_color_cols = st.columns(2)
+                            selected_highlight_colors = [
+                                highlight_color_cols[0].color_picker(
+                                    "First / signal-on marker",
+                                    value=str(saved_highlight_colors[0]),
+                                    key=f"bo_composer_measured_highlight_color_on_{index}",
+                                ),
+                                highlight_color_cols[1].color_picker(
+                                    "Second / signal-off marker",
+                                    value=str(saved_highlight_colors[1]),
+                                    key=f"bo_composer_measured_highlight_color_off_{index}",
+                                ),
+                            ]
+                        else:
+                            selected_highlight_colors = saved_highlight_colors[:2]
+                        st.session_state[
+                            f"bo_composer_measured_highlight_colors_{index}"
+                        ] = list(selected_highlight_colors)
+                        spec["highlight_colors"] = list(selected_highlight_colors)
                         step_slice_values = _numeric_slice_values(points, "step_potential")
                         compact_slice_limit = (
                             2 if st.session_state.get(
                                 "bo_composer_type1_compact_linked_controls"
                             ) else 4
                         )
+                        slice_values_key = f"bo_composer_real_slice_values_{index}"
                         spec["slice_sweep_values"] = st.multiselect(
                             "Step-size slice planes",
                             step_slice_values,
                             max_selections=compact_slice_limit,
-                            key=f"bo_composer_real_slice_values_{index}",
+                            key=slice_values_key,
+                            on_change=_composer_slice_planes_changed,
+                            args=(index, slice_values_key),
                             help=(
                                 "Draws "
                                 f"up to {compact_slice_limit} constant-step plane"

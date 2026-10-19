@@ -207,6 +207,8 @@ SOURCE_FIELDS = {
         "phase": "measured_phase", "average_channels": "measured_average",
         "x": "measured_x", "y": "measured_y", "z": "measured_z",
         "show_highlight_labels": "show_highlight_labels",
+        "highlight_color_mode": "measured_highlight_color_mode",
+        "highlight_colors": "measured_highlight_colors",
         "q_colorbar_inset": "q_colorbar_inset",
     },
     "Measured 2D map": {
@@ -272,6 +274,13 @@ def apply_source_edit(state, edit):
     for field, key in SOURCE_FIELDS[spec["kind"]].items():
         if field in spec:
             state[f"bo_composer_{key}_{index}"] = copy.deepcopy(spec[field])
+    if spec["kind"] == "Measured 3D tensor" and spec.get("highlight_colors"):
+        colors = list(spec["highlight_colors"])
+        if colors:
+            state[f"bo_composer_measured_highlight_color_on_{index}"] = colors[0]
+            state[f"bo_composer_measured_highlight_color_off_{index}"] = (
+                colors[1] if len(colors) > 1 else colors[0]
+            )
     if spec['kind'] == 'Chronological SWV stack' and 'crop_to_minima' in spec and 'voltage_display_range' not in spec:
         state[f'bo_composer_stack_voltage_range_{index}'] = (
             'Corrected peak bracket' if spec['crop_to_minima'] else 'Full analyzed voltage range'

@@ -102,6 +102,20 @@ def test_camera_update_is_panel_local_and_preserves_geometry():
     assert state['bo_composer_width_0'] == .6
 
 
+def test_cube_selected_point_color_choice_is_saved_panel_locally():
+    state = {"bo_composer_count": 2, "bo_composer_kind_0": "Measured 3D tensor"}
+    assert apply_source_edit(state, {"index": 0, "spec": {
+        "kind": "Measured 3D tensor",
+        "highlight_color_mode": "Custom colors",
+        "highlight_colors": ["#112233", "#445566"],
+    }})
+    assert state["bo_composer_measured_highlight_color_mode_0"] == "Custom colors"
+    assert state["bo_composer_measured_highlight_colors_0"] == ["#112233", "#445566"]
+    assert state["bo_composer_measured_highlight_color_on_0"] == "#112233"
+    assert state["bo_composer_measured_highlight_color_off_0"] == "#445566"
+    assert "bo_composer_measured_highlight_color_mode_1" not in state
+
+
 def test_group_scope_accepts_numeric_serialization_without_mixing_groups():
     import pandas as pd
     from bo_session_viewer import _composer_group_scope

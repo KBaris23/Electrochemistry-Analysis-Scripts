@@ -6,6 +6,7 @@ from matplotlib.collections import LineCollection
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.plotting import (
+    CONCENTRATION_DISPLAY_MODES,
     _langmuir_isotherm,
     _invert_langmuir_response,
     _prepare_titration_fit_points,
@@ -24,6 +25,116 @@ from core.plotting import (
     plot_titration_plateaus,
     plot_titration_snr,
 )
+
+
+def test_optional_concentration_display_modes_keep_default_data_unchanged():
+    import matplotlib.pyplot as plt
+
+    rows = []
+    for scan_number, occupancy in enumerate((0.2, 0.8, 0.99, 1.05), start=1):
+        prediction = None if occupancy >= 1.0 else occupancy / (1.0 - occupancy)
+        rows.append({
+            "channel": "1 group 1 | optimized",
+            "scan_number": scan_number,
+            "known_concentration": float(scan_number),
+            "predicted_concentration": prediction,
+            # Exercise the real below-LOD case where the default displayed
+            # estimate differs from the raw, uncensored inverse.
+            "unbounded_predicted_concentration": (
+                prediction / 2.0 if scan_number == 1 else prediction
+            ),
+            "predicted_concentration_std": 0.2 if prediction is not None else None,
+            "unbounded_predicted_concentration_std": 0.2,
+            "fit_metric_value": occupancy,
+            "fit_baseline": 0.0,
+            "fit_amplitude": 1.0,
+            "fit_kd": 1.0,
+            "response_noise_std": 0.03,
+            "limit_of_detection": 0.1,
+            "upper_limit_of_quantification": 3.0,
+        })
+    source_snapshot = [dict(row) for row in rows]
+
+    default_figure = plot_titration_concentration_accuracy(rows)
+    default_measurement_figure = plot_titration_concentration_vs_measurement(rows)
+    default_points = next(
+        collection for collection in default_figure.axes[0].collections
+        if collection.get_label() == "SWV Method 1"
+    )
+    assert len(default_points.get_offsets()) == 3
+    default_rms = next(
+        text.get_text() for text in default_figure.axes[0].texts
+        if "RMS Fold Error" in text.get_text()
+    )
+
+    flag_figure = plot_titration_concentration_accuracy(
+        rows, concentration_display_mode=CONCENTRATION_DISPLAY_MODES[1]
+    )
+    flagged = next(
+        collection for collection in flag_figure.axes[0].collections
+        if collection.get_label() == "Display-limited estimate"
+    )
+    assert len(flagged.get_offsets()) == 1
+
+    for mode in CONCENTRATION_DISPLAY_MODES[2:]:
+        measurement_figure = plot_titration_concentration_vs_measurement(
+            rows, concentration_display_mode=mode
+        )
+        accuracy_figure = plot_titration_concentration_accuracy(
+            rows, concentration_display_mode=mode
+        )
+        assert measurement_figure is not None
+        assert getattr(measurement_figure, "_swv_concentration_display_note") == mode
+        assert "Display-limited estimate" not in [
+            collection.get_label() for collection in measurement_figure.axes[0].collections
+        ]
+        assert "Display-limited estimate" not in [
+            collection.get_label() for collection in accuracy_figure.axes[0].collections
+        ]
+        assert next(
+            text.get_text() for text in accuracy_figure.axes[0].texts
+            if "RMS Fold Error" in text.get_text()
+        ) == default_rms
+
+        if mode == CONCENTRATION_DISPLAY_MODES[5]:
+            method_points = next(
+                collection for collection in accuracy_figure.axes[0].collections
+                if collection.get_label() == "SWV Method 1"
+            )
+            assert len(method_points.get_offsets()) == len(default_points.get_offsets())
+            # The hybrid must not drag an already-valid 99 uM ordinary
+            # inverse down to the 49 uM epsilon ceiling.
+            assert np.any(np.isclose(method_points.get_offsets()[:, 1], 99.0))
+            # A non-invertible point that is absent from the default stays
+            # absent instead of being replaced by a clipped central estimate.
+            assert not np.any(np.isclose(method_points.get_offsets()[:, 0], 4.0))
+            default_measurement_points = next(
+                collection for collection in default_measurement_figure.axes[0].collections
+                if collection.get_label() == "SWV Method 1"
+            )
+            clipped_measurement_points = next(
+                collection for collection in measurement_figure.axes[0].collections
+                if collection.get_label() == "SWV Method 1"
+            )
+            np.testing.assert_allclose(
+                clipped_measurement_points.get_offsets(),
+                default_measurement_points.get_offsets(),
+            )
+
+    capped_figure = plot_titration_concentration_accuracy(
+        rows,
+        concentration_display_mode=CONCENTRATION_DISPLAY_MODES[2],
+        concentration_display_boundary=10.0,
+    )
+    capped_points = next(
+        collection for collection in capped_figure.axes[0].collections
+        if collection.get_label() == "SWV Method 1"
+    )
+    assert float(np.max(capped_points.get_offsets()[:, 1])) == 10.0
+
+    assert all("Normalized response" not in mode for mode in CONCENTRATION_DISPLAY_MODES)
+    assert rows == source_snapshot
+    plt.close("all")
 
 
 def test_response_direction_inference_does_not_require_langmuir_fit():
@@ -259,6 +370,7 @@ def test_metric_plot_plateau_overlay_is_disconnected_and_has_std_error_bars():
         vlines=vlines,
         show_titration_plateaus=True,
         titration_edge_trim_fraction=0.0,
+        titration_plateau_alpha=0.42,
     )
 
     axis = figure.axes[0]
@@ -278,6 +390,17 @@ def test_metric_plot_plateau_overlay_is_disconnected_and_has_std_error_bars():
     )
     assert all(
         collection.get_linestyles()[0][1] is not None
+        for collection in plateau_segments + plateau_errors
+    )
+    measurement_line = next(
+        line for line in axis.lines if not getattr(line, "_swv_titration_vline", False)
+    )
+    assert all(
+        collection.get_zorder() > measurement_line.get_zorder()
+        for collection in plateau_segments + plateau_errors
+    )
+    assert all(
+        np.isclose(collection.get_alpha(), 0.42)
         for collection in plateau_segments + plateau_errors
     )
     assert np.allclose(

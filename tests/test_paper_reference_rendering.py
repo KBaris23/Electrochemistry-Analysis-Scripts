@@ -120,11 +120,108 @@ def test_cube_label_toggle_keeps_markers_and_title(monkeypatch):
         viewer._composer_cube_annotations(cube, 10)
         assert len(cube.collections) == 3  # all measured dots and both highlights
         assert len(cube._composer_highlight_positions) == 2
+        assert [item[2] for item in cube._composer_highlight_positions] == [
+            "#c62828", "#2439b2"
+        ]
         labels = [text.get_text() for text in cube.texts]
         assert ('Iter 1' in labels) == visible
         assert ('Iter 2' in labels) == visible
         assert cube._composer_cube_title in labels
         plt.close(fig)
+
+
+def test_cube_selected_points_can_reuse_original_q_colors(monkeypatch):
+    from matplotlib.colors import Normalize, to_hex
+
+    frame = pd.DataFrame(dict(
+        iteration=[1, 2], group_id=[1, 1], value=[3.0, -1.0],
+        frequency=[100, 200], amplitude=[.04, .09], step_potential=[.001, .004],
+    ))
+    monkeypatch.setattr(viewer, "_composer_real_points", lambda *args: frame)
+    spec = dict(
+        rect=(.05, .05, .9, .9), x="step_potential", y="amplitude", z="frequency",
+        metric="Paired Q", colorscale="Viridis", highlight_iterations=[1, 2],
+        highlight_color_mode="Original Q dot color",
+    )
+    fig, slot = plt.subplots()
+    try:
+        cube = viewer._composer_draw_cube(fig, slot, spec, [])
+        actual = [item[2] for item in cube._composer_highlight_positions]
+        cmap = plt.get_cmap("viridis")
+        norm = Normalize(-1.0, 3.0)
+        assert actual == [to_hex(cmap(norm(3.0))), to_hex(cmap(norm(-1.0)))]
+    finally:
+        plt.close(fig)
+
+
+def test_linked_swv_badge_reuses_cube_original_q_color(monkeypatch):
+    from matplotlib.colors import Normalize, to_hex
+
+    frame = pd.DataFrame(dict(
+        iteration=[1, 2], group_id=[1, 1], value=[3.0, -1.0],
+        frequency=[100, 200], amplitude=[.04, .09], step_potential=[.001, .004],
+    ))
+    monkeypatch.setattr(viewer, "_composer_real_points", lambda *args: frame)
+    monkeypatch.setattr(
+        viewer,
+        "_trace_paths",
+        lambda *args: [dict(path="trace", channel="2", phase="buffer")],
+    )
+    monkeypatch.setattr(
+        viewer,
+        "_swv_trace_arrays",
+        lambda *args: (
+            np.array([-.4, -.2, 0.]), np.array([0., 1., 0.]), 1, 0, 2,
+        ),
+    )
+    observation = dict(
+        iteration=1,
+        params=dict(frequency=100, amplitude=.04, step_potential=.001),
+    )
+    cube_spec = dict(
+        kind="Measured 3D tensor", rect=(.02, .05, .46, .9),
+        x="step_potential", y="amplitude", z="frequency",
+        channels=["2"], metric="Paired Q", phase="target",
+        colorscale="Viridis", highlight_iterations=[1, 2],
+        highlight_color_mode="Original Q dot color", show_label=False,
+    )
+    trace_spec = dict(
+        kind="SWV trace overlay", rect=(.54, .3, .42, .4),
+        corrected=True, channels=["2"], corrected_trace_key="corrected_current",
+        normalize_to_peak=False, observation_iteration=1, trace_role="Signal-on",
+        show_example_markers=True, show_label=False,
+    )
+    fig = viewer._build_composer_figure(
+        {"config": {}}, pd.DataFrame(), [observation], observation, {}, False,
+        [cube_spec, trace_spec], "Presentation (12 x 9 in)", "Arial", 10, 10, "", 72,
+    )
+    try:
+        badges = [
+            line
+            for axis in fig.axes
+            for line in axis.lines
+            if line.get_marker() == "o"
+            and np.allclose(np.asarray(line.get_xdata(), dtype=float), [.96])
+        ]
+        assert len(badges) == 1
+        expected = to_hex(plt.get_cmap("viridis")(Normalize(-1.0, 3.0)(3.0)))
+        assert to_hex(badges[0].get_color()) == expected
+    finally:
+        plt.close(fig)
+
+
+def test_cube_slice_edit_updates_linked_compact_planes(monkeypatch):
+    from types import SimpleNamespace
+
+    state = {
+        "bo_composer_count": 5,
+        "bo_composer_type1_compact_linked_controls": True,
+        "bo_composer_type1_compact_slice_values": [.004, .007],
+        "bo_composer_real_slice_values_0": [.001, .010],
+    }
+    monkeypatch.setattr(viewer, "st", SimpleNamespace(session_state=state))
+    viewer._composer_slice_planes_changed(0, "bo_composer_real_slice_values_0")
+    assert state["bo_composer_type1_compact_slice_values"] == [.001, .010]
 
 
 def test_plotly_cube_label_toggle_keeps_highlight_markers(monkeypatch):

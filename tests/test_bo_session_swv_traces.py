@@ -795,6 +795,37 @@ def test_trace_paths_preserves_all_same_channel_phase_replicates(tmp_path):
     assert {trace["channel"] for trace in traces} == {"1"}
 
 
+def test_trace_paths_rejects_stale_overwritten_results_csv_rows(tmp_path):
+    original_paths = []
+    stale_paths = []
+    for label, destination in (("original", original_paths), ("later", stale_paths)):
+        for replicate in range(1, 4):
+            trace_path = tmp_path / f"{label}_buffer_ch1_replicate_{replicate}.csv"
+            trace_path.write_text("voltage,current\n0,0\n", encoding="utf-8")
+            destination.append(trace_path)
+
+    results_path = tmp_path / "buffer_results.csv"
+    pd.DataFrame([
+        {"file_path": str(path), "channel": 1}
+        for path in stale_paths
+    ]).to_csv(results_path, index=False)
+    record_path = tmp_path / "buffer_analysis_record.json"
+    record_path.write_text(
+        json.dumps({
+            "folders": [str(path) for path in original_paths],
+            "results_csv": str(results_path),
+        }),
+        encoding="utf-8",
+    )
+
+    traces = _trace_paths({"root": tmp_path}, {
+        "objective": "paired_response",
+        "buffer_analysis_record": str(record_path),
+    })
+
+    assert [trace["path"] for trace in traces] == original_paths
+
+
 def test_trace_paths_preserve_per_channel_settings_and_saved_bo_directions(tmp_path):
     rows = []
     for channel, frequency, amplitude, step in (

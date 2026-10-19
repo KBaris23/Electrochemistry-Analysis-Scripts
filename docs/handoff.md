@@ -46,6 +46,8 @@ Recommended logical inputs:
 | `np_sweep` | BO Session | NP survey `bo_sessions/<survey-session>` |
 | `np_validation` | BO Session | NP optimization `bo_sessions/<optimization-session>` |
 | `np_titration` | SWV | NP titration measurement root |
+| `np_titration_aug13_all_channels` | SWV | NP August 13 titration, all ten physical channels |
+| `np_titration_aug13_high_quality` | SWV | NP August 13 titration under `<NP_DATA_ROOT>/500um_new_scoring_bo_20260812_130435` |
 | `kana_try_sweep` | BO Session | Planar/Kana survey session |
 | `kana_try_validation` | BO Session | Planar/Kana optimization session |
 | `kana_try_titration` | SWV | `<DATA_ROOT>/titration_only/kana_try` or its original experiment root |
@@ -58,6 +60,32 @@ The names are conveniences, not required folder names. Planar/Kana and Amp0 are
 planar-electrode datasets; NP is the nanoporous-electrode dataset. Confirm the
 experiment metadata rather than inferring electrode type from a saved-session
 name.
+
+### NP August 13 high-quality titration
+
+`np_titration_aug13_all_channels` is the preferred exploratory session when the
+5120 uM plateau must remain well resolved. Its provenance is the August 13
+measurement block with source scan IDs 3011-6210. The cache contains all ten
+physical channels (3,200 real SWV measurements; 320 per channel), but its Type
+4A composer remains preselected to Channels 5 and 3. The smaller
+`np_titration_aug13_high_quality` fallback contains only those two physical
+channels (640 measurements) for the fastest possible reopen:
+
+- Channel 5 optimized: signal-off, 116 Hz, 50 mV amplitude, 1 mV step; use as
+  the primary full-range Type 4A row;
+- Channel 3 optimized: signal-on, 499 Hz, 40 mV amplitude, 7 mV step; use when
+  the cleanest single-peak SWV presentation is preferred;
+- group 1 is the optimized method and group 2 is the 200 Hz manual/reference
+  method for both physical channels;
+- the full grouped method axis is measurements 1-160 for 40-5120 uM;
+- for 80-5120 uM, use display measurements **21-160**. Measurement 21 begins
+  the buffer immediately preceding the 80 uM target at measurement 31, so the
+  preceding-buffer response and Langmuir calculations remain defined.
+
+Both caches record their exact source-file paths and omit the expensive
+full-folder source-signature scan to keep opening responsive. Treat the archived
+raw folder as immutable; if it changes, rerun the analysis from the recorded
+source paths rather than trusting the cache.
 
 ## 4. Recreate local sessions from original data
 
@@ -126,6 +154,13 @@ and render. The measured slices and cube must come from the same active session.
 Open the optimization session, choose Type 2 or 2A, and verify the linked
 validation group, channel and maximize/minimize direction. Select **Original
 recorded Q**, rescored Q or paired SNR explicitly; these are not interchangeable.
+
+For sweep-versus-BO tables, compare equal numbers of measured settings and use
+the same peak extraction as well as the same Q formula. Keep full-sweep extrema
+in a provenance-rich appendix/CSV rather than presenting a best-of-200 sweep as
+the direct efficiency benchmark for a 50-observation BO run. A saved analysis
+record's frozen input filenames are authoritative if a later acquisition reused
+and overwrote the same external results-CSV name.
 
 ### Titration and concentration figures
 

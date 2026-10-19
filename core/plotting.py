@@ -13,7 +13,7 @@ from matplotlib import cm
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 from scipy.interpolate import PchipInterpolator
-from scipy.optimize import OptimizeWarning, curve_fit
+from scipy.optimize import OptimizeWarning, curve_fit, minimize_scalar
 import warnings
 
 from .processing import find_peak_candidates
@@ -1827,6 +1827,236 @@ def _invert_langmuir_response(
     return float(kd * occupancy / (1.0 - occupancy))
 
 
+CONCENTRATION_DISPLAY_MODES = (
+    "Current behavior (default)",
+    "Flag non-invertible points at boundary",
+    "Cap estimates and error bars at boundary",
+    "Epsilon-clipped inverse (display only)",
+    "Regularized inverse (display only)",
+    "Default points + epsilon-clipped error bars",
+)
+
+
+def _finite_float(value: Any) -> Optional[float]:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _row_occupancy(row: dict) -> Optional[float]:
+    response = _finite_float(row.get("fit_metric_value"))
+    baseline = _finite_float(row.get("fit_baseline"))
+    amplitude = _finite_float(row.get("fit_amplitude"))
+    if response is None or baseline is None or amplitude is None or np.isclose(amplitude, 0.0):
+        return None
+    occupancy = (response - baseline) / amplitude
+    return float(occupancy) if np.isfinite(occupancy) else None
+
+
+def _row_concentration_boundary(
+    row: dict,
+    fallback: float,
+    explicit_boundary: Optional[float] = None,
+) -> float:
+    explicit = _finite_float(explicit_boundary)
+    if explicit is not None and explicit > 0:
+        return explicit
+    uloq = _finite_float(row.get("upper_limit_of_quantification"))
+    if uloq is not None and uloq > 0:
+        return min(uloq, max(float(fallback), np.finfo(float).tiny))
+    return max(float(fallback), np.finfo(float).tiny)
+
+
+def _regularized_langmuir_inverse(
+    occupancy: float,
+    kd: float,
+    regularization: float,
+    maximum_concentration: float,
+) -> Optional[float]:
+    """Finite, non-negative forward-model estimate used only for display."""
+    if not np.isfinite(occupancy) or not np.isfinite(kd) or kd <= 0:
+        return None
+    regularization = max(float(regularization), 0.0)
+    maximum_concentration = max(float(maximum_concentration), kd * 1e-9)
+    upper_z = max(maximum_concentration / kd, 1e-9)
+
+    def objective(z_value: float) -> float:
+        modeled = z_value / (1.0 + z_value)
+        return (
+            (modeled - occupancy) ** 2
+            + regularization * np.log1p(z_value) ** 2
+        )
+
+    result = minimize_scalar(
+        objective,
+        bounds=(0.0, upper_z),
+        method="bounded",
+        options={"xatol": 1e-10},
+    )
+    if not result.success or not np.isfinite(result.x):
+        return None
+    return float(kd * result.x)
+
+
+def _prepare_concentration_display_rows(
+    accuracy_rows: List[dict],
+    display_mode: str,
+    *,
+    epsilon: float = 0.02,
+    regularization: float = 1e-4,
+    boundary: Optional[float] = None,
+) -> List[dict]:
+    """Return display-only row copies for optional inverse-stability views."""
+    if display_mode == CONCENTRATION_DISPLAY_MODES[0]:
+        return accuracy_rows
+
+    positive_known = [
+        value
+        for row in accuracy_rows
+        if (value := _finite_float(row.get("known_concentration"))) is not None
+        and value > 0
+    ]
+    fallback_boundary = max(positive_known, default=1.0)
+    explicit_boundary = _finite_float(boundary)
+    if explicit_boundary is not None and explicit_boundary <= 0:
+        explicit_boundary = None
+    epsilon = float(np.clip(epsilon, 1e-9, 0.49))
+    prepared: List[dict] = []
+    for source_row in accuracy_rows:
+        row = dict(source_row)
+        # This is the exact value used by the default plot, including its
+        # existing below-LOD reporting convention.  Display-only modes must
+        # not silently substitute the uncensored inverse for metrics or for
+        # central points that were already valid.
+        original_prediction = _finite_float(
+            source_row.get("predicted_concentration")
+        )
+        original_unbounded_prediction = _finite_float(
+            source_row.get("unbounded_predicted_concentration")
+        )
+        if original_prediction is None:
+            original_prediction = original_unbounded_prediction
+        row["_original_predicted_concentration"] = original_prediction
+        row["_original_unbounded_predicted_concentration"] = (
+            original_unbounded_prediction
+        )
+        occupancy = _row_occupancy(row)
+        row_boundary = _row_concentration_boundary(
+            row, fallback_boundary, explicit_boundary
+        )
+        kd = _finite_float(row.get("fit_kd"))
+        response_sigma = _finite_float(row.get("response_noise_std"))
+        amplitude = _finite_float(row.get("fit_amplitude"))
+        occupancy_sigma = (
+            response_sigma / abs(amplitude)
+            if response_sigma is not None and amplitude is not None
+            and not np.isclose(amplitude, 0.0)
+            else None
+        )
+        row["_display_flag_noninvertible"] = False
+        row["_display_boundary"] = row_boundary
+
+        if display_mode == CONCENTRATION_DISPLAY_MODES[1]:
+            prediction = original_prediction
+            if prediction is None:
+                prediction = row_boundary
+                row["_display_flag_noninvertible"] = True
+            row["predicted_concentration"] = prediction
+            row["unbounded_predicted_concentration"] = prediction
+
+        elif display_mode == CONCENTRATION_DISPLAY_MODES[2]:
+            prediction = original_prediction
+            if prediction is None or prediction > row_boundary:
+                prediction = row_boundary
+            row["predicted_concentration"] = prediction
+            row["unbounded_predicted_concentration"] = prediction
+            uncertainty = _finite_float(row.get("unbounded_predicted_concentration_std"))
+            if uncertainty is not None:
+                row["_display_error_lower"] = max(0.0, prediction - uncertainty)
+                row["_display_error_upper"] = min(row_boundary, prediction + uncertainty)
+
+        elif display_mode == CONCENTRATION_DISPLAY_MODES[3]:
+            if occupancy is None or kd is None or kd <= 0:
+                continue
+            clipped = float(np.clip(occupancy, epsilon, 1.0 - epsilon))
+            prediction = float(kd * clipped / (1.0 - clipped))
+            if explicit_boundary is not None:
+                prediction = min(prediction, row_boundary)
+            row["predicted_concentration"] = prediction
+            row["unbounded_predicted_concentration"] = prediction
+            if occupancy_sigma is not None:
+                lower_p = float(np.clip(occupancy - occupancy_sigma, epsilon, 1.0 - epsilon))
+                upper_p = float(np.clip(occupancy + occupancy_sigma, epsilon, 1.0 - epsilon))
+                error_lower = kd * lower_p / (1.0 - lower_p)
+                error_upper = kd * upper_p / (1.0 - upper_p)
+                if explicit_boundary is not None:
+                    error_lower = min(error_lower, row_boundary)
+                    error_upper = min(error_upper, row_boundary)
+                row["_display_error_lower"] = min(error_lower, prediction)
+                row["_display_error_upper"] = max(error_upper, prediction)
+
+        elif display_mode == CONCENTRATION_DISPLAY_MODES[4]:
+            if occupancy is None or kd is None or kd <= 0:
+                continue
+            prediction = _regularized_langmuir_inverse(
+                occupancy, kd, regularization, row_boundary
+            )
+            if prediction is None:
+                continue
+            row["predicted_concentration"] = prediction
+            row["unbounded_predicted_concentration"] = prediction
+            if occupancy_sigma is not None:
+                lower = _regularized_langmuir_inverse(
+                    occupancy - occupancy_sigma, kd, regularization, row_boundary
+                )
+                upper = _regularized_langmuir_inverse(
+                    occupancy + occupancy_sigma, kd, regularization, row_boundary
+                )
+                if lower is not None and upper is not None:
+                    row["_display_error_lower"] = min(lower, upper)
+                    row["_display_error_upper"] = max(lower, upper)
+
+        elif display_mode == CONCENTRATION_DISPLAY_MODES[5]:
+            if occupancy is None or kd is None or kd <= 0:
+                continue
+            # Hybrid view: preserve both panel-specific default central values.
+            # Accuracy uses the reported/censored estimate; measurement uses
+            # the uncensored estimate. Only uncertainty endpoints are clipped.
+            prediction = original_prediction
+            if prediction is None:
+                continue
+            measurement_prediction = (
+                original_unbounded_prediction
+                if original_unbounded_prediction is not None
+                else prediction
+            )
+            row["predicted_concentration"] = prediction
+            row["unbounded_predicted_concentration"] = measurement_prediction
+            if occupancy_sigma is not None:
+                lower_p = float(np.clip(
+                    occupancy - occupancy_sigma, epsilon, 1.0 - epsilon
+                ))
+                upper_p = float(np.clip(
+                    occupancy + occupancy_sigma, epsilon, 1.0 - epsilon
+                ))
+                error_lower = kd * lower_p / (1.0 - lower_p)
+                error_upper = kd * upper_p / (1.0 - upper_p)
+                if explicit_boundary is not None:
+                    error_lower = min(error_lower, row_boundary)
+                    error_upper = min(error_upper, row_boundary)
+                row["_display_error_lower"] = min(
+                    error_lower, measurement_prediction
+                )
+                row["_display_error_upper"] = max(
+                    error_upper, measurement_prediction
+                )
+
+        prepared.append(row)
+    return prepared
+
+
 def _propagated_langmuir_concentration_std(
     response: float,
     baseline: float,
@@ -2124,6 +2354,7 @@ def build_titration_measurement_accuracy_table(
                 "raw_metric_value": raw_response,
                 "fit_metric_value": corrected_response,
                 "measurement_snr": measurement_snr,
+                "response_noise_std": noise_std,
                 "plateau_snr": step.get("titration_snr"),
                 "fit_baseline": baseline,
                 "fit_amplitude": amplitude,
@@ -2678,12 +2909,17 @@ def plot_metric_vs_scan(
     vline_label_mode: str = "boundary",
     show_titration_plateaus: bool = False,
     titration_edge_trim_fraction: float = 0.15,
+    titration_plateau_alpha: float = 0.65,
 
 ) -> Optional[plt.Figure]:
 
     if normalize_per_channel and percent_change_per_channel:
 
         raise ValueError("Choose only one per-channel normalization mode.")
+
+    titration_plateau_alpha = float(np.clip(
+        titration_plateau_alpha, 0.0, 1.0
+    ))
 
     if measurement_start_at_one and scan_range and x_key == "scan_number":
         from core.paper_titration import measurement_display_data
@@ -2998,6 +3234,7 @@ def plot_metric_vs_scan(
                 linestyle=line_style, ms=3, lw=1.6,
                 color=colors[ch], alpha=0.15 if dimmed else 0.9,
                 label=trace_label if segment_index == 0 else "_nolegend_",
+                zorder=3,
             )
             line._swv_preserve_color = _swv_method_blue(ch) is not None
         plotted_y_by_axis[plot_axis].append(y[np.isfinite(y)])
@@ -3022,12 +3259,13 @@ def plot_metric_vs_scan(
                 color="black",
                 linestyles="--",
                 linewidth=2.4,
-                alpha=0.95,
-                zorder=6,
+                alpha=titration_plateau_alpha,
+                zorder=4.0,
                 label="_nolegend_",
             )
             segment._swv_titration_plateau = True
             segment._swv_titration_plateau_segment = True
+            segment._swv_preserve_alpha = True
             errorbar = plot_axis.errorbar(
                 [plateau_midpoint],
                 [plateau_value],
@@ -3037,8 +3275,8 @@ def plot_metric_vs_scan(
                 elinewidth=1.1,
                 capsize=3.0,
                 capthick=1.1,
-                alpha=0.95,
-                zorder=7,
+                alpha=titration_plateau_alpha,
+                zorder=4.1,
                 label="_nolegend_",
             )
             _data_line, cap_lines, bar_collections = errorbar.lines
@@ -3046,6 +3284,7 @@ def plot_metric_vs_scan(
                 artist.set_linestyle("--")
                 artist._swv_titration_plateau = True
                 artist._swv_titration_plateau_errorbar = True
+                artist._swv_preserve_alpha = True
             plotted_y_by_axis[plot_axis].append(np.asarray([
                 plateau_value - plateau_std,
                 plateau_value + plateau_std,
@@ -4387,7 +4626,20 @@ def plot_titration_concentration_accuracy(
     square_axes: bool = True,
     error_summary_position: str = "inside",
     compact_legend: bool = False,
+    concentration_display_mode: str = CONCENTRATION_DISPLAY_MODES[0],
+    concentration_display_epsilon: float = 0.02,
+    concentration_regularization: float = 1e-4,
+    concentration_display_boundary: Optional[float] = None,
 ) -> Optional[plt.Figure]:
+    if concentration_display_mode not in CONCENTRATION_DISPLAY_MODES:
+        concentration_display_mode = CONCENTRATION_DISPLAY_MODES[0]
+    accuracy_rows = _prepare_concentration_display_rows(
+        accuracy_rows,
+        concentration_display_mode,
+        epsilon=concentration_display_epsilon,
+        regularization=concentration_regularization,
+        boundary=concentration_display_boundary,
+    )
     usable_rows = [
         row for row in accuracy_rows
         if row.get("known_concentration") is not None
@@ -4430,6 +4682,7 @@ def plot_titration_concentration_accuracy(
     uloq_legend_added = False
     log_errors_by_trace: Dict[str, List[float]] = {}
     annotation_color_by_trace: Dict[str, Any] = {}
+    flagged_label_added = False
     for index, channel in enumerate(channels):
         channel_rows = [
             row for row in usable_rows if row["channel"] == channel
@@ -4449,7 +4702,13 @@ def plot_titration_concentration_accuracy(
         annotation_color_by_trace.setdefault(annotation_label, color)
         for row in channel_rows:
             known_value = float(row["known_concentration"])
-            predicted_value = float(row["predicted_concentration"])
+            predicted_value = _finite_float(
+                row.get("_original_predicted_concentration")
+                if "_original_predicted_concentration" in row
+                else row.get("predicted_concentration")
+            )
+            if predicted_value is None or predicted_value <= 0:
+                continue
             log_error = float(np.log10(predicted_value / known_value))
             if np.isfinite(log_error):
                 log_errors_by_trace.setdefault(annotation_label, []).append(
@@ -4530,6 +4789,23 @@ def plot_titration_concentration_accuracy(
             zorder=3,
         )
         prediction_points._swv_preserve_alpha = True
+        flagged_rows = (
+            [row for row in channel_rows if row.get("_display_flag_noninvertible")]
+            if concentration_display_mode == CONCENTRATION_DISPLAY_MODES[1]
+            else []
+        )
+        if flagged_rows:
+            flagged_points = ax.scatter(
+                [float(row["known_concentration"]) for row in flagged_rows],
+                [float(row["predicted_concentration"]) for row in flagged_rows],
+                s=42,
+                color="tab:orange",
+                marker="^",
+                label=("Display-limited estimate" if not flagged_label_added else "_nolegend_"),
+                zorder=4,
+            )
+            flagged_points._swv_preserve_alpha = True
+            flagged_label_added = True
 
     if np.isfinite(percent_error_bound) and 0 < percent_error_bound < 100:
         bound_fraction = float(percent_error_bound) / 100.0
@@ -4628,6 +4904,7 @@ def plot_titration_concentration_accuracy(
     allowed_legend_labels = {
         f"Within ±{percent_error_bound:g}%",
         "1:1",
+        "Display-limited estimate",
     }
     allowed_legend_labels.update(
         (channel_labels or {}).get(channel)
@@ -4664,6 +4941,8 @@ def plot_titration_concentration_accuracy(
         # The paper compositor normally relocates legends heuristically. This
         # compact two-column legend is intentionally placed for square axes.
         legend._swv_keep_location = True
+    if concentration_display_mode != CONCENTRATION_DISPLAY_MODES[0]:
+        fig._swv_concentration_display_note = concentration_display_mode
     fig.tight_layout(rect=(0.0, 0.11, 1.0, 1.0) if compact_legend else None)
     return fig
 
@@ -4684,6 +4963,10 @@ def plot_titration_concentration_vs_measurement(
     scan_range: Optional[Tuple[int, int]] = None,
     measurement_start_at_one: bool = False,
     vline_label_mode: str = "boundary",
+    concentration_display_mode: str = CONCENTRATION_DISPLAY_MODES[0],
+    concentration_display_epsilon: float = 0.02,
+    concentration_regularization: float = 1e-4,
+    concentration_display_boundary: Optional[float] = None,
 ) -> Optional[plt.Figure]:
     """Plot per-SWV Langmuir concentration predictions by measurement number.
 
@@ -4698,6 +4981,15 @@ def plot_titration_concentration_vs_measurement(
             accuracy_rows, vlines, vlines_by_channel, scan_range=scan_range,
             start_at_one=measurement_start_at_one,
         )
+    if concentration_display_mode not in CONCENTRATION_DISPLAY_MODES:
+        concentration_display_mode = CONCENTRATION_DISPLAY_MODES[0]
+    accuracy_rows = _prepare_concentration_display_rows(
+        accuracy_rows,
+        concentration_display_mode,
+        epsilon=concentration_display_epsilon,
+        regularization=concentration_regularization,
+        boundary=concentration_display_boundary,
+    )
     usable_rows = []
     for row in accuracy_rows:
         try:
@@ -4792,6 +5084,7 @@ def plot_titration_concentration_vs_measurement(
         channel_colors=channel_colors,
     )
     suppressed_uncertainty_count = 0
+    flagged_label_added = False
     for index, channel in enumerate(channels):
         channel_rows = sorted(
             [row for row in usable_rows if row.get("channel") == channel],
@@ -4811,6 +5104,11 @@ def plot_titration_concentration_vs_measurement(
         line_style, marker = styles[channel]
         uncertainty_rows = []
         for position, row in zip(x_values, channel_rows):
+            display_lower = _finite_float(row.get("_display_error_lower"))
+            display_upper = _finite_float(row.get("_display_error_upper"))
+            if display_lower is not None and display_upper is not None:
+                uncertainty_rows.append((position, row))
+                continue
             uncertainty = row.get("predicted_concentration_std")
             try:
                 uncertainty = float(uncertainty)
@@ -4842,21 +5140,35 @@ def plot_titration_concentration_vs_measurement(
                 [float(row["_plot_predicted_concentration"]) for _position, row in uncertainty_rows],
                 dtype=float,
             )
-            error_std = np.asarray(
-                [float(row["predicted_concentration_std"]) for _position, row in uncertainty_rows],
-                dtype=float,
-            )
             error_levels = _concentration_to_doubling_level(
                 error_y,
                 minimum_nonzero_concentration,
             )
+            if all(
+                _finite_float(row.get("_display_error_lower")) is not None
+                and _finite_float(row.get("_display_error_upper")) is not None
+                for _position, row in uncertainty_rows
+            ):
+                lower_error_values = np.asarray(
+                    [float(row["_display_error_lower"]) for _position, row in uncertainty_rows],
+                    dtype=float,
+                )
+                upper_error_values = np.asarray(
+                    [float(row["_display_error_upper"]) for _position, row in uncertainty_rows],
+                    dtype=float,
+                )
+            else:
+                error_std = np.asarray(
+                    [float(row["predicted_concentration_std"]) for _position, row in uncertainty_rows],
+                    dtype=float,
+                )
+                lower_error_values = error_y - error_std
+                upper_error_values = error_y + error_std
             lower_error_levels = _concentration_to_doubling_level(
-                error_y - error_std,
-                minimum_nonzero_concentration,
+                lower_error_values, minimum_nonzero_concentration,
             )
             upper_error_levels = _concentration_to_doubling_level(
-                error_y + error_std,
-                minimum_nonzero_concentration,
+                upper_error_values, minimum_nonzero_concentration,
             )
             transformed_error = np.vstack((
                 error_levels - lower_error_levels,
@@ -4919,10 +5231,36 @@ def plot_titration_concentration_vs_measurement(
             ),
             zorder=4,
         )
+        flagged_rows = (
+            [row for row in channel_rows if row.get("_display_flag_noninvertible")]
+            if concentration_display_mode == CONCENTRATION_DISPLAY_MODES[1]
+            else []
+        )
+        if flagged_rows:
+            flagged_predictions = np.asarray(
+                [float(row["_plot_predicted_concentration"]) for row in flagged_rows],
+                dtype=float,
+            )
+            flagged_levels = _concentration_to_doubling_level(
+                flagged_predictions, minimum_nonzero_concentration,
+            )
+            ax.scatter(
+                [row.get(x_key) for row in flagged_rows],
+                flagged_levels,
+                color="tab:orange",
+                s=34,
+                marker="^",
+                label=("Display-limited estimate" if not flagged_label_added else "_nolegend_"),
+                zorder=5,
+            )
+            flagged_label_added = True
 
     if suppressed_uncertainty_count or any(
-        row.get("predicted_concentration_std") is not None
-        and np.isfinite(row.get("predicted_concentration_std", np.nan))
+        (
+            row.get("predicted_concentration_std") is not None
+            and np.isfinite(row.get("predicted_concentration_std", np.nan))
+        )
+        or _finite_float(row.get("_display_error_lower")) is not None
         for row in usable_rows
     ):
         uncertainty_note = "Error bars: propagated ±1σ; below-LOD values allowed"
@@ -5047,6 +5385,8 @@ def plot_titration_concentration_vs_measurement(
         ncol=1,
         borderaxespad=0.5,
     )
+    if concentration_display_mode != CONCENTRATION_DISPLAY_MODES[0]:
+        fig._swv_concentration_display_note = concentration_display_mode
     fig.tight_layout()
     return fig
 

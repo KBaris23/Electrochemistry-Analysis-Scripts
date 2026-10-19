@@ -35,6 +35,23 @@ def test_discovery_prunes_artifacts_in_legacy_nested_layout(tmp_path):
     assert viewer.discover_bo_session_folders(tmp_path) == [session]
 
 
+def test_nonrecursive_discovery_does_not_walk_large_raw_data_tree(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "raw" / "deep" / "measurements").mkdir(parents=True)
+
+    def fail_if_walked(*_args, **_kwargs):
+        raise AssertionError("bounded provenance lookup must not recurse")
+
+    monkeypatch.setattr(viewer.os, "walk", fail_if_walked)
+
+    assert viewer.discover_bo_session_folders(
+        tmp_path,
+        recursive_fallback=False,
+    ) == []
+
+
 def test_large_session_label_does_not_parse_complete_state(tmp_path, monkeypatch):
     session = tmp_path / "bo_sessions" / "large_simulation"
     session.mkdir(parents=True)

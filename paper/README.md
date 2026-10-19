@@ -67,12 +67,19 @@ changed, generate the preview again.
 
 Known working concentration spans include:
 
+- NP: 40-5120 uM in `np_titration_aug13_all_channels` (all ten channels, with
+  Channels 5 and 3 preselected) or the smaller
+  `np_titration_aug13_high_quality`; for an 80-5120 uM
+  presentation use grouped measurements **21-160**, retaining the immediately
+  preceding buffer at measurements 21-30;
 - Planar/Kana: 20-5120 uM;
 - Amp0: 1000-64000 uM;
 - Vancomycin: 0.2-51.2 uM.
 
-Use the labels stored in the NP session for the NP span rather than copying a
-range from another experiment.
+The preferred high-range NP rows are Channel 5 optimized (signal-off; strongest
+5120 uM recovery) and Channel 3 optimized (signal-on; cleanest single-peak SWVs).
+Use the labels stored in the NP session rather than copying a range from another
+experiment.
 
 The response plateaus/error bars can be displayed as unconnected dashed black
 summaries. Titration vline labels can be centered in their steps with the final
@@ -100,6 +107,13 @@ chosen external results folder, not inside this repository.
 - A parameter-sweep optimum and a real-BO optimum need not be identical. Report
   both observed parameter triplets and scores; do not imply agreement unless the
   data demonstrate it.
+- Compare optimization efficiency at a matched measurement budget. A best-of-200
+  sweep value is not a fair direct benchmark for a 50-observation BO run; retain
+  the full-sweep extrema in the audit data, but use equal-budget values for the
+  main performance claim.
+- Q values are comparable only when both the score definition and SWV peak
+  extraction settings match. Rescoring saved peak metrics alone does not
+  harmonize different peak finders.
 - Cherry-picked channels should still represent the observed distribution. Keep
   enough channels to show repeatability, electrode differences and meaningful
   spread, while documenting any excluded corner/extreme candidates.
