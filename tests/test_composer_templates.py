@@ -41,6 +41,44 @@ def test_builtin_templates_are_publication_styled_and_consistent(builder):
     assert all(f"bo_composer_kind_{index}" in state for index in range(count))
 
 
+def test_chronological_stack_uses_frozen_export_exclusions(monkeypatch):
+    from matplotlib.figure import Figure
+
+    selected = {}
+
+    def representative(observations, channels, maximum):
+        selected['iterations'] = [row['iteration'] for row in observations]
+        return []
+
+    def empty_stack(*args, **kwargs):
+        figure = Figure()
+        figure.subplots()
+        return figure, []
+
+    monkeypatch.setattr(
+        viewer, '_composer_trace_observations_for_channels', representative
+    )
+    monkeypatch.setattr(viewer, '_composer_trace_entries', lambda *args: [])
+    monkeypatch.setattr(viewer, '_plot_chronological_swv_stack', empty_stack)
+
+    figure = viewer._composer_build_chronological_swv(
+        {
+            'kind': 'Chronological SWV stack',
+            'channels': ['1_max'],
+            'corrected': True,
+            'excluded_iterations': [2],
+        },
+        {'config': {}},
+        [
+            {'iteration': 1, 'optimization_direction': 'maximize'},
+            {'iteration': 2, 'optimization_direction': 'maximize'},
+        ],
+        {},
+    )
+    assert selected['iterations'] == [1]
+    figure.clear()
+
+
 def test_titration_templates_use_captured_plots_and_expected_layout():
     main = viewer._composer_titration_main_preset()["config"]["state"]
     assert main["bo_composer_layout"] == "Manual"

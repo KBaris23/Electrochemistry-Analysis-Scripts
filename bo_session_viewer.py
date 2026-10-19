@@ -34887,6 +34887,23 @@ def _composer_build_chronological_swv(
         fig, ax = plt.subplots(figsize=(8, 4.8))
         _composer_error_panel(ax, "Choose at least one channel.")
         return fig
+    # Type 2 waveform exclusions always belong to the chronological stack.
+    # With stack-only scope enabled, other linked panels retain the complete
+    # recorded history while this builder still omits the selected iterations.
+    if "excluded_iterations" in spec:
+        excluded_iterations = spec.get("excluded_iterations") or []
+    elif st.session_state.get("bo_composer_validation_linked"):
+        # Compatibility for older saved panel specifications. New renders
+        # freeze the list into the spec so deferred export workers do not
+        # depend on live Streamlit widget state.
+        excluded_iterations = st.session_state.get(
+            "bo_composer_validation_excluded_iterations", []
+        )
+    else:
+        excluded_iterations = []
+    observations = _composer_filter_excluded_observations(
+        observations, excluded_iterations
+    )
     show_all_successful = bool(spec.get("show_all_successful", True))
     representative_observations = _composer_trace_observations_for_channels(
         observations,
@@ -36408,6 +36425,48 @@ def _composer_type2_swv_anomalies(session, observations, state) -> dict[int, lis
     return _anomalous_swv_iterations(loaded)
 
 
+def _composer_excluded_iteration_set(values: Sequence[Any]) -> set[int]:
+    """Normalize saved Type 2 exclusions without rejecting other records."""
+    excluded: set[int] = set()
+    for value in values or ():
+        try:
+            excluded.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return excluded
+
+
+def _composer_filter_excluded_observations(
+    observations: Sequence[Mapping[str, Any]],
+    excluded: Sequence[Any],
+) -> list[dict]:
+    """Return observations outside the selected Type 2 iteration exclusions."""
+    excluded_set = _composer_excluded_iteration_set(excluded)
+    if not excluded_set:
+        return list(observations)
+    kept = []
+    for item in observations:
+        try:
+            iteration = int(item.get("iteration", -1))
+        except (TypeError, ValueError):
+            iteration = -1
+        if iteration not in excluded_set:
+            kept.append(item)
+    return kept
+
+
+def _composer_filter_excluded_history(
+    history: pd.DataFrame,
+    excluded: Sequence[Any],
+) -> pd.DataFrame:
+    """Return history outside the selected Type 2 iteration exclusions."""
+    excluded_set = _composer_excluded_iteration_set(excluded)
+    if not excluded_set or "iteration" not in history:
+        return history
+    numeric_iteration = pd.to_numeric(history["iteration"], errors="coerce")
+    return history.loc[~numeric_iteration.isin(excluded_set)].copy()
+
+
 def _composer_validation_scope(session, observations, history):
     state = st.session_state
     # Recognize existing saved Type 2 layouts as well as new presets.
@@ -36516,19 +36575,34 @@ def _composer_validation_scope(session, observations, history):
             "deleting or changing the recorded BO session. Clear the selection to restore them."
         ),
     )
+    stack_only_key = "bo_composer_validation_exclusions_stack_only"
+    state.setdefault(stack_only_key, False)
+    stack_only = st.checkbox(
+        "Limit exclusions to the chronological SWV stack",
+        key=stack_only_key,
+        help=(
+            "Keeps the selected iterations out of the chronological SWV stack, "
+            "but retains their recorded values in the Q plot, cube, measured maps, "
+            "parallel coordinates, and other linked Type 2 panels."
+        ),
+    )
     if excluded:
-        excluded_set = set(map(int, excluded))
-        observations = [
-            item for item in observations
-            if int(item.get("iteration", -1)) not in excluded_set
-        ]
-        if "iteration" in history:
-            numeric_iteration = pd.to_numeric(history["iteration"], errors="coerce")
-            history = history.loc[~numeric_iteration.isin(excluded_set)].copy()
-        st.caption(
-            f"Type 2 excludes {len(excluded_set)} selected outlier iteration(s) "
-            "from this figure only; source data are unchanged."
-        )
+        excluded_set = _composer_excluded_iteration_set(excluded)
+        if stack_only:
+            st.caption(
+                f"The chronological SWV stack excludes {len(excluded_set)} selected "
+                "outlier iteration(s); all other Type 2 panels retain the recorded points. "
+                "Source data are unchanged."
+            )
+        else:
+            observations = _composer_filter_excluded_observations(
+                observations, excluded_set
+            )
+            history = _composer_filter_excluded_history(history, excluded_set)
+            st.caption(
+                f"Type 2 excludes {len(excluded_set)} selected outlier iteration(s) "
+                "from every linked panel in this figure only; source data are unchanged."
+            )
     return observations, history
 
 
@@ -36664,7 +36738,13 @@ def _composer_source_controls(index, source_spec, session, history, observations
     elif kind == "Global trend":
         columns = _numeric_columns(history)
         draft["metric"] = st.selectbox("Metric", columns, index=columns.index(draft["metric"]) if draft["metric"] in columns else 0)
-        draft["running_mean_window"] = st.number_input("Running mean window", 0, 50, int(draft.get("running_mean_window",0)))
+        draft["running_mean_window"] = st.number_input(
+            "Running mean window (0 disables)",
+            0,
+            50,
+            int(draft.get("running_mean_window", 0)),
+            help="Set to 0 to show only the recorded Q values.",
+        )
     elif kind in ("Buffer/target trend", "Chronological buffer/target trend"):
         metrics = list(PAIRED_TREND_METRICS)
         draft["metric"] = st.selectbox("Metric", metrics, index=metrics.index(draft["metric"]))
@@ -37658,6 +37738,20 @@ def _render_figure_composer(
                 "rect": rect,
                 "optimization_direction": st.session_state.get("bo_composer_direction", ""),
             }
+            if (
+                kind == "Chronological SWV stack"
+                and st.session_state.get("bo_composer_validation_linked")
+            ):
+                # Export rendering runs from an immutable snapshot and must
+                # not read live widget state. Store the stack exclusions in
+                # the panel recipe so preview and every export format match.
+                spec["excluded_iterations"] = sorted(
+                    _composer_excluded_iteration_set(
+                        st.session_state.get(
+                            "bo_composer_validation_excluded_iterations", []
+                        )
+                    )
+                )
             format_tab, axes_tab = st.tabs(["Title & Text Sizes", "Axis Names & Spacing"])
             with format_tab:
                 if kind == 'SWV trace overlay':

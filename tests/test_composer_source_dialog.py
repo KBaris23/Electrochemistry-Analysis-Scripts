@@ -65,6 +65,40 @@ st.session_state['test_q_values'] = history.Q_run.tolist()
     assert app.session_state['bo_composer_paired_channels_2'] == ['6']
 
 
+def test_validation_exclusions_can_be_limited_to_chronological_stack(monkeypatch):
+    monkeypatch.setattr(viewer, '_real_data_channels', lambda obs: ['1_max'])
+    app = AppTest.from_string('''
+import streamlit as st
+import pandas as pd
+import bo_session_viewer as v
+st.session_state.setdefault('bo_composer_count', 1)
+st.session_state.setdefault('bo_composer_validation_linked', True)
+st.session_state.setdefault('bo_composer_kind_0', 'Chronological SWV stack')
+st.session_state.setdefault('bo_composer_validation_excluded_iterations', [2])
+st.session_state.setdefault('bo_composer_validation_exclusions_stack_only', True)
+observations = [
+    dict(iteration=1, group_id=1, optimization_direction='maximize'),
+    dict(iteration=2, group_id=1, optimization_direction='maximize'),
+]
+frame = pd.DataFrame(observations)
+obs, history = v._composer_validation_scope({}, observations, frame)
+stack_obs = v._composer_filter_excluded_observations(
+    obs, st.session_state['bo_composer_validation_excluded_iterations'])
+st.session_state['test_panel_iterations'] = history.iteration.tolist()
+st.session_state['test_stack_iterations'] = [row['iteration'] for row in stack_obs]
+''').run()
+    assert not app.exception
+    assert app.session_state['test_panel_iterations'] == [1, 2]
+    assert app.session_state['test_stack_iterations'] == [1]
+
+    app.checkbox(
+        key='bo_composer_validation_exclusions_stack_only'
+    ).uncheck().run()
+    assert not app.exception
+    assert app.session_state['test_panel_iterations'] == [1]
+    assert app.session_state['test_stack_iterations'] == [1]
+
+
 def test_panel_channel_can_switch_group_and_direction_without_unlocking(monkeypatch):
     monkeypatch.setattr(viewer, '_real_data_channels',
                         lambda obs: sorted({o['channel'] for o in obs}))
