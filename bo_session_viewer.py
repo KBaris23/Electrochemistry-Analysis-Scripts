@@ -25027,16 +25027,16 @@ def _plot_perimeter_width() -> float:
 
 def _plot_perimeter_color() -> str:
     value = str(
-        _plot_setting("bo_plot_perimeter_color", "#222222")
-        or "#222222"
+        _plot_setting("bo_plot_perimeter_color", "#000000")
+        or "#000000"
     ).strip()
     if not is_color_like(value):
-        return "#222222"
+        return "#000000"
     try:
         # Plotly axis line colors do not accept Matplotlib's #RRGGBBAA form.
         return to_hex(value, keep_alpha=False)
     except ValueError:
-        return "#222222"
+        return "#000000"
 
 
 def _plot_margin_px() -> int:
@@ -27043,7 +27043,7 @@ def _apply_surrogate_map_settings(fig, settings: Mapping[str, Any]) -> None:
                     axis.xaxis.label.set_text(label)
                 else:
                     axis.yaxis.label.set_text(label)
-            axis.tick_params(labelsize=settings["colorbar_size"])
+            axis.tick_params(which='both', labelsize=settings["colorbar_size"], labelcolor='#000000')
             axis.xaxis.label.set_fontsize(settings["colorbar_size"])
             axis.yaxis.label.set_fontsize(settings["colorbar_size"])
             axis.title.set_fontsize(settings["colorbar_size"])
@@ -27054,7 +27054,7 @@ def _apply_surrogate_map_settings(fig, settings: Mapping[str, Any]) -> None:
             if settings[name]:
                 artist.set_text(settings[name])
             artist.set_fontsize(settings[f"{name}_size"])
-        axis.tick_params(labelsize=settings["tick_size"])
+        axis.tick_params(which='both', labelsize=settings["tick_size"], labelcolor='#000000')
         axis.grid(settings["show_grid"])
         legend = axis.get_legend()
         if legend is not None:
@@ -28063,9 +28063,9 @@ def _apply_individual_plotly_style(
     tick_size = float(settings["tick_size"])
     margin = int(settings["margin"])
     perimeter_width = float(settings["perimeter_width"])
-    perimeter_color = str(settings["perimeter_color"] or "#222222")
+    perimeter_color = str(settings["perimeter_color"] or "#000000")
     if not is_color_like(perimeter_color):
-        perimeter_color = "#222222"
+        perimeter_color = "#000000"
     legend_side = str(settings.get("legend_side") or "Right")
     legend_on_left = legend_side == "Left"
     legend_text_size = float(
@@ -28655,7 +28655,7 @@ def _history_plotly_to_matplotlib(
         )
         perimeter_color = _matplotlib_plotly_color(
             settings["perimeter_color"]
-        ) or "#222222"
+        ) or "#000000"
         for spine in axis.spines.values():
             spine.set_visible(float(settings["perimeter_width"]) > 0)
             spine.set_linewidth(float(settings["perimeter_width"]))
@@ -28856,7 +28856,7 @@ def _queue_plot_for_composer(
         raise ValueError("Select an existing Composer panel before replacing it.")
     if replace_index is None and current_panel_count + len(pending) >= 24:
         raise ValueError("Figure Composer already has 24 panels queued or in use.")
-    reserved_index = replace_index if replace_index is not None else len(pending)
+    reserved_index = replace_index if replace_index is not None else current_panel_count + len(pending)
     reserved_label = chr(ord("A") + reserved_index)
     captured_png = (
         bytes(png_bytes)
@@ -29081,7 +29081,7 @@ def _render_downloadable_plotly(
             "marker_scale": 1.0,
             "margin": 50,
             "perimeter_width": 0.8,
-            "perimeter_color": "#222222",
+            "perimeter_color": "#000000",
             "show_legend": (
                 bool(fig.layout.showlegend)
                 if fig.layout.showlegend is not None
@@ -31526,6 +31526,7 @@ def _render_app_scrollbar_style() -> None:
 
 
 _COMPOSER_STATE_EXCLUSIONS = (
+    "bo_composer_image_upload_",
     "bo_composer_editor_",
     "bo_composer_pending_source_edit",
     "bo_composer_source_draft",
@@ -31544,6 +31545,7 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_captured_plots",
     "bo_composer_pending_captures",
     "bo_composer_pending_delete_indices",
+    "bo_composer_pending_panel_state",
     "bo_composer_capture_flash",
     "bo_composer_capture_preview_",
     "bo_composer_add_flash_",
@@ -31752,7 +31754,7 @@ def _composer_apply_config(config: Mapping[str, Any]) -> None:
 
 
 def _composer_apply_pending_captures() -> tuple[int, int]:
-    """Insert queued snapshots as visible leading Composer panels."""
+    """Append queued snapshots without changing existing panels or their letters."""
     pending_key = "bo_composer_pending_captures"
     pending = st.session_state.pop(pending_key, [])
     registry = st.session_state.get("bo_composer_captured_plots")
@@ -31769,38 +31771,11 @@ def _composer_apply_pending_captures() -> tuple[int, int]:
     ]
     capacity = max(0, 24 - panel_count)
     accepted = valid_pending[:capacity]
-    shift = len(accepted)
-    if shift:
-        panel_state: list[tuple[str, int, Any]] = []
-        for state_key in list(st.session_state):
-            if any(
-                str(state_key).startswith(prefix)
-                for prefix in _COMPOSER_STATE_EXCLUSIONS
-            ):
-                continue
-            match = re.fullmatch(r"(bo_composer_.+_)(\d+)", str(state_key))
-            if match is None:
-                continue
-            old_index = int(match.group(2))
-            if old_index >= panel_count:
-                continue
-            panel_state.append((match.group(1), old_index, st.session_state[state_key]))
-            del st.session_state[state_key]
-        for prefix, old_index, value in sorted(
-            panel_state,
-            key=lambda item: item[1],
-            reverse=True,
-        ):
-            new_index = old_index + shift
-            if prefix == "bo_composer_label_" and value == chr(ord("A") + old_index):
-                value = chr(ord("A") + new_index)
-            elif prefix == "bo_composer_zoom_from_" and value not in {None, "None"}:
-                source_index = ord(str(value)) - ord("A")
-                if 0 <= source_index < 24 - shift:
-                    value = chr(ord("A") + source_index + shift)
-            st.session_state[f"{prefix}{new_index}"] = value
     added = 0
-    for index, capture_id in enumerate(accepted):
+    st.session_state["bo_composer_count"] = panel_count
+    for capture_id in accepted:
+        index = panel_count + added
+        _composer_add_panel()
         capture = registry.get(str(capture_id))
         st.session_state[f"bo_composer_kind_{index}"] = "Captured plot"
         st.session_state[f"bo_composer_capture_id_{index}"] = str(capture_id)
@@ -31814,9 +31789,32 @@ def _composer_apply_pending_captures() -> tuple[int, int]:
                 )
         added += 1
     panel_count += added
-    st.session_state["bo_composer_count"] = max(panel_count, 1)
+    st.session_state["bo_composer_count"] = max(panel_count, 0)
     skipped = max(0, len(pending) - added)
     return added, skipped
+
+
+def _composer_add_panel() -> None:
+    """Append an image panel without replacing content or rearranging existing panels."""
+    count = int(st.session_state.get("bo_composer_count", 4))
+    if count >= 24:
+        return
+    layout = st.session_state.get("bo_composer_layout", "Manual")
+    rects = (_composer_manual_rects(count) if layout == "Manual"
+             else _composer_layout_rects(count, layout))
+    # A previously removed panel may have left widget values at this index.
+    for key in list(st.session_state):
+        if re.fullmatch(rf"bo_composer_.+_{count}", str(key)):
+            del st.session_state[key]
+    new_rect = _composer_layout_rects(count + 1, "Grid")[-1]
+    for index, rect in enumerate([*rects, new_rect]):
+        for field, value in zip(("left", "bottom", "width", "height"), rect):
+            st.session_state[f"bo_composer_{field}_{index}"] = value
+    st.session_state[f"bo_composer_kind_{count}"] = "Image file"
+    st.session_state[f"bo_composer_image_path_{count}"] = ""
+    st.session_state["bo_composer_count"] = count + 1
+    st.session_state["bo_composer_layout"] = "Manual"
+    st.session_state["bo_composer_active_panel"] = count
 
 
 def _composer_swap_panels(
@@ -31888,7 +31886,6 @@ def _composer_delete_panels(
         return panel_count
 
     remaining = [index for index in range(panel_count) if index not in deleted]
-    reset_to_empty_panel = not remaining
     indexed_state: list[tuple[str, int, Any]] = []
     for state_key in list(st.session_state):
         state_key = str(state_key)
@@ -31933,7 +31930,9 @@ def _composer_delete_panels(
             )
         st.session_state[f"{prefix}{new_index}"] = value
 
-    new_count = 1 if reset_to_empty_panel else len(remaining)
+    active = st.session_state.get("bo_composer_active_panel")
+    st.session_state["bo_composer_active_panel"] = old_to_new.get(active)
+    new_count = len(remaining)
     st.session_state["bo_composer_count"] = new_count
     st.session_state["bo_composer_auto_render"] = True
     return new_count
@@ -31941,6 +31940,7 @@ def _composer_delete_panels(
 
 def _composer_apply_pending_panel_deletions() -> int:
     """Apply editor deletions before any Composer widgets are instantiated."""
+    _composer_restore_pending_panel_state()
     pending_key = "bo_composer_pending_delete_indices"
     pending = st.session_state.pop(pending_key, [])
     if not isinstance(pending, list) or not pending:
@@ -31957,6 +31957,20 @@ def _composer_apply_pending_panel_deletions() -> int:
     })
     _composer_delete_panels(pending, panel_count)
     return valid_deleted_count
+
+
+def _composer_stage_panel_state(panel_count: int) -> None:
+    """Keep widget values alive across an early rerun before panels are rendered."""
+    st.session_state["bo_composer_pending_panel_state"] = {
+        key: copy.deepcopy(value)
+        for key, value in _composer_widget_state(panel_count).items()
+        if re.fullmatch(r"bo_composer_.+_\d+", key)
+    }
+
+
+def _composer_restore_pending_panel_state() -> None:
+    for key, value in st.session_state.pop("bo_composer_pending_panel_state", {}).items():
+        st.session_state[key] = value
 
 
 def _composer_open_source(metadata: Mapping[str, Any]) -> None:
@@ -32970,8 +32984,38 @@ def _composer_manual_rects(panel_count: int) -> list[tuple[float, float, float, 
             st.session_state.get(f"bo_composer_width_{index}", default[2]),
             st.session_state.get(f"bo_composer_height_{index}", default[3]),
         )
-        rects.append(_composer_normalize_rect(values) or default)
+        native = _composer_native_image_size(index)
+        if native:
+            rects.append(_composer_native_image_rect(values, native))
+        else:
+            rects.append(_composer_normalize_rect(values) or default)
     return rects
+
+
+def _composer_native_image_size(index: int) -> tuple[int, int] | None:
+    from PIL import Image
+    if st.session_state.get(f"bo_composer_kind_{index}") != "Image file":
+        return None
+    data = st.session_state.get(f"bo_composer_image_data_{index}")
+    if not data:
+        return None
+    with Image.open(BytesIO(base64.b64decode(data))) as image:
+        return image.size
+
+
+def _composer_native_image_rect(rect, pixels, canvas=None, dpi=None):
+    """Keep one source pixel per output PNG pixel, without rounding the size."""
+    canvas = canvas or COMPOSER_CANVAS_SIZES.get(
+        st.session_state.get("bo_composer_aspect"), (12, 9))
+    dpi = float(dpi or st.session_state.get("bo_composer_dpi", 220))
+    width, height = pixels[0] / (canvas[0] * dpi), pixels[1] / (canvas[1] * dpi)
+    if width > 1 or height > 1:
+        raise ValueError(
+            f"Image is {pixels[0]} × {pixels[1]} pixels and does not fit at native size. "
+            "Choose a larger Canvas or increase PNG DPI."
+        )
+    return (max(0., min(float(rect[0]), 1 - width)),
+            max(0., min(float(rect[1]), 1 - height)), width, height)
 
 
 def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
@@ -32991,6 +33035,7 @@ def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
         return False
     deleted_indices = result.get("deleted_indices")
     if isinstance(deleted_indices, list) and deleted_indices:
+        _composer_stage_panel_state(panel_count)
         st.session_state[seen_key] = event_id
         st.session_state["bo_composer_pending_delete_indices"] = deleted_indices
         return True
@@ -33001,6 +33046,9 @@ def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
     if any(rect is None for rect in normalized):
         return False
     for index, rect in enumerate(normalized):
+        native = _composer_native_image_size(index)
+        if native:
+            rect = _composer_native_image_rect(rect, native)
         left, bottom, width, height = rect
         st.session_state[f"bo_composer_left_{index}"] = left
         st.session_state[f"bo_composer_bottom_{index}"] = bottom
@@ -33012,6 +33060,7 @@ def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
         st.session_state["bo_composer_active_panel"] = active_index
     duplicates = result.get("duplicate_indices")
     if isinstance(duplicates, list) and duplicates:
+        _composer_stage_panel_state(panel_count)
         st.session_state["bo_composer_pending_duplicates"] = [
             i for i in duplicates if isinstance(i, int) and 0 <= i < panel_count
         ][:max(0, 24 - panel_count)]
@@ -33055,6 +33104,9 @@ def _composer_draw_global(
     spec: dict | None = None,
 ) -> None:
     spec = spec or {}
+    if metric is None or metric not in history.columns:
+        _composer_error_panel(ax, "No BO metric selected. Choose a plot source with available data in Edit panel.")
+        return
     history = history.sort_values('iteration') if 'iteration' in history else history
     x, y = _composer_metric_series(history, metric)
     line_color = _plot_line_color_override() or "#1f77b4"
@@ -33761,6 +33813,158 @@ def _composer_scale_plotly_marks(fig: go.Figure, factor: float) -> None:
             line.width = scaled(width, line_factor)
 
 
+def _composer_font_weight(spec, role):
+    return {'Normal': 'normal', 'Medium': 'medium', 'Semibold': 'semibold', 'Bold': 'bold'}.get(
+        spec.get(f'{role}_weight', 'Keep original'))
+
+
+def _composer_apply_axis_font_weights(axis, spec):
+    """Apply independent weights and black tick labels without changing sizes."""
+    axis.tick_params(which='both', labelcolor='#000000')
+    for text in axis.findobj(Text):
+        text.set_color('#000000')
+        text.set_alpha(1.0)
+    def apply(texts, role):
+        weight = _composer_font_weight(spec, role)
+        if weight:
+            for text in texts:
+                text.set_fontweight(weight)
+    apply([axis.title, axis._left_title, axis._right_title], 'title')
+    for name in ('x', 'y', 'z'):
+        target = getattr(axis, name + 'axis', None)
+        if target is not None:
+            target.get_offset_text().set_color('#000000')
+            apply([target.label], 'axis_label')
+            apply([target.get_offset_text()], 'tick')
+            for tick in [*target.get_major_ticks(), *target.get_minor_ticks()]:
+                apply([tick.label1, tick.label2], 'tick')
+    legend = axis.get_legend()
+    if legend is not None:
+        apply([*legend.get_texts(), legend.get_title()], 'legend')
+    for text in axis.texts:
+        if getattr(text, '_bo_axis_tick', False):
+            text.set_color('#000000')
+            apply([text], 'tick')
+        elif getattr(text, '_bo_axis_label', False) or getattr(text, '_bo_axis_name', None):
+            apply([text], 'axis_label')
+
+
+def _composer_apply_plotly_font_weights(fig, spec):
+    def apply(font, role):
+        font.color = '#000000'
+        weight = _composer_font_weight(spec, role)
+        if weight and 'weight' in font._valid_props:
+            font.weight = {'normal': 400, 'medium': 500, 'semibold': 600, 'bold': 700}[weight]
+    apply(fig.layout.title.font, 'title')
+    apply(fig.layout.legend.font, 'legend')
+    apply(fig.layout.legend.title.font, 'legend')
+    for key in fig.layout.to_plotly_json():
+        if re.fullmatch(r'[xy]axis\d*', key):
+            axis = fig.layout[key]
+            axis.tickfont.color = '#000000'
+            apply(axis.title.font, 'axis_label')
+            apply(axis.tickfont, 'tick')
+        elif re.fullmatch(r'scene\d*', key):
+            for name in ('xaxis', 'yaxis', 'zaxis'):
+                axis = fig.layout[key][name]
+                axis.tickfont.color = '#000000'
+                apply(axis.title.font, 'axis_label')
+                apply(axis.tickfont, 'tick')
+    _composer_black_plotly_text(fig)
+
+
+def _composer_black_plotly_text(fig):
+    """Normalize font colors while leaving series, markers, and borders alone."""
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key.endswith('font') and isinstance(item, dict):
+                    item['color'] = '#000000'
+                if key == 'text' and isinstance(item, str):
+                    value[key] = re.sub(r'(?<![-\w])color\s*:\s*[^;"\'>]+',
+                                        'color: #000000', item, flags=re.I)
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    layout = fig.layout.to_plotly_json()
+    layout.setdefault('font', {})['color'] = '#000000'
+    visit(layout)
+    for annotation in layout.get('annotations', []):
+        annotation['opacity'] = 1.0
+    fig.update_layout(layout)
+    for trace in fig.data:
+        data = trace.to_plotly_json()
+        visit(data)
+        trace.update(data)
+
+
+def _composer_axis_label_size(spec, name, default=None):
+    """Shared size wins unless independent axis sizes are explicitly enabled."""
+    shared = spec.get('axis_label_size', default)
+    # Preserve rendering of old recipes until the UI migrates their mode.
+    if spec.get('individual_axis_sizes', True):
+        return spec.get(f'{name}_axis_size', shared)
+    return shared
+
+
+def _composer_tick_values(value):
+    """Parse explicit numeric tick positions without silently dropping bad input."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return []
+    tokens = re.split(r'[,;\s]+', value.strip()) if isinstance(value, str) else value
+    values = []
+    for token in tokens:
+        if token == '':
+            continue
+        number = _finite_float(token)
+        if number is None:
+            raise ValueError(f'Invalid tick value {token!r}. Enter finite numbers separated by commas.')
+        if number not in values:
+            values.append(number)
+    return values
+
+
+def _composer_plotly_tick_override(fig, name, axis_config, count, scene=None, reference=None, values=None):
+    """Use explicit numeric tick values so Plotly cannot vary the count with fonts."""
+    logarithmic = axis_config.get('type') == 'log'
+    explicit = _composer_tick_values(values)
+    if explicit:
+        if logarithmic and min(explicit) <= 0:
+            raise ValueError(f'{name.upper()} tick values must be positive on a logarithmic axis.')
+        return {'tickmode': 'array', 'tickvals': explicit, 'ticktext': None}
+    if not count:
+        return {}
+    bounds = axis_config.get('range')
+    if bounds is not None and len(bounds) == 2:
+        bounds = [_finite_float(value) for value in bounds]
+        if any(value is None for value in bounds):
+            return {}
+        if logarithmic:
+            bounds = np.power(10., bounds)
+    else:
+        values = []
+        for trace in fig.data:
+            if scene is not None:
+                if getattr(trace, 'scene', None) not in (scene, None if scene == 'scene' else scene):
+                    continue
+            elif getattr(trace, name + 'axis', None) not in (reference, None if reference == name else reference):
+                continue
+            raw = getattr(trace, name, None)
+            if raw is not None:
+                values.extend(value for value in (_finite_float(v) for v in np.asarray(raw).ravel())
+                              if value is not None and (not logarithmic or value > 0))
+        if not values:
+            return {}
+        bounds = [min(values), max(values)]
+    if bounds[0] == bounds[1]:
+        return {}
+    ticks = (np.geomspace(*bounds, count) if logarithmic else np.linspace(*bounds, count))
+    if count == 1:
+        ticks = [np.sqrt(bounds[0] * bounds[1]) if logarithmic else np.mean(bounds)]
+    return {'tickmode': 'array', 'tickvals': list(ticks), 'ticktext': None}
+
+
 def _composer_apply_plotly_text_size(
     fig: go.Figure,
     size: float,
@@ -33832,17 +34036,27 @@ def _composer_apply_plotly_text_size(
     for key in layout_json:
         if re.fullmatch(r'[xy]axis\d*', str(key)):
             name = str(key)[0]
-            title = {'font': {'size': float(typography.get(f'{name}_axis_size', label_size))}}
+            title = {'font': {'size': float(_composer_axis_label_size(typography, name, label_size))}}
             if typography.get(f'{name}_axis_title'):
                 title['text'] = typography[f'{name}_axis_title']
-            fig.update_layout(**{key: {'title': title}})
+            ticks = _composer_plotly_tick_override(
+                fig, name, layout_json[key], int(typography.get(f'{name}_tick_count', 0) or 0),
+                reference=key.replace('axis', ''),
+                values=typography.get(f'{name}_tick_values'),
+            )
+            fig.update_layout(**{key: {'title': title, **ticks}})
         elif re.fullmatch(r'scene\d*', str(key)):
             axes = {}
             for name in ('x', 'y', 'z'):
-                title = {'font': {'size': float(typography.get(f'{name}_axis_size', label_size)) * .77}}
+                title = {'font': {'size': float(_composer_axis_label_size(typography, name, label_size)) * .77}}
                 if typography.get(f'{name}_axis_title'):
                     title['text'] = typography[f'{name}_axis_title']
-                axes[name + 'axis'] = {'title': title}
+                ticks = _composer_plotly_tick_override(
+                    fig, name, layout_json[key].get(name + 'axis', {}),
+                    int(typography.get(f'{name}_tick_count', 0) or 0), scene=key,
+                    values=typography.get(f'{name}_tick_values'),
+                )
+                axes[name + 'axis'] = {'title': title, **ticks}
             fig.update_layout(**{key: axes})
     if _COMPOSER_JOURNAL_STYLE.get():
         # Journal panels carry no in-plot title (the caption describes them),
@@ -33918,6 +34132,7 @@ def _composer_apply_plotly_text_size(
                     text_size=text_size,
                     tick_text_size=tick_size,
                 )
+    _composer_apply_plotly_font_weights(fig, typography)
     return fig
 
 
@@ -33998,13 +34213,35 @@ def _composer_axis_overrides(axis, spec):
     """Apply labels to ordinary axes and the stack's projected annotations."""
     for name in ('x', 'y', 'z'):
         text = str(spec.get(f'{name}_axis_title', '')).strip()
-        size = spec.get(f'{name}_axis_size', spec.get('axis_label_size'))
+        size = _composer_axis_label_size(spec, name)
         target = getattr(axis, name + 'axis', None)
         if target is not None:
             if text:
                 target.label.set_text(text)
             if size is not None:
                 target.label.set_fontsize(float(size))
+            count = int(spec.get(f'{name}_tick_count', 0) or 0)
+            explicit = _composer_tick_values(spec.get(f'{name}_tick_values'))
+            if explicit and getattr(axis, f'get_{name}scale')() == 'log' and min(explicit) <= 0:
+                raise ValueError(f'{name.upper()} tick values must be positive on a logarithmic axis.')
+            if explicit or count > 0:
+                from matplotlib.ticker import FixedLocator, NullLocator
+                bounds = np.asarray(getattr(axis, f'get_{name}lim')(), dtype=float)
+                transform = target.get_transform()
+                transformed = transform.transform(bounds)
+                if explicit or np.isfinite(transformed).all():
+                    if explicit:
+                        positions = explicit
+                    else:
+                        positions = (np.linspace(*transformed, count) if count > 1
+                                     else np.asarray([np.mean(transformed)]))
+                        positions = transform.inverted().transform(positions)
+                    target.set_major_locator(FixedLocator(positions))
+                    target.set_minor_locator(NullLocator())
+                    if getattr(axis, f'get_{name}scale')() == 'log':
+                        from matplotlib.ticker import LogFormatterSciNotation
+                        target.set_major_formatter(LogFormatterSciNotation(
+                            labelOnlyBase=False, minor_thresholds=(np.inf, np.inf)))
         for artist in axis.texts:
             if getattr(artist, '_bo_axis_name', None) == name:
                 if text:
@@ -34071,6 +34308,11 @@ def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
                     axis.set_ylabel(
                         label.replace("SWV Measurement Number", "Measurement no.")
                     )
+
+    for axis in fig.axes:
+        _composer_apply_axis_font_weights(axis, typography)
+    if suptitle is not None and _composer_font_weight(typography, 'title'):
+        suptitle.set_fontweight(_composer_font_weight(typography, 'title'))
 
 
 def _composer_draw_embedded_figure(
@@ -34152,6 +34394,9 @@ def _composer_draw_embedded_figure(
                 forward=True,
             )
             buffer = BytesIO()
+            for text in panel_figure.findobj(Text):
+                text.set_color('#000000')
+                text.set_alpha(1.0)
             panel_figure.savefig(
                 buffer,
                 format="png",
@@ -34169,20 +34414,44 @@ def _composer_draw_embedded_figure(
         _composer_error_panel(ax, str(exc))
 
 
-def _composer_draw_image_file(ax, path_text: str) -> None:
+def _composer_image_uploaded(index: int) -> None:
+    """Store portable image content separately from the upload widget."""
+    from PIL import Image
+
+    upload = st.session_state.get(f"bo_composer_image_upload_{index}")
+    data = upload.getvalue() if upload is not None else b""
+    if data:
+        try:
+            with Image.open(BytesIO(data)) as image:
+                image.verify()
+        except Exception:
+            st.error("Could not read this image. Please choose a valid image file.")
+            return
+    st.session_state[f"bo_composer_image_data_{index}"] = (
+        base64.b64encode(data).decode("ascii") if data else ""
+    )
+
+
+def _composer_clear_uploaded_image(index: int) -> None:
+    st.session_state.pop(f"bo_composer_image_upload_{index}", None)
+    st.session_state[f"bo_composer_image_data_{index}"] = ""
+
+
+def _composer_draw_image_file(ax, path_text: str, image_data: str = "") -> None:
     from PIL import Image
 
     cleaned = str(path_text or "").strip().strip('"')
-    if not cleaned:
-        _composer_error_panel(ax, "Paste an image path.")
+    if not cleaned and not image_data:
+        _composer_error_panel(ax, "Upload an image or paste an image path.")
         return
     path = Path(cleaned).expanduser()
-    if not path.is_file():
+    if not image_data and not path.is_file():
         _composer_error_panel(ax, "Image file was not found.")
         return
     try:
-        with Image.open(path) as image:
-            ax.imshow(image.convert("RGB"))
+        source = BytesIO(base64.b64decode(image_data)) if image_data else path
+        with Image.open(source) as image:
+            ax.imshow(image.convert("RGBA"), interpolation="none")
         ax.set_axis_off()
     except Exception as exc:
         _composer_error_panel(ax, f"Could not open image: {exc}")
@@ -34295,7 +34564,7 @@ def _composer_formatted_capture_figure(
     line_scale = max(0.1, float(spec.get("capture_line_scale", 1.0)))
     marker_scale = max(0.1, float(spec.get("capture_marker_scale", 1.0)))
     spine_width = max(0.1, float(spec.get("capture_spine_width", 0.8)))
-    spine_color = str(spec.get("capture_spine_color", "#222222"))
+    spine_color = str(spec.get("capture_spine_color", "#000000"))
     show_vlines = bool(spec.get("capture_show_vlines", True))
     vline_width = max(0.1, float(spec.get("capture_vline_width", 1.0)))
     show_legend = bool(spec.get("capture_show_legend", True))
@@ -35673,6 +35942,11 @@ def _build_composer_figure_inner(
         panel_snapshots = []
         for index, spec in enumerate(specs):
             spec = dict(spec)
+            if spec.get("image_native_pixels"):
+                spec["rect"] = _composer_native_image_rect(
+                    spec["rect"], spec["image_native_pixels"], canvas_size,
+                    spec["image_native_dpi"],
+                )
             direction = str(spec.get("optimization_direction") or "").strip()
             if spec.get("custom_title") and "{direction}" in str(spec["custom_title"]):
                 spec["custom_title"] = str(spec["custom_title"]).replace(
@@ -35825,7 +36099,7 @@ def _build_composer_figure_inner(
                     spec.get("text_size", font_size),
                 )
             elif kind == "Image file":
-                _composer_draw_image_file(ax, spec.get("path", ""))
+                _composer_draw_image_file(ax, spec.get("path", ""), spec.get("image_data", ""))
             elif kind == "Captured plot":
                 _composer_draw_captured_plot(
                     fig,
@@ -35917,7 +36191,7 @@ def _build_composer_figure_inner(
                 ax.grid(False)
                 for spine in ax.spines.values():
                     spine.set_visible(True)
-                    spine.set_color("#222222")
+                    spine.set_color("#000000")
                     spine.set_linewidth(.8)
                 # Recreating the legend must retain the independently edited
                 # size, not silently replace it with Plot text minus one.
@@ -35926,7 +36200,7 @@ def _build_composer_figure_inner(
                 ax.set_title(getattr(ax, "_composer_slice_title", ""), fontsize=panel_text_size, pad=4)
                 for spine in ax.spines.values():
                     spine.set_visible(True)
-                    spine.set_color(spec.get("border_color") or "#222222")
+                    spine.set_color(spec.get("border_color") or "#000000")
                     spine.set_linewidth(1.25 if spec.get("border_color") else .6)
                 ax.tick_params(pad=2, length=2)
             if kind == "SWV trace overlay":
@@ -35961,6 +36235,7 @@ def _build_composer_figure_inner(
                 legend.set_loc(spec['legend_location'])
                 if spec.get('legend_custom_anchor'):
                     legend.set_bbox_to_anchor((spec.get('legend_x', 1.), spec.get('legend_y', 1.)), transform=ax.transAxes)
+            _composer_apply_axis_font_weights(ax, spec)
             if spec.get('hide_title'):
                 panel_header = ''
                 for location in ('left', 'center', 'right'):
@@ -35978,6 +36253,8 @@ def _build_composer_figure_inner(
                     ha="center",
                     va="bottom",
                 )
+                if _composer_font_weight(spec, 'title'):
+                    header_text.set_fontweight(_composer_font_weight(spec, 'title'))
                 if kind == "SWV trace overlay":
                     _composer_size_swv_title(
                         header_text, ax.get_window_extent().width * .90,
@@ -36084,7 +36361,8 @@ def _build_composer_figure_inner(
         if hasattr(cube, "_composer_cube_title"):
             _composer_cube_annotations(cube, cube.xaxis.label.get_fontsize())
     from core.composer_bounds import fit_panel_bounds
-    fit_panel_bounds(fig, panel_groups)
+    fit_panel_bounds(fig, [group for group, spec in zip(panel_groups, specs)
+                           if not spec.get("image_native_pixels")])
     # Bounds fitting can rescale a cube panel. Re-anchor paired scales only
     # after that final geometry pass so Q and Iteration retain a fixed small
     # screen-space gap at every Q-bar inward offset.
@@ -36115,6 +36393,9 @@ def _composer_figure_bytes(
     *,
     metadata_json: str | None = None,
 ) -> bytes:
+    for text in fig.findobj(Text):
+        text.set_color('#000000')
+        text.set_alpha(1.0)
     output = BytesIO()
     save_kwargs = {
         "format": fmt, "bbox_inches": "tight", "pad_inches": .08,
@@ -36140,22 +36421,24 @@ def _composer_supports_deferred_downloads():
     return 'deferred_file_id' in DownloadButton.DESCRIPTOR.fields_by_name
 
 
-def _composer_export_controls(exporter):
+def _composer_export_controls(exporter, key_prefix='bo_composer_exports', panel_label=None):
     """Downloads stay available without a preview; render on click only."""
     deferred = _composer_supports_deferred_downloads()
     for column, fmt, mime in zip(st.columns(4), ('png', 'pdf', 'svg', 'zip'),
                                   ('image/png', 'application/pdf', 'image/svg+xml', 'application/zip')):
         label = 'Export all (ZIP)' if fmt == 'zip' else f'Export {fmt.upper()}'
+        if panel_label:
+            label = f'Export panel {panel_label} ({fmt.upper()})'
         filename = f'{exporter.stem}.figure.zip' if fmt == 'zip' else f'{exporter.stem}.{fmt}'
         if deferred:
             column.download_button(label, data=partial(exporter.get, fmt), file_name=filename,
                                    mime=mime, on_click='ignore',
-                                   key=f'bo_composer_exports_download_{fmt}', use_container_width=True)
+                                   key=f'{key_prefix}_download_{fmt}', use_container_width=True)
         else:
             # Old Streamlit cannot generate download data lazily. The format
             # button still starts final rendering; show the download immediately
             # afterward, with no separate global final-render/preview gate.
-            if column.button(label, key=f'bo_composer_exports_prepare_{fmt}', use_container_width=True):
+            if column.button(label, key=f'{key_prefix}_prepare_{fmt}', use_container_width=True):
                 try:
                     with st.spinner(f'Preparing {label.lower()}...'):
                         exporter.get(fmt)
@@ -36164,10 +36447,61 @@ def _composer_export_controls(exporter):
             if fmt in exporter._files:
                 column.download_button('Download ZIP' if fmt == 'zip' else f'Download {fmt.upper()}',
                                        data=exporter.get(fmt), file_name=filename, mime=mime,
-                                       key=f'bo_composer_exports_download_{fmt}', use_container_width=True)
+                                       key=f'{key_prefix}_download_{fmt}', use_container_width=True)
     if not deferred:
         st.caption('This Streamlit version needs one extra Download click after preparation. No preview is required.')
     st.caption('Every PNG, PDF and SVG embeds the figure recipe. Export all includes all three formats plus figure-metadata.json. Source data remain in their original folders; metadata can contain local paths.')
+
+
+def _composer_render_panel_export(args, kwargs, captures, plot_settings, index):
+    """Keep the full composition's final geometry; only hide other panels."""
+    figure = _composer_render_export_snapshot(args, kwargs, captures, True, plot_settings)
+    group = figure._composer_panel_groups[index]
+    _rect, axes, texts, artists = group
+    for axis in figure.axes:
+        if axis not in axes:
+            axis.set_visible(False)
+    for text in figure.texts:
+        if text not in texts:
+            text.set_visible(False)
+    for artist in figure.artists:
+        if artist not in artists:
+            artist.set_visible(False)
+    # Do not refit or resize. Tight export removes unused canvas only.
+    figure._composer_panel_groups = [group]
+    return figure
+
+
+def _composer_panel_exporter(args, kwargs, config, captures, plot_settings, index, stem):
+    """Export one panel at its composed physical size, with a standalone recipe."""
+    from core.composer_exports import FigureExports
+    spec = copy.deepcopy(args[6][index])
+    letter = chr(65 + index)
+    spec.setdefault('label', letter)
+    spec.pop('zoom_from', None)
+    panel_state = {}
+    for key, value in config.get('state', {}).items():
+        match = re.fullmatch(r'(bo_composer_.+_)(\d+)', key)
+        if match:
+            if int(match.group(2)) == index:
+                panel_state[f'{match.group(1)}0'] = copy.deepcopy(value)
+        else:
+            panel_state[key] = copy.deepcopy(value)
+    panel_state.update(bo_composer_count=1, bo_composer_title='',
+                       bo_composer_label_0=spec['label'], bo_composer_zoom_from_0='None',
+                       bo_composer_layout='Manual')
+    for field, value in zip(('left', 'bottom', 'width', 'height'), spec['rect']):
+        panel_state[f'bo_composer_{field}_0'] = value
+    panel_config = {**copy.deepcopy(config), 'state': panel_state, 'panels': [spec]}
+    metadata = _composer_metadata(args[0], panel_config, preset_name=f'Panel {letter}')
+    metadata['exported_panel'] = letter
+    metadata['panel_scale'] = 'Full composition geometry; cropped without resizing'
+    metadata['plot_settings'] = copy.deepcopy(plot_settings)
+    return FigureExports(
+        partial(_composer_render_panel_export, args, copy.deepcopy(kwargs),
+                copy.deepcopy(captures), copy.deepcopy(plot_settings), index),
+        _composer_figure_bytes, metadata, args[12], f'{stem}_panel_{letter}',
+    )
 
 
 def _composer_export_source_snapshot(session, history, observations, observation, analysis, versions):
@@ -37044,6 +37378,7 @@ def _render_figure_composer(
     trace_analysis: dict,
     paired_objective: bool,
 ) -> None:
+    _composer_restore_pending_panel_state()
     editor_root = str(session.get('root', ''))
     if st.session_state.get('bo_composer_editor_root') != editor_root:
         for key in list(st.session_state):
@@ -37138,14 +37473,14 @@ def _render_figure_composer(
     if added_captures:
         added_labels = ", ".join(
             f"Figure {chr(ord('A') + index)}"
-            for index in range(added_captures)
+            for index in range(int(st.session_state["bo_composer_count"]) - added_captures, int(st.session_state["bo_composer_count"]))
         )
         st.success(
-            f"{added_labels} added at the top of the Composer. "
-            "Existing panels were shifted down."
+            f"{added_labels} added to the Composer. Existing panels were preserved."
         )
         captures = st.session_state.get("bo_composer_captured_plots")
-        first_capture_id = st.session_state.get("bo_composer_capture_id_0")
+        first_added_index = int(st.session_state["bo_composer_count"]) - added_captures
+        first_capture_id = st.session_state.get(f"bo_composer_capture_id_{first_added_index}")
         first_capture = (
             captures.get(str(first_capture_id))
             if isinstance(captures, Mapping)
@@ -37158,7 +37493,7 @@ def _render_figure_composer(
             st.image(
                 first_capture["png_bytes"],
                 caption=(
-                    "Figure A preview · "
+                    f"Figure {chr(65 + first_added_index)} preview · "
                     f"{first_capture.get('label') or 'Captured plot'}"
                 ),
                 width=520,
@@ -37398,7 +37733,7 @@ def _render_figure_composer(
             "The presentation canvases are larger and get scaled down in a paper."
         ),
     )
-    panel_count = int(c2.number_input("Panels", min_value=1, max_value=24, value=4, step=1, key="bo_composer_count"))
+    panel_count = int(c2.number_input("Panels", min_value=0, max_value=24, value=4, step=1, key="bo_composer_count"))
     preset = c3.selectbox("Layout", ["Manual", "Grid", "Main left + stack", "Top wide + grid"], key="bo_composer_layout")
     dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25, key="bo_composer_dpi"))
     c5, c6, c7 = st.columns(3)
@@ -37594,10 +37929,25 @@ def _render_figure_composer(
             st.session_state.setdefault(f"bo_composer_real_show_points_{index}", False)
             st.session_state.setdefault(f"bo_composer_real_show_contours_{index}", True)
 
+    native_image_sizes = [_composer_native_image_size(i) for i in range(panel_count)]
+    try:
+        for i, pixels in enumerate(native_image_sizes):
+            if pixels:
+                native_rect = _composer_native_image_rect(
+                    (st.session_state.get(f"bo_composer_left_{i}", .07),
+                     st.session_state.get(f"bo_composer_bottom_{i}", .1), 0, 0),
+                    pixels, COMPOSER_CANVAS_SIZES[aspect], dpi,
+                )
+                for field, value in zip(("left", "bottom", "width", "height"), native_rect):
+                    st.session_state[f"bo_composer_{field}_{i}"] = value
+    except ValueError as exc:
+        st.error(str(exc))
+        return
     if preset == "Manual":
         manual_rects = _composer_manual_rects(panel_count)
         editor_result = _figure_layout_editor(
             rects=[list(rect) for rect in manual_rects],
+            locked_sizes=[bool(size) for size in native_image_sizes],
             labels=[chr(ord("A") + index) for index in range(panel_count)],
             aspect=aspect,
             key="bo_composer_layout_editor",
@@ -37638,6 +37988,11 @@ def _render_figure_composer(
             "The selected panel opens below; use Expand all only for bulk review."
         ),
     )
+    panel_nav.button(
+        "Add panel", key="bo_composer_add_panel", on_click=_composer_add_panel,
+        disabled=panel_count >= 24,
+        help="Add a new image panel and open its settings. Existing plots and positions are preserved; drag the new panel into place on the canvas.",
+    )
     expand_all_panels = panel_nav_help.checkbox(
         "Expand all panel settings",
         value=False,
@@ -37650,6 +38005,7 @@ def _render_figure_composer(
     )
     editor_tools = None
     specs = []
+    tick_value_errors = []
     for index in range(panel_count):
         default_rect = rects[index] if rects else (.07, .10, .40, .35)
         with st.expander(
@@ -37723,11 +38079,13 @@ def _render_figure_composer(
                 pos_cols = st.columns(4)
                 left = pos_cols[0].number_input("Left", 0.0, .95, float(default_rect[0]), .01, format="%.3f", key=f"bo_composer_left_{index}")
                 bottom = pos_cols[1].number_input("Bottom", 0.0, .95, float(default_rect[1]), .01, format="%.3f", key=f"bo_composer_bottom_{index}")
-                width = pos_cols[2].number_input("Width", .05, 1.0, float(default_rect[2]), .01, format="%.3f", key=f"bo_composer_width_{index}")
-                height = pos_cols[3].number_input("Height", .05, 1.0, float(default_rect[3]), .01, format="%.3f", key=f"bo_composer_height_{index}")
+                width = pos_cols[2].number_input("Width", .000001 if native_image_sizes[index] else .05, 1.0, float(default_rect[2]), .01, format="%.3f", key=f"bo_composer_width_{index}", disabled=bool(native_image_sizes[index]))
+                height = pos_cols[3].number_input("Height", .000001 if native_image_sizes[index] else .05, 1.0, float(default_rect[3]), .01, format="%.3f", key=f"bo_composer_height_{index}", disabled=bool(native_image_sizes[index]))
                 rect = (left, bottom, min(width, 1 - left), min(height, 1 - bottom))
             else:
                 rect = default_rect
+            if native_image_sizes[index]:
+                rect = _composer_native_image_rect(rect, native_image_sizes[index], COMPOSER_CANVAS_SIZES[aspect], dpi)
             spec = {
                 "kind": kind,
                 "label": label,
@@ -37738,6 +38096,10 @@ def _render_figure_composer(
                 "rect": rect,
                 "optimization_direction": st.session_state.get("bo_composer_direction", ""),
             }
+            if native_image_sizes[index]:
+                spec["image_native_pixels"] = native_image_sizes[index]
+                spec["image_native_dpi"] = dpi
+                st.caption(f"Image size locked: {native_image_sizes[index][0]} × {native_image_sizes[index][1]} pixels at {dpi} PNG DPI. Move the panel to position it; preview is scaled to fit.")
             if (
                 kind == "Chronological SWV stack"
                 and st.session_state.get("bo_composer_validation_linked")
@@ -37778,6 +38140,17 @@ def _render_figure_composer(
                     key=f"bo_composer_custom_title_{index}",
                     help="Leave blank to use the automatic title. Use {direction} to insert the selected Maximize/Minimize direction, or type any wording you prefer.",
                 ).strip()
+                axis_mode_key = f'bo_composer_individual_axis_sizes_{index}'
+                if axis_mode_key not in st.session_state:
+                    shared_size = float(st.session_state.get(f'bo_composer_axis_label_size_{index}', panel_text_size))
+                    st.session_state[axis_mode_key] = any(
+                        float(st.session_state.get(f'bo_composer_{name}_axis_size_{index}', shared_size)) != shared_size
+                        for name in ('x', 'y', 'z')
+                    )
+                spec['individual_axis_sizes'] = st.checkbox(
+                    'Use separate X/Y/Z label sizes', key=axis_mode_key,
+                    help='Off: Axis-label pt controls every axis label. On: the individual sizes below replace it.',
+                )
                 type_cols = st.columns(4)
                 spec["title_size"] = float(type_cols[0].number_input(
                     "Title pt", 4.0, 40.0, float(panel_text_size * 1.2), .5,
@@ -37792,6 +38165,8 @@ def _render_figure_composer(
                 spec["axis_label_size"] = float(type_cols[1].number_input(
                     "Axis-label pt", 4.0, 40.0, float(panel_text_size), .5,
                     key=f"bo_composer_axis_label_size_{index}",
+                    disabled=spec['individual_axis_sizes'],
+                    help='Applies to every axis label unless separate X/Y/Z sizes are enabled.',
                 ))
                 spec["tick_size"] = float(type_cols[2].number_input(
                     "Tick pt", 4.0, 40.0, float(max(4.0, panel_text_size * .88)), .5,
@@ -37801,15 +38176,47 @@ def _render_figure_composer(
                     "Legend pt", 4.0, 40.0, float(max(4.0, panel_text_size * .85)), .5,
                     key=f"bo_composer_legend_size_{index}",
                 ))
+                weight_cols = st.columns(4)
+                for column, role, label in zip(weight_cols,
+                        ('title', 'axis_label', 'tick', 'legend'),
+                        ('Title weight', 'Axis-label weight', 'Tick weight', 'Legend weight')):
+                    spec[f'{role}_weight'] = column.selectbox(
+                        label, ['Keep original', 'Normal', 'Medium', 'Semibold', 'Bold'],
+                        key=f'bo_composer_{role}_weight_{index}',
+                        disabled=kind == 'Image file' or (kind == 'Captured plot' and not editable_capture),
+                        help='Changes font weight independently of font size. Uploaded images and raster-only captures cannot be edited.',
+                    )
+                if spec['individual_axis_sizes']:
+                    label_cols = st.columns(3)
+                    for axis_column, name in zip(label_cols, ('x', 'y', 'z')):
+                        spec[f'{name}_axis_size'] = axis_column.number_input(
+                            f'{name.upper()} label pt', 4., 40., float(spec['axis_label_size']), .5,
+                            key=f'bo_composer_{name}_axis_size_{index}')
             with axes_tab:
-                st.caption('Blank names keep automatic labels. Stack: X = voltage, Y = current, Z = iteration. Raster-only captures cannot be relabelled.')
+                st.caption('Text sizes are controlled in Title & Text Sizes. Blank names keep automatic labels. Stack: X = voltage, Y = current, Z = iteration. Raster-only captures cannot be relabelled.')
                 for axis_name in ('x', 'y', 'z'):
+                    tick_text = st.text_input(
+                        f'{axis_name.upper()} exact tick values',
+                        key=f'bo_composer_{axis_name}_tick_values_text_{index}',
+                        placeholder='0, 0.25, 0.5, 1',
+                        disabled=kind == 'Image file' or (kind == 'Captured plot' and not editable_capture),
+                        help='Comma-separated numeric positions in axis units. Overrides tick count. Leave blank to use tick count or automatic ticks. Values outside the displayed axis limits are not shown.',
+                    )
+                    try:
+                        spec[f'{axis_name}_tick_values'] = _composer_tick_values(tick_text)
+                    except ValueError as exc:
+                        message = f'Panel {chr(65 + index)}, {axis_name.upper()} axis: {exc}'
+                        tick_value_errors.append(message)
+                        st.error(message)
                     axis_cols = st.columns([3, 1])
                     spec[f'{axis_name}_axis_title'] = axis_cols[0].text_input(
                         f'{axis_name.upper()} axis name', key=f'bo_composer_{axis_name}_axis_title_{index}')
-                    spec[f'{axis_name}_axis_size'] = axis_cols[1].number_input(
-                        f'{axis_name.upper()} label pt', 4., 40., float(spec['axis_label_size']), .5,
-                        key=f'bo_composer_{axis_name}_axis_size_{index}')
+                    spec[f'{axis_name}_tick_count'] = int(axis_cols[1].number_input(
+                        f'{axis_name.upper()} tick count', 0, 30, 0, 1,
+                        key=f'bo_composer_{axis_name}_tick_count_{index}',
+                        disabled=bool(tick_text.strip()) or kind == 'Image file' or (kind == 'Captured plot' and not editable_capture),
+                        help='0 = automatic. A positive value fixes the number of major ticks independently of Tick pt. Z applies to 3D axes. Uploaded images have baked-in ticks.',
+                    ))
                 if kind == 'Chronological SWV stack':
                     spec['iteration_label_padding'] = st.slider('Iteration title offset (pt)',
                         16., 80., 34., 1., key=f'bo_composer_iteration_label_padding_{index}',
@@ -38768,7 +39175,7 @@ def _render_figure_composer(
                     ))
                     detail_cols = st.columns(3)
                     spec["capture_spine_color"] = detail_cols[0].color_picker(
-                        "Axis-line color", "#222222",
+                        "Axis-line color", "#000000",
                         key=f"bo_composer_capture_spine_color_{index}",
                         disabled=not source_is_editable,
                     )
@@ -38862,6 +39269,18 @@ def _render_figure_composer(
                     spec["capture_id"] = ""
                     st.warning("No captured plots remain in this app session.")
             elif kind == "Image file":
+                st.file_uploader(
+                    "Upload image (drag and drop)",
+                    type=["png", "jpg", "jpeg", "tif", "tiff", "webp", "bmp", "gif"],
+                    key=f"bo_composer_image_upload_{index}",
+                    on_change=_composer_image_uploaded, args=(index,),
+                    help="Drop an image here or browse for one. Uploaded images are included in saved figure metadata.",
+                )
+                spec["image_data"] = st.session_state.get(f"bo_composer_image_data_{index}", "")
+                if spec["image_data"]:
+                    st.caption("Using the uploaded image. Clear it to use the image path instead.")
+                    st.button("Clear uploaded image", key=f"bo_composer_image_clear_{index}",
+                              on_click=_composer_clear_uploaded_image, args=(index,))
                 spec["path"] = st.text_input(
                     "Image path",
                     value="",
@@ -38942,6 +39361,9 @@ def _render_figure_composer(
             if index == active_panel:
                 editor_tools = st.container()
 
+    if tick_value_errors:
+        st.info('Correct the tick values above to preview or export this figure.')
+        return
     if editor_tools is not None:
         with editor_tools:
             _composer_unified_panel_actions(active_panel, specs, session, history, observations,
@@ -38985,6 +39407,7 @@ def _render_figure_composer(
     source_snapshot = _composer_export_source_snapshot(
         session, history, observations, observation, trace_analysis, source_versions)
     export_signature = _composer_config_signature({
+        'text_rendering': 'opaque-black-v1',
         'config': config_signature, 'name': preset_name or title, 'source': str(session['root']),
         'files': source_versions, 'captures': {key: hashlib.sha256(value.get('png_bytes') or b'').hexdigest()
                                               for key, value in capture_snapshot.items()},
@@ -39005,10 +39428,35 @@ def _render_figure_composer(
             metadata = _composer_metadata(source, saved_config, preset_name=name)
             metadata['plot_settings'] = saved_settings
             return metadata
-        export_request = {'signature': export_signature, 'exporter': FigureExports(
+        export_request = {'signature': export_signature, 'args': args, 'exporter': FigureExports(
             callback, _composer_figure_bytes, export_metadata, dpi, stem)}
         st.session_state[export_key] = export_request
     _composer_export_controls(export_request['exporter'])
+    if specs:
+        with st.expander("Download a specific panel", expanded=False):
+            if st.session_state.get('bo_composer_exports_panel_index') not in range(len(specs)):
+                st.session_state['bo_composer_exports_panel_index'] = 0
+            panel_index = st.selectbox(
+                "Panel to download", list(range(len(specs))),
+                format_func=lambda i: f"Panel {chr(65 + i)} — {specs[i]['kind']}",
+                key="bo_composer_exports_panel_index",
+            )
+            st.caption("Crops this panel from the full composition without resizing. Pixel scale matches the full PNG export at the selected PNG DPI; the browser preview may be scaled. No preview is required.")
+            panel_signature = (export_signature, panel_index, 'full-layout-v2')
+            panel_key = f'{export_key}_single_panel'
+            panel_request = st.session_state.get(panel_key)
+            if not panel_request or panel_request['signature'] != panel_signature:
+                # Rebuild arguments for sessions opened before panel export was added.
+                panel_args = export_request.get('args') or source_snapshot['args'] + copy.deepcopy((
+                    paired_objective, specs, aspect, font_family, font_size, label_size,
+                    title, dpi, panel_border, panel_border_color, panel_border_width))
+                panel_request = {'signature': panel_signature, 'exporter': _composer_panel_exporter(
+                    panel_args, {'journal_style': journal_style}, config, capture_snapshot,
+                    plot_settings, panel_index, export_request['exporter'].stem)}
+                st.session_state[panel_key] = panel_request
+            _composer_export_controls(panel_request['exporter'],
+                                      key_prefix='bo_composer_exports_single_panel',
+                                      panel_label=chr(65 + panel_index))
     # Editing stages settings; only Preview and export explicitly render.
     automatic_render = False
     render_preview = bool(preview_clicked or automatic_render)
@@ -39075,7 +39523,17 @@ def _render_figure_composer(
                 f"{stage.capitalize()} rendered in {time.perf_counter() - started:.1f} s."
             )
         except Exception as exc:
-            st.error(f"Figure rendering failed: {exc}")
+            import traceback
+            details = traceback.format_exc()
+            st.error(f"Figure rendering failed ({type(exc).__name__}): {exc}")
+            with st.expander("Rendering error details", expanded=True):
+                st.code(details, language="text")
+            # Keep diagnostics available locally even after the next app rerun.
+            error_path = Path(tempfile.gettempdir()) / "swv_composer_render_error.txt"
+            try:
+                error_path.write_text(details, encoding="utf-8")
+            except OSError:
+                pass
         finally:
             if figure is not None:
                 plt.close(figure)
@@ -39117,7 +39575,9 @@ def _preserve_bo_widget_choices():
     if mapper is None:
         return
     for widget_id, key in list(mapper.id_key_mapping.items()):
-        metadata = state._get_widget_metadata(widget_id)
+        get_metadata = getattr(state, '_get_widget_metadata', None)
+        metadata = (get_metadata(widget_id) if callable(get_metadata)
+                    else state._new_widget_state.widget_metadata.get(widget_id))
         if (str(key).startswith('bo_') and metadata is not None
                 and metadata.value_type not in {None, 'trigger_value', 'string_trigger_value',
                     'chat_input_value', 'file_uploader_state_value'} and key in st.session_state):
@@ -39633,7 +40093,7 @@ def render_bo_session_app() -> None:
             key="bo_plot_perimeter_width",
         ))
         st.session_state["bo_plot_perimeter_width__preferred"] = plot_perimeter_width
-        st.session_state.setdefault("bo_plot_perimeter_color", "#222222")
+        st.session_state.setdefault("bo_plot_perimeter_color", "#000000")
         plot_perimeter_color = st.text_input(
             "Plot perimeter color",
             help="Use a Matplotlib/CSS color name or hex value.",
@@ -39644,7 +40104,7 @@ def render_bo_session_app() -> None:
             and not is_color_like(plot_perimeter_color)
         ):
             st.caption(
-                "Perimeter color is not recognized; #222222 is being used."
+                "Perimeter color is not recognized; #000000 is being used."
             )
         st.session_state.setdefault("bo_plot_show_legend", True)
         st.checkbox(

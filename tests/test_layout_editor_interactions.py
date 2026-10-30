@@ -69,5 +69,21 @@ render([[.05,.1,.95,.3]]);
     # Restore the redraw stub before the final incoming-frame check.
     checks = checks.replace('// Numeric fields', 'canvas.replaceChildren = () => {};\n// Numeric fields')
     checks += "assert.equal(input.value, '42');\n"
+    checks += r'''
+// Native-size image panels stay exact through numeric edits and alignment.
+document.activeElement = null;
+args.locked_sizes = [true];
+args.rects = [[.1, .1, 137/2640, 83/1980]];
+rects = args.rects.map(r => [...r]);
+selected = new Set([0]);
+document.getElementById('pos-w').onchange({target:{valueAsNumber:80}});
+assert.equal(rects[0][2], 137/2640);
+document.getElementById('square').onclick();
+assert.equal(rects[0][3], 83/1980);
+const moved = normalizedRect([.95, .95, .8, .8], 0);
+assert.equal(moved[2], 137/2640);
+assert.equal(moved[3], 83/1980);
+assert.ok(moved[0] + moved[2] <= 1);
+'''
     subprocess.run([shutil.which('node'), '-'], input=harness + script + checks,
                    text=True, capture_output=True, check=True)

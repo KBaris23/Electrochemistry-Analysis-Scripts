@@ -72,7 +72,7 @@ def preset_with_current_selections(config, current):
 def reset_swv_sizes(state, index):
     """Restore the reference sweep's SWV size settings, without changing data."""
     defaults = dict(text_size=10, title_size=12., axis_label_size=10., tick_size=8.8,
-                    legend_size=8.5, x_axis_size=10., y_axis_size=10., z_axis_size=10.,
+                    legend_size=8.5, individual_axis_sizes=False, x_axis_size=10., y_axis_size=10., z_axis_size=10.,
                     trace_width=1.5)
     for field, value in defaults.items():
         state[f'bo_composer_{field}_{index}'] = value

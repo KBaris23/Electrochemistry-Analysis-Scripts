@@ -135,3 +135,89 @@ def test_export_events_are_not_figure_settings_or_saved_session_state(monkeypatc
     monkeypatch.setattr(viewer.st, 'session_state', state)
     assert viewer._composer_widget_state(1) == {'bo_composer_font_size': 10}
     assert serializable_state(state) == {'bo_composer_font_size': 10}
+
+
+def test_single_panel_export_is_lazy_preserves_size_and_excludes_other_panels(monkeypatch):
+    import base64
+    import numpy as np
+    import pandas as pd
+    source = BytesIO()
+    Image.new('RGBA', (137, 83), (255, 0, 0, 255)).save(source, format='PNG')
+    specs = [
+        {'kind': 'Unsupported source', 'rect': [.1, .1, .4, .4]},
+        {'kind': 'Image file', 'rect': [.6, .1, .3, .3], 'show_label': False,
+         'label': 'B', 'image_data': base64.b64encode(source.getvalue()).decode(),
+         'image_native_pixels': [137, 83], 'image_native_dpi': 220, 'zoom_from': 0},
+    ]
+    args = ({'config': {}}, pd.DataFrame(), [], {}, {}, False, specs,
+            '4:3', 'DejaVu Sans', 10, 10, 'Whole figure title', 220, False, '#222222', .8)
+    config = {'state': {'bo_composer_count': 2, 'bo_composer_kind_0': 'Unsupported source',
+                       'bo_composer_kind_1': 'Image file', 'bo_composer_label_1': 'B',
+                       'bo_composer_title': 'Whole figure title'}, 'panels': specs}
+    calls = []
+    original = viewer._composer_render_export_snapshot
+    def render(*a, **kw):
+        calls.append(a[0][6])
+        return original(*a, **kw)
+    monkeypatch.setattr(viewer, '_composer_render_export_snapshot', render)
+    exporter = viewer._composer_panel_exporter(args, {}, config, {}, {}, 1, 'comparison')
+    assert calls == []
+    png = exporter.get('png')
+    assert len(calls) == 1 and len(calls[0]) == 2
+    assert 'zoom_from' not in exporter.metadata['config']['panels'][0]
+    assert exporter.stem == 'comparison_panel_B'
+    assert specs[1]['zoom_from'] == 0  # Export does not alter the composition.
+    with Image.open(BytesIO(png)) as image:
+        metadata = json.loads(image.info[viewer.COMPOSER_PNG_METADATA_KEY])
+        pixels = np.asarray(image.convert('RGBA'))
+    red = (pixels[:, :, 0] == 255) & (pixels[:, :, 1] == 0) & (pixels[:, :, 3] == 255)
+    ys, xs = np.where(red)
+    assert (xs.max()-xs.min()+1, ys.max()-ys.min()+1) == (137, 83)
+    assert metadata['exported_panel'] == 'B'
+    assert len(metadata['config']['panels']) == 1
+    state = metadata['config']['state']
+    assert state['bo_composer_count'] == 1
+    assert state['bo_composer_kind_0'] == 'Image file'
+    assert state['bo_composer_label_0'] == 'B'
+    assert state['bo_composer_title'] == ''
+    assert 'bo_composer_kind_1' not in state
+    assert b'%PDF' in exporter.get('pdf')[:10]
+    assert b'<svg' in exporter.get('svg')
+    assert len(calls) == 1
+
+
+def test_panel_download_keeps_full_render_axes_text_and_mark_sizes(monkeypatch):
+    import pandas as pd
+    import numpy as np
+    original_render = viewer._composer_render_export_snapshot
+    full_geometry = {}
+    def render(*a, **kw):
+        figure = original_render(*a, **kw)
+        axis = figure.axes[1]
+        full_geometry['axes'] = axis.get_position().bounds
+        full_geometry['font'] = axis.yaxis.label.get_fontsize()
+        full_geometry['marker'] = axis.lines[0].get_markersize()
+        full_geometry['line'] = axis.lines[0].get_linewidth()
+        full_geometry['canvas'] = figure.get_size_inches().copy()
+        return figure
+    monkeypatch.setattr(viewer, '_composer_render_export_snapshot', render)
+    history = pd.DataFrame({'iteration': [1, 2, 3], 'Q_run': [1., 3., 2.]})
+    specs = [dict(kind='Global trend', metric='Q_run', rect=[.05, .1, .4, .6]),
+             dict(kind='Global trend', metric='Q_run', rect=[.55, .15, .3, .45], label='B')]
+    args = ({'config': {}}, history, [], {}, {}, False, specs,
+            '4:3', 'DejaVu Sans', 10, 10, 'Overall title', 220, False, '#222222', .8)
+    figure = viewer._composer_render_panel_export(args, {}, {}, {}, 1)
+    try:
+        axis = figure.axes[1]
+        assert not figure.axes[0].get_visible()
+        assert axis.get_visible()
+        assert not figure._suptitle.get_visible()
+        np.testing.assert_array_equal(axis.get_position().bounds, full_geometry['axes'])
+        np.testing.assert_array_equal(figure.get_size_inches(), full_geometry['canvas'])
+        assert axis.yaxis.label.get_fontsize() == full_geometry['font']
+        assert axis.lines[0].get_markersize() == full_geometry['marker']
+        assert axis.lines[0].get_linewidth() == full_geometry['line']
+        viewer._composer_figure_bytes(figure, 'png', 220)
+        np.testing.assert_array_equal(axis.get_position().bounds, full_geometry['axes'])
+    finally:
+        viewer.plt.close(figure)

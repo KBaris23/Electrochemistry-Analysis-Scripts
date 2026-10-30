@@ -72,6 +72,7 @@ from bo_session_viewer import (
     _bo_swv_settings_key,
     _figure_layout_editor,
     _queue_plot_for_composer,
+    _preserve_bo_widget_choices,
     _render_add_to_composer_button,
     bo_swv_optimization_direction_map,
     render_captured_figure_composer,
@@ -407,10 +408,10 @@ def _apply_swv_plot_formatting(
     line_scale = float(plot_setting("line_width_scale", 1.0))
     perimeter_width = float(plot_setting("perimeter_width", 0.8))
     perimeter_color = str(
-        plot_setting("perimeter_color", "#222222") or "#222222"
+        plot_setting("perimeter_color", "#000000") or "#000000"
     ).strip()
     if not is_color_like(perimeter_color):
-        perimeter_color = "#222222"
+        perimeter_color = "#000000"
     marker_size = float(plot_setting("marker_size", 6.0))
     marker_opacity = float(plot_setting("marker_opacity", 0.85))
     show_legend = bool(plot_setting("show_legend", plot_kind != "swv_trace"))
@@ -443,7 +444,9 @@ def _apply_swv_plot_formatting(
         axis.title.set_fontsize(text_size * 1.2)
         axis.xaxis.label.set_fontsize(text_size)
         axis.yaxis.label.set_fontsize(text_size)
-        axis.tick_params(labelsize=text_size * 0.9)
+        axis.tick_params(which='both', labelsize=text_size * 0.9, labelcolor='#000000')
+        axis.xaxis.get_offset_text().set_color('#000000')
+        axis.yaxis.get_offset_text().set_color('#000000')
         if show_grid:
             axis.grid(True, alpha=0.2)
         else:
@@ -463,8 +466,15 @@ def _apply_swv_plot_formatting(
             for legend_text in legend.get_texts():
                 legend_text.set_fontsize(text_size * 0.8)
             legend.get_title().set_fontsize(text_size * 0.9)
+            for handle in legend.get_lines():
+                if handle.get_marker() not in (None, "None", "none", "", " ", "_", "|"):
+                    handle.set_markersize(marker_size)
         for line in axis.lines:
             line.set_linewidth(max(0.1, line.get_linewidth() * line_scale))
+            # Metrics use Line2D markers, while scatter plots use collections.
+            # Leave error-bar caps and lines without markers alone.
+            if line.get_marker() not in (None, "None", "none", "", " ", "_", "|"):
+                line.set_markersize(marker_size)
             if line_color and not bool(getattr(line, "_swv_preserve_color", False)):
                 line.set_color(line_color)
         for collection in axis.collections:
@@ -514,7 +524,9 @@ def _apply_swv_plot_formatting(
         st.session_state.get("swv_plot_colorbar_tick_positions", "")
     )
     for axis in colorbar_axes:
-        axis.tick_params(labelsize=text_size * 0.9)
+        axis.tick_params(which='both', labelsize=text_size * 0.9, labelcolor='#000000')
+        axis.xaxis.get_offset_text().set_color('#000000')
+        axis.yaxis.get_offset_text().set_color('#000000')
         axis.title.set_fontsize(text_size)
         if colorbar_label_override:
             axis.set_ylabel(colorbar_label_override)
@@ -524,6 +536,11 @@ def _apply_swv_plot_formatting(
             count = min(len(positions), len(colorbar_tick_labels))
             if count:
                 axis.set_yticks(positions[:count], labels=colorbar_tick_labels[:count])
+
+
+    for text in fig.findobj(plt.matplotlib.text.Text):
+        text.set_color('#000000')
+        text.set_alpha(1.0)
 
 
 def _wrap_swv_plot_titles(fig: plt.Figure) -> None:
@@ -706,7 +723,7 @@ def _render_all_metrics_plot_settings() -> None:
             )
             frame_columns[2].text_input(
                 "Perimeter color",
-                value=str(st.session_state.get("swv_plot_perimeter_color", "#222222")),
+                value=str(st.session_state.get("swv_plot_perimeter_color", "#000000")),
                 key="swv_metrics_all_perimeter_color",
             )
 
@@ -843,7 +860,7 @@ def _render_all_langmuir_plot_settings() -> None:
             )
             frame_columns[2].text_input(
                 "Perimeter color",
-                value=str(st.session_state.get("swv_langmuir_plot_perimeter_color", "#222222")),
+                value=str(st.session_state.get("swv_langmuir_plot_perimeter_color", "#000000")),
                 key="swv_langmuir_all_perimeter_color",
             )
             marker_columns = st.columns(2)
@@ -1044,7 +1061,7 @@ def render_downloadable_pyplot(
         st.session_state.get("swv_plot_perimeter_width", 0.8)
     )
     reconstruction_perimeter_color = str(
-        st.session_state.get("swv_plot_perimeter_color", "#222222")
+        st.session_state.get("swv_plot_perimeter_color", "#000000")
     )
     reconstruction_marker_size = float(
         st.session_state.get("swv_plot_marker_size", 6.0)
@@ -1329,7 +1346,7 @@ def render_downloadable_pyplot(
                 reconstruction_perimeter_color
                 and not is_color_like(reconstruction_perimeter_color)
             ):
-                st.caption("Unrecognized perimeter color; #222222 will be used.")
+                st.caption("Unrecognized perimeter color; #000000 will be used.")
             reconstruction_show_grid = st.checkbox(
                 "Show background grid",
                 value=bool(reconstruction_show_grid),
@@ -1560,7 +1577,7 @@ def render_downloadable_pyplot(
             perimeter_color = (
                 reconstruction_perimeter_color
                 if is_color_like(reconstruction_perimeter_color)
-                else "#222222"
+                else "#000000"
             )
             for spine in primary_axis.spines.values():
                 spine.set_visible(reconstruction_perimeter_width > 0)
@@ -2175,7 +2192,7 @@ def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cel
     line_scale = float(st.session_state.get("paper_titration_line_scale", 1.0))
     marker_scale = float(st.session_state.get("paper_titration_marker_scale", 1.0))
     spine_width = float(st.session_state.get("paper_titration_spine_width", 0.8))
-    spine_color = str(st.session_state.get("paper_titration_spine_color", "#222222"))
+    spine_color = str(st.session_state.get("paper_titration_spine_color", "#000000"))
     show_vlines = bool(st.session_state.get("paper_titration_show_vlines", True))
     vline_width = float(st.session_state.get("paper_titration_vline_width", 1.0))
     vline_alpha = float(st.session_state.get("paper_titration_vline_alpha", 0.6))
@@ -3296,6 +3313,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Composer panels must survive navigation back to Metrics or other views.
+_preserve_bo_widget_choices()
+
 
 st.markdown("""
 <style>
@@ -6388,7 +6409,7 @@ with st.sidebar:
             )
             swv_perimeter_color = st.text_input(
                 "Plot perimeter color",
-                value="#222222",
+                value="#000000",
                 key="swv_plot_perimeter_color",
                 on_change=_sync_shared_swv_style_to_metrics,
                 args=("perimeter_color",),
@@ -6399,7 +6420,7 @@ with st.sidebar:
                 and not is_color_like(swv_perimeter_color)
             ):
                 st.caption(
-                    "Unrecognized perimeter color; #222222 is being used."
+                    "Unrecognized perimeter color; #000000 is being used."
                 )
             swv_plot_show_legend = st.checkbox(
                 "Show plot legends",
@@ -8706,7 +8727,7 @@ if view == "Paper Figures":
                 key="paper_titration_spine_width",
             )
             style_cols[3].color_picker(
-                "Axis-line color", "#222222",
+                "Axis-line color", "#000000",
                 key="paper_titration_spine_color",
             )
             style_cols[4].selectbox(

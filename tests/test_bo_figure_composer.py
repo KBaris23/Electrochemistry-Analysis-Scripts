@@ -475,7 +475,7 @@ def test_add_to_composer_accepts_plotly_source_without_server_png():
     assert state["bo_composer_pending_captures"] == [capture_id]
 
 
-def test_captured_plot_is_inserted_as_figure_a_and_shifts_existing_panels():
+def test_captured_plot_appends_without_shifting_existing_panels():
     state = {
         "bo_composer_count": 2,
         "bo_composer_kind_0": "Global trend",
@@ -496,13 +496,15 @@ def test_captured_plot_is_inserted_as_figure_a_and_shifts_existing_panels():
 
     assert (added, skipped) == (1, 0)
     assert state["bo_composer_count"] == 3
-    assert state["bo_composer_kind_0"] == "Captured plot"
-    assert state["bo_composer_capture_id_0"] == capture_id
-    assert state["bo_composer_kind_1"] == "Global trend"
-    assert state["bo_composer_kind_2"] == "Measured 2D map"
+    assert state["bo_composer_kind_0"] == "Global trend"
+    assert state["bo_composer_kind_1"] == "Measured 2D map"
+    assert state["bo_composer_kind_2"] == "Captured plot"
+    assert state["bo_composer_capture_id_2"] == capture_id
+    assert state["bo_composer_label_0"] == "A"
     assert state["bo_composer_label_1"] == "B"
     assert state["bo_composer_label_2"] == "C"
-    assert state["bo_composer_zoom_from_2"] == "B"
+    assert state["bo_composer_zoom_from_1"] == "A"
+    assert state["bo_composer_captured_plots"][capture_id]["reserved_panel_label"] == "C"
 
 
 def test_composer_swaps_panel_contents_letters_and_zoom_links():
@@ -576,7 +578,7 @@ def test_layout_editor_stages_deletion_until_before_widget_creation():
     assert state["bo_composer_auto_render"] is True
 
 
-def test_deleting_every_panel_resets_to_one_empty_panel():
+def test_deleting_every_panel_leaves_an_empty_composer():
     state = {
         "bo_composer_count": 2,
         "bo_composer_kind_0": "Global trend",
@@ -589,7 +591,7 @@ def test_deleting_every_panel_resets_to_one_empty_panel():
     with patch.object(viewer.st, "session_state", state):
         assert viewer._composer_apply_pending_panel_deletions() == 2
 
-    assert state["bo_composer_count"] == 1
+    assert state["bo_composer_count"] == 0
     assert not any(key.startswith("bo_composer_kind_") for key in state)
     assert not any(key.startswith("bo_composer_label_") for key in state)
 
@@ -678,3 +680,209 @@ def test_best_so_far_uses_minimum_for_signal_off():
         assert list(line.get_ydata()) == [1.,-5.,-5.]
     finally:
         plt.close(fig)
+
+
+def test_add_image_panel_preserves_existing_plots_and_layout():
+    for layout in ('Manual', 'Grid', 'Main left + stack'):
+        state = {
+            'bo_composer_count': 2, 'bo_composer_layout': layout,
+            'bo_composer_kind_0': 'Global trend',
+            'bo_composer_kind_1': 'Captured plot',
+            'bo_composer_capture_id_1': 'my-plot',
+            'bo_composer_title_0': 'Keep this title',
+            'bo_composer_left_0': .11, 'bo_composer_width_0': .3,
+            'bo_composer_image_path_2': '/stale.png',
+            'bo_composer_zoom_from_2': 'A',
+        }
+        with patch.object(viewer.st, 'session_state', state):
+            before = (viewer._composer_manual_rects(2) if layout == 'Manual'
+                      else viewer._composer_layout_rects(2, layout))
+            viewer._composer_add_panel()
+            assert viewer._composer_manual_rects(3)[:2] == before
+        assert state['bo_composer_count'] == 3
+        assert state['bo_composer_kind_0'] == 'Global trend'
+        assert state['bo_composer_kind_1'] == 'Captured plot'
+        assert state['bo_composer_capture_id_1'] == 'my-plot'
+        assert state['bo_composer_title_0'] == 'Keep this title'
+        assert state['bo_composer_kind_2'] == 'Image file'
+        assert state['bo_composer_image_path_2'] == ''
+        assert 'bo_composer_zoom_from_2' not in state
+        assert state['bo_composer_active_panel'] == 2
+        assert state['bo_composer_layout'] == 'Manual'
+
+
+def test_add_panel_respects_limit():
+    state = {'bo_composer_count': 24}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_add_panel()
+    assert state == {'bo_composer_count': 24}
+
+
+def test_uploaded_image_renders_and_survives_metadata_roundtrip():
+    buffer = BytesIO()
+    Image.new('RGBA', (8, 5), (255, 0, 0, 128)).save(buffer, format='PNG')
+    state = {'bo_composer_count': 1, 'bo_composer_kind_0': 'Image file',
+             'bo_composer_image_upload_0': buffer}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_image_uploaded(0)
+        spec = {'kind': 'Image file', 'image_data': state['bo_composer_image_data_0'],
+                'path': '/missing/fallback.png', 'rect': [.1, .1, .8, .8]}
+        config = viewer._composer_config([spec], 1)
+        restored = json.loads(viewer._composer_json_bytes(config))
+        assert 'bo_composer_image_upload_0' not in restored['state']
+        assert restored['state']['bo_composer_image_data_0'] == spec['image_data']
+        fig = Figure()
+        ax = fig.subplots()
+        viewer._composer_draw_image_file(ax, spec['path'], restored['panels'][0]['image_data'])
+        assert len(ax.images) == 1
+        assert ax.images[0].get_array().shape == (5, 8, 4)
+        assert ax.images[0].get_array()[0, 0, 3] == 128
+        viewer._composer_clear_uploaded_image(0)
+        assert state['bo_composer_image_data_0'] == ''
+        assert 'bo_composer_image_upload_0' not in state
+
+
+def test_invalid_image_upload_keeps_previous_image():
+    state = {'bo_composer_image_upload_0': BytesIO(b'not an image'),
+             'bo_composer_image_data_0': 'previous'}
+    with patch.object(viewer.st, 'session_state', state), patch.object(viewer.st, 'error') as error:
+        viewer._composer_image_uploaded(0)
+    assert state['bo_composer_image_data_0'] == 'previous'
+    error.assert_called_once()
+
+
+def test_native_image_export_keeps_exact_pixels_and_preview_geometry():
+    import base64
+    import numpy as np
+    import pytest
+    buffer = BytesIO()
+    Image.new('RGBA', (137, 83), (255, 0, 0, 255)).save(buffer, format='PNG')
+    spec = {'kind': 'Image file', 'image_data': base64.b64encode(buffer.getvalue()).decode(),
+            'image_native_pixels': [137, 83], 'image_native_dpi': 220,
+            'rect': [.1, .1, .5, .5], 'show_label': False}
+    for render_dpi in (110, 220):
+        fig = viewer._build_composer_figure(
+            {'config': {}}, pd.DataFrame(), [], {}, {}, False,
+            [spec], '4:3', 'DejaVu Sans', 10, 10, '', render_dpi=render_dpi)
+        try:
+            ax = fig.axes[0]
+            assert ax.get_position().width * 12 * 220 == pytest.approx(137)
+            assert ax.get_position().height * 9 * 220 == pytest.approx(83)
+            png = viewer._composer_figure_bytes(fig, 'png', 220)
+            with Image.open(BytesIO(png)) as image:
+                pixels = np.asarray(image.convert('RGBA'))
+            red = (pixels[:, :, 0] == 255) & (pixels[:, :, 1] == 0) & (pixels[:, :, 3] == 255)
+            ys, xs = np.where(red)
+            assert xs.max() - xs.min() + 1 == 137
+            assert ys.max() - ys.min() + 1 == 83
+        finally:
+            viewer.plt.close(fig)
+
+
+def test_native_image_layout_ignores_resize_and_clamps_position():
+    import base64
+    import pytest
+    buffer = BytesIO()
+    Image.new('RGB', (137, 83)).save(buffer, format='PNG')
+    state = {'bo_composer_kind_0': 'Image file',
+             'bo_composer_image_data_0': base64.b64encode(buffer.getvalue()).decode(),
+             'bo_composer_aspect': '4:3', 'bo_composer_dpi': 220}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_apply_layout_editor_result(
+            {'event_id': 'resize', 'rects': [[.95, .95, .5, .5]]}, 1)
+        rect = viewer._composer_manual_rects(1)[0]
+        assert rect[2] * 12 * 220 == pytest.approx(137)
+        assert rect[3] * 9 * 220 == pytest.approx(83)
+        assert rect[0] + rect[2] <= 1
+        assert rect[1] + rect[3] <= 1
+    with pytest.raises(ValueError, match='does not fit'):
+        viewer._composer_native_image_rect([0, 0, 1, 1], [3000, 4000], (3, 3), 72)
+
+
+def test_layout_deletion_rerun_preserves_surviving_widget_values():
+    from streamlit.testing.v1 import AppTest
+    app = AppTest.from_string('''
+import streamlit as st
+import bo_session_viewer as v
+if 'initialized' not in st.session_state:
+    st.session_state.update(initialized=True, bo_composer_count=3,
+        bo_composer_kind_0='Captured plot', bo_composer_kind_1='Image file',
+        bo_composer_kind_2='Captured plot', bo_composer_title_0='First metric',
+        bo_composer_title_1='Reference', bo_composer_title_2='Last metric')
+v._composer_apply_pending_panel_deletions()
+n = st.number_input('Panels', min_value=0, max_value=24, key='bo_composer_count')
+if st.button('Delete middle'):
+    v._composer_apply_layout_editor_result({'event_id': 'delete-middle', 'deleted_indices': [1]}, n)
+    st.rerun()
+if st.button('Delete all'):
+    v._composer_apply_layout_editor_result({'event_id': 'delete-all', 'deleted_indices': list(range(n))}, n)
+    st.rerun()
+st.button('Add panel', on_click=v._composer_add_panel)
+for i in range(n):
+    st.selectbox(f'Panel {i}', ['Global trend', 'Image file', 'Captured plot'], key=f'bo_composer_kind_{i}')
+    st.text_input(f'Title {i}', key=f'bo_composer_title_{i}')
+''').run()
+    app.button[0].click().run()
+    assert not app.exception
+    assert app.number_input[0].value == 2
+    assert [w.value for w in app.selectbox] == ['Captured plot', 'Captured plot']
+    assert [w.value for w in app.text_input] == ['First metric', 'Last metric']
+    app.run()
+    assert [w.value for w in app.text_input] == ['First metric', 'Last metric']
+    app.button[1].click().run()
+    assert not app.exception
+    assert app.number_input[0].value == 0
+    assert len(app.selectbox) == 0
+    app.button[2].click().run()
+    assert not app.exception
+    assert app.number_input[0].value == 1
+    assert app.selectbox[0].value == 'Image file'
+
+
+def test_global_panel_without_metric_does_not_crash_render():
+    fig = Figure()
+    ax = fig.subplots()
+    viewer._composer_draw_global(ax, pd.DataFrame(), None, 10)
+    assert any('No BO metric selected' in text.get_text() for text in ax.texts)
+
+
+def test_metrics_navigation_appends_capture_after_uploaded_image():
+    from streamlit.testing.v1 import AppTest
+    app = AppTest.from_string('''
+import streamlit as st
+import bo_session_viewer as v
+from PIL import Image
+from io import BytesIO
+import base64
+v._preserve_bo_widget_choices()
+if 'initialized' not in st.session_state:
+    buffer = BytesIO()
+    Image.new('RGBA', (137, 83), (255, 0, 0, 128)).save(buffer, format='PNG')
+    st.session_state.update(initialized=True, bo_composer_count=1,
+        bo_composer_kind_0='Image file', bo_composer_label_0='A',
+        bo_composer_image_data_0=base64.b64encode(buffer.getvalue()).decode(),
+        bo_composer_left_0=.12, bo_composer_bottom_0=.2)
+view=st.radio('View', ['Composer', 'Metrics'])
+if view == 'Composer':
+    v._composer_apply_pending_captures()
+    n=st.number_input('Panels', min_value=0, max_value=24, key='bo_composer_count')
+    for i in range(n):
+        st.selectbox(f'Panel {i}', ['Global trend', 'Image file', 'Captured plot'],key=f'bo_composer_kind_{i}')
+        st.text_input(f'Label {i}',key=f'bo_composer_label_{i}')
+else:
+    st.button('Add metric', on_click=v._queue_plot_for_composer,
+        args=(b'png',), kwargs={'label':'Metric', 'file_stem':'metric', 'figure':None})
+''').run()
+    original_image = app.session_state['bo_composer_image_data_0']
+    app.radio[0].set_value('Metrics').run()
+    app.button[0].click().run()
+    app.radio[0].set_value('Composer').run()
+    assert not app.exception
+    assert app.number_input[0].value == 2
+    assert [w.value for w in app.selectbox] == ['Image file', 'Captured plot']
+    assert [w.value for w in app.text_input] == ['A', 'B']
+    assert app.session_state['bo_composer_image_data_0'] == original_image
+    assert app.session_state['bo_composer_left_0'] == .12
+    assert app.session_state['bo_composer_bottom_0'] == .2
+    app.run()
+    assert [w.value for w in app.selectbox] == ['Image file', 'Captured plot']
