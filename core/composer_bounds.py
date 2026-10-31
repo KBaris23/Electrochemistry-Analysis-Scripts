@@ -11,29 +11,63 @@ def overlapping_rectangles(rects):
             and min(a[1]+a[3], b[1]+b[3])-max(a[1], b[1]) > 1e-8]
 
 
-def panel_bounds(fig, axes, texts, artists, renderer):
+def panel_bounds(fig, axes, texts, artists, renderer, layout_only=False):
     boxes = []
     for artist in [*axes, *texts, *artists]:
         if not artist.get_visible():
             continue
-        box = artist.get_tightbbox(renderer)
+        if layout_only and artist in axes:
+            box = artist.get_tightbbox(renderer, for_layout_only=True)
+        else:
+            box = artist.get_tightbbox(renderer)
         if box is not None and np.isfinite(box.extents).all() and box.width > 0 and box.height > 0:
             boxes.append(box)
     return Bbox.union(boxes) if boxes else None
 
 
-def fit_panel_bounds(fig, groups, pad_points=2):
+def fit_panel_bounds(fig, groups, pad_points=2, preserve_font_sizes=False):
     """Uniformly fit each whole panel, preserving native vector artists.
 
     Iterate because tick locators and 3D projection can change after resizing.
     The rectangle includes text, legends and colorbars, not just the data axes.
     """
-    for _ in range(8):
+    # Captured figures restored from serialized state may have only the
+    # backend-neutral FigureCanvasBase, which cannot measure text bounds.
+    if not callable(getattr(fig.canvas, 'get_renderer', None)):
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        FigureCanvasAgg(fig)
+    if preserve_font_sizes:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        for rect, axes, texts, _ in groups:
+            available_width = rect[2] * fig.bbox.width - 2 * pad_points * fig.dpi / 72
+            # Long titles cannot fit by shrinking the axes while retaining
+            # their point size. Wrap them before reserving vertical space.
+            for ax, title in [(ax, title) for ax in axes for title in (ax.title, ax._left_title, ax._right_title)]:
+                title_width = min(available_width, ax.get_position().width * fig.bbox.width) * .9
+                original = getattr(title, '_composer_unwrapped_title', title.get_text())
+                title._composer_unwrapped_title = original
+                lines = []
+                for paragraph in original.split('\n'):
+                    line = ''
+                    for word in paragraph.split():
+                        candidate = f'{line} {word}'.strip()
+                        width = renderer.get_text_width_height_descent(candidate, title.get_fontproperties(), False)[0]
+                        if line and width > title_width:
+                            lines.append(line)
+                            line = word
+                        else:
+                            line = candidate
+                    lines.append(line)
+                title.set_text('\n'.join(lines))
+            for text in [*texts, *(text for ax in axes for text in ax.findobj(Text))]:
+                text._composer_fixed_fontsize = text.get_fontsize()
+    for _ in range(20 if preserve_font_sizes else 8):
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
         changed = False
         for rect, axes, texts, artists in groups:
-            box = panel_bounds(fig, axes, texts, artists, renderer)
+            box = panel_bounds(fig, axes, texts, artists, renderer, layout_only=preserve_font_sizes)
             if box is None:
                 continue
             target = Bbox.from_bounds(*rect).transformed(fig.transFigure)

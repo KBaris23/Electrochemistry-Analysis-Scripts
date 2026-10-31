@@ -32996,6 +32996,14 @@ def _composer_native_image_size(index: int) -> tuple[int, int] | None:
     from PIL import Image
     if st.session_state.get(f"bo_composer_kind_{index}") != "Image file":
         return None
+    vector_type = st.session_state.get(f"bo_composer_image_vector_type_{index}")
+    if vector_type:
+        from core.image_panels import document_image_info
+        info = document_image_info(
+            base64.b64decode(st.session_state[f"bo_composer_image_vector_data_{index}"]),
+            vector_type, int(st.session_state.get(f"bo_composer_image_page_{index}", 1)))
+        dpi = float(st.session_state.get("bo_composer_dpi", 220))
+        return tuple(max(1, round(length * dpi)) for length in info['size_inches'])
     data = st.session_state.get(f"bo_composer_image_data_{index}")
     if not data:
         return None
@@ -34393,19 +34401,34 @@ def _composer_draw_embedded_figure(
                 height_px / float(render_dpi),
                 forward=True,
             )
-            buffer = BytesIO()
             for text in panel_figure.findobj(Text):
                 text.set_color('#000000')
                 text.set_alpha(1.0)
-            panel_figure.savefig(
-                buffer,
-                format="png",
-                dpi=render_dpi,
-                bbox_inches="tight",
-                facecolor="none",
-                transparent=True,
-            )
-            buffer.seek(0)
+            def render_at_panel_size():
+                from core.composer_bounds import fit_panel_bounds
+                bounds = ax.get_position()
+                fw, fh = target_fig.get_size_inches()
+                panel_figure.set_size_inches(fw * bounds.width, fh * bounds.height)
+                panel_figure.set_layout_engine(None)
+                fit_panel_bounds(panel_figure,
+                    [((0., 0., 1., 1.), list(panel_figure.axes), list(panel_figure.texts), [])],
+                    preserve_font_sizes=True)
+                output = BytesIO()
+                # A tight crop followed by imshow rescales the text. Render
+                # exactly the destination's physical size instead.
+                from matplotlib.transforms import Bbox
+                panel_figure.savefig(output, format='png', dpi=render_dpi,
+                    bbox_inches=Bbox.from_bounds(0, 0, *panel_figure.get_size_inches()),
+                    pad_inches=0, facecolor='none', transparent=True)
+                output.seek(0)
+                return output
+            buffer = render_at_panel_size()
+            def refresh_embedded():
+                with Image.open(render_at_panel_size()) as updated:
+                    ax.images[0].set_data(np.asarray(updated.convert('RGBA')))
+                ax.set_aspect('auto')
+            ax._composer_refresh_embedded = refresh_embedded
+            ax._composer_vector_figure = panel_figure
             plt.close(panel_figure)
         with Image.open(buffer) as image:
             ax.imshow(image.convert("RGBA"))
@@ -34420,36 +34443,63 @@ def _composer_image_uploaded(index: int) -> None:
 
     upload = st.session_state.get(f"bo_composer_image_upload_{index}")
     data = upload.getvalue() if upload is not None else b""
+    kind = Path(getattr(upload, 'name', '')).suffix.lower().lstrip('.')
+    vector_data = ''
+    page_count = 1
     if data:
         try:
-            with Image.open(BytesIO(data)) as image:
-                image.verify()
-        except Exception:
-            st.error("Could not read this image. Please choose a valid image file.")
+            if kind in {'pdf', 'svg'}:
+                from core.image_panels import document_image_info, render_document_image
+                page_count = document_image_info(data, kind)['pages']
+                vector_data = base64.b64encode(data).decode('ascii')
+                data = render_document_image(data, kind)
+            else:
+                with Image.open(BytesIO(data)) as image:
+                    image.verify()
+        except Exception as exc:
+            st.error(f"Could not read this image: {exc}")
             return
     st.session_state[f"bo_composer_image_data_{index}"] = (
         base64.b64encode(data).decode("ascii") if data else ""
     )
+    st.session_state[f'bo_composer_image_vector_data_{index}'] = vector_data
+    st.session_state[f'bo_composer_image_vector_type_{index}'] = kind if vector_data else ''
+    st.session_state[f'bo_composer_image_page_count_{index}'] = page_count
+    st.session_state[f'bo_composer_image_page_{index}'] = 1
 
 
 def _composer_clear_uploaded_image(index: int) -> None:
     st.session_state.pop(f"bo_composer_image_upload_{index}", None)
     st.session_state[f"bo_composer_image_data_{index}"] = ""
+    for field in ('image_vector_data', 'image_vector_type', 'image_page_count', 'image_page'):
+        st.session_state.pop(f'bo_composer_{field}_{index}', None)
 
 
-def _composer_draw_image_file(ax, path_text: str, image_data: str = "") -> None:
+def _composer_draw_image_file(ax, path_text: str, image_data: str = "",
+                              vector_data: str = '', vector_type: str = '',
+                              page: int = 1, render_dpi: int = 180) -> None:
     from PIL import Image
 
     cleaned = str(path_text or "").strip().strip('"')
-    if not cleaned and not image_data:
+    if not cleaned and not image_data and not vector_data:
         _composer_error_panel(ax, "Upload an image or paste an image path.")
         return
     path = Path(cleaned).expanduser()
-    if not image_data and not path.is_file():
+    if not image_data and not vector_data and not path.is_file():
         _composer_error_panel(ax, "Image file was not found.")
         return
     try:
-        source = BytesIO(base64.b64decode(image_data)) if image_data else path
+        if not image_data and not vector_data and path.suffix.lower() in {'.pdf', '.svg'}:
+            vector_data = base64.b64encode(path.read_bytes()).decode('ascii')
+            vector_type = path.suffix.lower().lstrip('.')
+        if vector_data:
+            from core.image_panels import render_document_image
+            from core.composer_vectors import document_vector_svg
+            ax._composer_vector_svg = document_vector_svg(base64.b64decode(vector_data), vector_type, page)
+            pixels = _composer_panel_pixel_size(ax.figure, ax.get_position().bounds, render_dpi)
+            source = BytesIO(render_document_image(base64.b64decode(vector_data), vector_type, page, pixels))
+        else:
+            source = BytesIO(base64.b64decode(image_data)) if image_data else path
         with Image.open(source) as image:
             ax.imshow(image.convert("RGBA"), interpolation="none")
         ax.set_axis_off()
@@ -34562,6 +34612,9 @@ def _composer_formatted_capture_figure(
     """Copy an in-memory source and apply Composer-owned formatting."""
     source = capture.get("source_figure")
     line_scale = max(0.1, float(spec.get("capture_line_scale", 1.0)))
+    from core.composer_colors import apply_capture_colors
+    line_color = spec.get('capture_line_color') if spec.get('capture_override_line_color') else None
+    marker_color = spec.get('capture_marker_color') if spec.get('capture_override_marker_color') else None
     marker_scale = max(0.1, float(spec.get("capture_marker_scale", 1.0)))
     spine_width = max(0.1, float(spec.get("capture_spine_width", 0.8)))
     spine_color = str(spec.get("capture_spine_color", "#000000"))
@@ -34577,6 +34630,7 @@ def _composer_formatted_capture_figure(
     ylim = _composer_valid_limits(spec.get("capture_ylim"))
     if isinstance(source, go.Figure):
         figure = go.Figure(source)
+        apply_capture_colors(figure, line_color, marker_color)
         figure.update_layout(showlegend=show_legend, title_text=title)
         figure.update_xaxes(title_text=xlabel, showgrid=show_grid)
         figure.update_yaxes(title_text=ylabel, showgrid=show_grid)
@@ -34603,6 +34657,7 @@ def _composer_formatted_capture_figure(
         return figure
     if isinstance(source, plt.Figure):
         figure = copy.deepcopy(source)
+        apply_capture_colors(figure, line_color, marker_color)
         primary_axis = next(
             (
                 axis for axis in figure.axes
@@ -36099,7 +36154,9 @@ def _build_composer_figure_inner(
                     spec.get("text_size", font_size),
                 )
             elif kind == "Image file":
-                _composer_draw_image_file(ax, spec.get("path", ""), spec.get("image_data", ""))
+                _composer_draw_image_file(ax, spec.get("path", ""), spec.get("image_data", ""),
+                    spec.get('image_vector_data', ''), spec.get('image_vector_type', ''),
+                    int(spec.get('image_page', 1)), render_dpi)
             elif kind == "Captured plot":
                 _composer_draw_captured_plot(
                     fig,
@@ -36362,7 +36419,11 @@ def _build_composer_figure_inner(
             _composer_cube_annotations(cube, cube.xaxis.label.get_fontsize())
     from core.composer_bounds import fit_panel_bounds
     fit_panel_bounds(fig, [group for group, spec in zip(panel_groups, specs)
-                           if not spec.get("image_native_pixels")])
+                           if not spec.get("image_native_pixels")], preserve_font_sizes=True)
+    for axis in fig.axes:
+        refresh = getattr(axis, '_composer_refresh_embedded', None)
+        if refresh is not None:
+            refresh()
     # Bounds fitting can rescale a cube panel. Re-anchor paired scales only
     # after that final geometry pass so Q and Iteration retain a fixed small
     # screen-space gap at every Q-bar inward offset.
@@ -36411,7 +36472,16 @@ def _composer_figure_bytes(
         save_kwargs['metadata'] = {'Description': metadata_json, 'Creator': 'SWV Figure Composer'}
     save_kwargs['dpi'] = dpi
     with RENDER_LOCK:
+        from core.composer_vectors import vector_panels, compose_svg, svg_to_pdf
+        panels = vector_panels(fig)
+        if panels and fmt == 'pdf':
+            return svg_to_pdf(_composer_figure_bytes(fig, 'svg', dpi, metadata_json=metadata_json), metadata_json)
+        if panels and fmt == 'svg':
+            for index, axis in enumerate(panels):
+                axis.images[0].set_gid(f'composer_vector_panel_{index}')
         fig.savefig(output, **save_kwargs)
+        if panels and fmt == 'svg':
+            return compose_svg(output.getvalue(), panels, dpi)
     return output.getvalue()
 
 
@@ -39173,6 +39243,17 @@ def _render_figure_composer(
                         key=f"bo_composer_capture_spine_width_{index}",
                         disabled=not source_is_editable,
                     ))
+                    color_cols = st.columns(2)
+                    for column, target in zip(color_cols, ('line', 'marker')):
+                        spec[f'capture_override_{target}_color'] = column.checkbox(
+                            f'Override {target} color', value=False,
+                            key=f'bo_composer_capture_override_{target}_color_{index}',
+                            disabled=not source_is_editable)
+                        spec[f'capture_{target}_color'] = column.color_picker(
+                            f'{target.title()} color', '#1f77b4',
+                            key=f'bo_composer_capture_{target}_color_{index}',
+                            disabled=not source_is_editable or not spec[f'capture_override_{target}_color'])
+                    st.caption('Color overrides apply to all data series in this panel. Uncheck to restore source colors. Enable Re-render source at Composer DPI to apply changes.')
                     detail_cols = st.columns(3)
                     spec["capture_spine_color"] = detail_cols[0].color_picker(
                         "Axis-line color", "#000000",
@@ -39271,13 +39352,55 @@ def _render_figure_composer(
             elif kind == "Image file":
                 st.file_uploader(
                     "Upload image (drag and drop)",
-                    type=["png", "jpg", "jpeg", "tif", "tiff", "webp", "bmp", "gif"],
+                    type=["png", "jpg", "jpeg", "tif", "tiff", "webp", "bmp", "gif", "pdf", "svg"],
                     key=f"bo_composer_image_upload_{index}",
                     on_change=_composer_image_uploaded, args=(index,),
                     help="Drop an image here or browse for one. Uploaded images are included in saved figure metadata.",
                 )
                 spec["image_data"] = st.session_state.get(f"bo_composer_image_data_{index}", "")
+                spec['image_vector_data'] = st.session_state.get(f'bo_composer_image_vector_data_{index}', '')
+                spec['image_vector_type'] = st.session_state.get(f'bo_composer_image_vector_type_{index}', '')
+                if spec['image_vector_type']:
+                    st.caption('PDF/SVG panels retain their original dimensions and vector artwork in SVG/PDF exports. PNG exports and previews use the selected rendering DPI. Text within the uploaded document is not editable here.')
+                if spec['image_vector_type'] == 'pdf':
+                    spec['image_page'] = int(st.number_input(
+                        'PDF page', min_value=1,
+                        max_value=int(st.session_state.get(f'bo_composer_image_page_count_{index}', 1)),
+                        step=1, key=f'bo_composer_image_page_{index}'))
                 if spec["image_data"]:
+                    with st.expander("Uploaded image info"):
+                        from core.image_panels import uploaded_image_info
+                        try:
+                            image_info = uploaded_image_info(
+                                base64.b64decode(spec['image_vector_data'] or spec['image_data']),
+                                spec['image_vector_type'], int(spec.get('image_page', 1)))
+                            st.write(f"Format: {image_info['format']}")
+                            if 'size_inches' in image_info:
+                                iw, ih = image_info['size_inches']
+                                st.write(f"Original size: {iw:.3f} × {ih:.3f} inches ({iw * 72:.2f} × {ih * 72:.2f} pt)")
+                                st.write(f"Aspect ratio (width / height): {iw / ih:.4f}")
+                                st.caption('Text sizes below are at the original document size. Resizing the figure in Keynote or another app scales its text too.')
+                            else:
+                                iw, ih = image_info['pixels']
+                                st.write(f"Original pixels: {iw} × {ih}")
+                                st.write(f"Aspect ratio (width / height): {iw / ih:.4f}")
+                            st.write(f"Panel size: {rect[2] * COMPOSER_CANVAS_SIZES[aspect][0]:.3f} × {rect[3] * COMPOSER_CANVAS_SIZES[aspect][1]:.3f} inches")
+                            if image_info['text']:
+                                sizes = sorted({row['Size (pt)'] for row in image_info['text']})
+                                fonts = sorted({row['Font'] for row in image_info['text']})
+                                st.write('Fonts: ' + '; '.join(fonts))
+                                st.write('Text sizes (pt): ' + ', '.join(f'{size:g}' for size in sizes))
+                                text_info = pd.DataFrame(image_info['text']).drop_duplicates()
+                                summary = text_info.groupby(['Role', 'Size (pt)'], sort=False)['Text'].agg(
+                                    lambda labels: '; '.join(list(dict.fromkeys(labels))[:4])
+                                ).reset_index().rename(columns={'Text': 'Examples'})
+                                st.table(summary)
+                                with st.expander('All detected text'):
+                                    st.dataframe(text_info, hide_index=True, use_container_width=True)
+                            else:
+                                st.caption('Font names and text sizes could not be reliably recovered from this image. Raster images and unsupported outlined text do not retain readable font information.')
+                        except Exception as exc:
+                            st.caption(f'Image information unavailable: {exc}')
                     st.caption("Using the uploaded image. Clear it to use the image path instead.")
                     st.button("Clear uploaded image", key=f"bo_composer_image_clear_{index}",
                               on_click=_composer_clear_uploaded_image, args=(index,))
@@ -39369,7 +39492,7 @@ def _render_figure_composer(
             _composer_unified_panel_actions(active_panel, specs, session, history, observations,
                 observation, trace_analysis, paired_objective, font_family, font_size, label_size)
     config = _composer_config(specs, panel_count)
-    config_signature = _composer_config_signature(config)
+    config_signature = _composer_config_signature({'rendering': 'vector-panels-v1', **config})
 
     preset_name = _composer_preset_save_controls(session, config, selected_preset_name, saved_presets)
 
@@ -39544,16 +39667,15 @@ def _render_figure_composer(
     rendered = st.session_state.get(render_key) or {}
     if not rendered:
         st.info("No preview yet. Preview is optional; use any export button to render and download the current figure.")
-    elif rendered.get("signature") != config_signature:
-        st.image(rendered["png"], caption="Last rendered version", use_container_width=True)
-        st.info("This preview shows older settings. Export buttons use your current applied settings; Render figure refreshes the preview only.")
     else:
+        from core.figure_preview import render_figure_preview
+        render_figure_preview(rendered["png"])
         preview_only = bool(rendered.get("preview_only"))
-        st.image(
-            rendered["png"],
-            caption=("Composer preview" if preview_only else "Rendered figure"),
-            use_container_width=True,
-        )
+        if rendered.get("signature") != config_signature:
+            st.caption("Last rendered version")
+            st.info("This preview shows older settings. Export buttons use your current applied settings; Render figure refreshes the preview only.")
+        else:
+            st.caption("Composer preview" if preview_only else "Rendered figure")
         st.caption('Use the export buttons above for final-quality files with embedded metadata.')
 def _load_simulated_sweep_section(session: dict, section: str) -> bool:
     """Execute only the selected BO tab, including on full-app reruns."""

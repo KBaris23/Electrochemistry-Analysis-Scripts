@@ -886,3 +886,31 @@ else:
     assert app.session_state['bo_composer_bottom_0'] == .2
     app.run()
     assert [w.value for w in app.selectbox] == ['Image file', 'Captured plot']
+
+
+def test_embedded_capture_keeps_point_sizes_after_final_panel_resize():
+    import matplotlib.pyplot as plt
+    from matplotlib.backend_bases import FigureCanvasBase
+    target = plt.figure(figsize=(8, 6))
+    ax = target.add_axes((.1, .1, .8, .8))
+    source, source_ax = plt.subplots(figsize=(10, 4))
+    source_ax.plot([0, 1], [0, 1])
+    source_ax.set_xlabel('Measurement number')
+    source_ax.set_ylabel('Peak height')
+    # Serialized captures can be restored with a renderer-less canvas.
+    FigureCanvasBase(source)
+    token = viewer._COMPOSER_PANEL_TYPOGRAPHY.set({'axis_label_size': 14, 'tick_size': 10})
+    try:
+        viewer._composer_draw_embedded_figure(target, ax, source, (.1, .1, .8, .8), 180, 14)
+        ax.set_position((.15, .15, .6, .6))
+        ax._composer_refresh_embedded()
+        assert source_ax.xaxis.label.get_fontsize() == 14
+        assert source_ax.yaxis.label.get_fontsize() == 14
+        pixels = ax.images[0].get_array().shape
+        bounds = ax.get_position()
+        assert abs(pixels[1] - bounds.width * 8 * 180) <= 1
+        assert abs(pixels[0] - bounds.height * 6 * 180) <= 1
+    finally:
+        viewer._COMPOSER_PANEL_TYPOGRAPHY.reset(token)
+        plt.close(source)
+        plt.close(target)

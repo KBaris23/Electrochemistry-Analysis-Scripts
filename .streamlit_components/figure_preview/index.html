@@ -1,0 +1,86 @@
+<!doctype html>
+<html><head><style>
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px system-ui, sans-serif; color: #333; }
+.toolbar { display: flex; align-items: center; gap: 12px; height: 42px; }
+select { padding: 5px; border: 1px solid #ccc; border-radius: 5px; }
+#viewport { height: 620px; overflow: auto; background: #f1f3f5;
+  border: 1px solid #ddd; border-radius: 5px; }
+#sheet { min-width: 100%; min-height: 100%; width: max-content;
+  display: flex; align-items: center; justify-content: center; padding: 12px; }
+img { display: block; flex: none; max-width: none; background: white; }
+#height-handle { height: 26px; width: 100%; cursor: ns-resize; touch-action: none;
+  border: 1px solid #ccc; border-radius: 0 0 5px 5px; background: #e9ecef;
+  color: #444; font: inherit; user-select: none; }
+#height-handle:focus { outline: 2px solid #448aff; }
+</style></head><body>
+<div class="toolbar"><label for="zoom">Preview zoom</label>
+<select id="zoom">
+<option value="page">Fit to page</option><option value="width">Fit to width</option>
+<option value="0.25">25%</option><option value="0.5">50%</option>
+<option value="0.75">75%</option><option value="1">100%</option>
+<option value="1.5">150%</option><option value="2">200%</option>
+</select><span>Preview only · exports keep their original size</span></div>
+<div id="viewport" tabindex="0" aria-label="Rendered figure preview">
+<div id="sheet"><img id="figure" alt="Rendered figure"></div></div>
+<button id="height-handle" aria-label="Resize preview height. Drag or use arrow keys.">↕ Drag to resize preview</button>
+<script>
+const viewport = document.getElementById('viewport');
+const picture = document.getElementById('figure');
+const zoom = document.getElementById('zoom');
+function resize() {
+  if (!picture.naturalWidth) return;
+  const width = viewport.clientWidth - 24;
+  const height = viewport.clientHeight - 24;
+  let scale = Number(zoom.value);
+  if (zoom.value === 'page') scale = Math.min(width / picture.naturalWidth, height / picture.naturalHeight);
+  if (zoom.value === 'width') scale = width / picture.naturalWidth;
+  picture.style.width = Math.max(1, picture.naturalWidth * scale) + 'px';
+  picture.style.height = Math.max(1, picture.naturalHeight * scale) + 'px';
+}
+zoom.addEventListener('change', () => { resize(); viewport.scrollTo(0, 0); });
+picture.addEventListener('load', resize);
+new ResizeObserver(resize).observe(viewport);
+const handle = document.getElementById('height-handle');
+const storageKey = 'composer-preview-height';
+let previewHeight = 620;
+try { previewHeight = Number(localStorage.getItem(storageKey)) || 620; } catch (_) {}
+function setHeight(value) {
+  previewHeight = Math.max(200, Math.min(1600, value));
+  viewport.style.height = previewHeight + 'px';
+  resize();
+  window.parent.postMessage({isStreamlitMessage: true, type: 'streamlit:setFrameHeight',
+    height: Math.ceil(handle.getBoundingClientRect().bottom + 4)}, '*');
+}
+function saveHeight() {
+  try { localStorage.setItem(storageKey, String(previewHeight)); } catch (_) {}
+}
+let drag = null;
+handle.addEventListener('pointerdown', event => {
+  if (event.button !== 0) return;
+  drag = {y: event.clientY, height: previewHeight};
+  handle.setPointerCapture(event.pointerId);
+  event.preventDefault();
+});
+handle.addEventListener('pointermove', event => {
+  if (drag) setHeight(drag.height + event.clientY - drag.y);
+});
+function finishDrag() { drag = null; saveHeight(); }
+handle.addEventListener('pointerup', finishDrag);
+handle.addEventListener('pointercancel', finishDrag);
+handle.addEventListener('lostpointercapture', finishDrag);
+handle.addEventListener('keydown', event => {
+  if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+  event.preventDefault();
+  setHeight(previewHeight + (event.key === 'ArrowDown' ? 25 : -25));
+  saveHeight();
+});
+window.addEventListener('message', event => {
+  if (event.source !== window.parent || event.data?.type !== 'streamlit:render') return;
+  const source = 'data:image/png;base64,' + event.data.args.png;
+  if (picture.getAttribute('src') !== source) picture.src = source;
+  setHeight(previewHeight);
+});
+window.parent.postMessage({isStreamlitMessage: true, type: 'streamlit:componentReady', apiVersion: 1}, '*');
+setHeight(previewHeight);
+</script></body></html>

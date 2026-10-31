@@ -11,3 +11,6 @@ kaleido==0.2.1
 Pillow
 pywavelets
 joblib
+
+# PDF and SVG imports in Figure Composer image panels.
+PyMuPDF>=1.24,<2

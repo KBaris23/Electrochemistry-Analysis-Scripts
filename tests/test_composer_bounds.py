@@ -33,3 +33,42 @@ def test_full_panel_includes_title_labels_legend_and_colorbar():
         assert max(box.width/target.width,box.height/target.height) > .9
         np.testing.assert_equal(axes[0].lines[0].get_ydata(),[2,3])
     plt.close(fig)
+
+
+def test_fit_preserves_requested_point_sizes():
+    fig = plt.figure(figsize=(6, 4))
+    ax = fig.add_axes((.1, .1, .8, .8))
+    ax.plot([0, 1], [0, 1])
+    ax.set_xlabel('Measurement number', fontsize=14)
+    ax.set_ylabel('Peak height', fontsize=14)
+    ax.tick_params(labelsize=10)
+    try:
+        fit_panel_bounds(fig, [((.1, .1, .8, .8), [ax], [], [])], preserve_font_sizes=True)
+        assert ax.xaxis.label.get_fontsize() == 14
+        assert ax.yaxis.label.get_fontsize() == 14
+        assert all(t.get_fontsize() == 10 for t in ax.get_xticklabels())
+        box = ax.get_tightbbox(fig.canvas.get_renderer())
+        target = Bbox.from_bounds(.1, .1, .8, .8).transformed(fig.transFigure)
+        assert box.x0 >= target.x0 - 1 and box.x1 <= target.x1 + 1
+    finally:
+        plt.close(fig)
+
+
+def test_long_metrics_title_does_not_collapse_axes_with_fixed_fonts():
+    fig, ax = plt.subplots(figsize=(5.6, 3.8))
+    ax.plot(range(80), [.02 + .0005 * i for i in range(80)])
+    ax.set_title('Channel 4 · method 2 | 434 Hz; amplitude 0.04 V; step 0.004 V', fontsize=14)
+    ax.set_xlabel('SWV Measurement Number', fontsize=14)
+    ax.set_ylabel('Peak Height (µA)', fontsize=14)
+    try:
+        for _ in range(2):
+            fit_panel_bounds(fig, [((0, 0, 1, 1), [ax], [], [])], preserve_font_sizes=True)
+            assert ax.get_position().width > .65
+            assert ax.get_position().height > .5
+            assert ax.xaxis.label.get_fontsize() == 14
+            assert ax.title.get_fontsize() == 14
+            assert '\n' in ax.title.get_text()
+            title_box = ax.title.get_window_extent(fig.canvas.get_renderer())
+            assert title_box.x0 >= 0 and title_box.x1 <= fig.bbox.width
+    finally:
+        plt.close(fig)
