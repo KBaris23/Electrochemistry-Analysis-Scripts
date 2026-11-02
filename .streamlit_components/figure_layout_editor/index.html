@@ -363,7 +363,7 @@
       publishLayout("draft saved; click Render to preview");
     }
     function setComponentValue(value) {
-      streamlitMessage("streamlit:setComponentValue", {value});
+      streamlitMessage("streamlit:setComponentValue", {value: {...value, panel_revision: args.panel_revision ?? 0}});
     }
     function aspectRatio(name) {
       if (Number(args.canvas_width_in) > 0 && Number(args.canvas_height_in) > 0) {

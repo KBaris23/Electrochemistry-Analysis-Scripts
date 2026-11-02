@@ -27976,6 +27976,12 @@ def _preserve_captured_plotly_view(source: go.Figure, target: go.Figure,
 def _composer_apply_plotly_title_position(figure):
     """Anchor the title inside the full image, independently of scene margins."""
     metadata = figure.layout.meta if isinstance(figure.layout.meta, Mapping) else {}
+    horizontal = _finite_float(metadata.get("bo_composer_title_x"))
+    if horizontal is not None:
+        figure.update_layout(title=dict(
+            x=min(1.0, max(0.0, horizontal)), xref="container", xanchor="center",
+            pad=dict(l=0, r=0),
+        ))
     position = _finite_float(metadata.get("bo_composer_title_y"))
     if position is not None:
         figure.update_layout(title=dict(
@@ -27993,6 +27999,7 @@ def _plotly_png_bytes(
     text_size: float | None = None,
     mark_scale: float | None = None,
     composer_colorbar_side: str | None = None,
+    trim_font_scale: float = 1.0,
 ) -> bytes:
     export_fig = go.Figure(fig)
     _apply_global_plot_style(export_fig)
@@ -28026,9 +28033,35 @@ def _plotly_png_bytes(
     palette_spec.update(metadata.get("bo_composer_colormap") or {})
     _composer_apply_plotly_colormap(export_fig, palette_spec)
     _composer_apply_plotly_title_position(export_fig)
+    # Plotly's WebGL auto-tick density can depend on raster scale even with a
+    # fixed logical viewport. Resolve automatic ticks before rasterization.
+    if _COMPOSER_PANEL_TYPOGRAPHY.get():
+        for scene_name, scene in export_fig.layout.to_plotly_json().items():
+            if not re.fullmatch(r"scene\d*", scene_name):
+                continue
+            for name in ("x", "y", "z"):
+                axis = scene.get(name + "axis", {})
+                if axis.get("tickmode") in {"array", "linear"} or axis.get("tickvals") is not None:
+                    continue
+                ticks = _composer_plotly_tick_override(export_fig, name, axis, 5, scene=scene_name)
+                ticks.pop("showticklabels", None)
+                export_fig.layout[scene_name][name + "axis"].update(ticks)
+    if "bo_composer_show_legend" in metadata:
+        export_fig.update_layout(showlegend=bool(metadata["bo_composer_show_legend"]))
+    if trim_font_scale != 1.0:
+        _composer_scale_plotly_fonts(export_fig, trim_font_scale)
     try:
         from core.plotly_export import prepare_plotly_export
         prepare_plotly_export()
+        if metadata.get("bo_composer_preserve_3d_view"):
+            import tempfile
+            diagnostic = Path(tempfile.gettempdir()) / "bo-composer-3d-export-diagnostic.json"
+            try:
+                diagnostic.write_text(json.dumps({"figure": json.loads(export_fig.to_json()),
+                    "width": width, "height": int(height or export_fig.layout.height or 800),
+                    "scale": scale, "typography": dict(_COMPOSER_PANEL_TYPOGRAPHY.get())}, default=str))
+            except OSError:
+                pass
         return export_fig.to_image(
             format="png",
             width=width,
@@ -28327,6 +28360,8 @@ def _render_camera_persistent_plotly(
     _apply_global_plot_style(fig)
     metadata = fig.layout.meta if isinstance(fig.layout.meta, Mapping) else {}
     _composer_apply_plotly_colorbar_geometry(fig, metadata.get("bo_composer_colorbar_geometry") or {})
+    if "bo_composer_show_legend" in metadata:
+        fig.update_layout(showlegend=bool(metadata["bo_composer_show_legend"]))
     effective_export_width = int(export_width or _plot_width_px())
     storage_key = f"bo_viewer_camera:{camera_storage_key}"
     shared_storage_key = shared_camera_storage_key or _SHARED_3D_CAMERA_STORAGE_KEY
@@ -31926,6 +31961,10 @@ def _render_app_scrollbar_style() -> None:
 
 
 _COMPOSER_STATE_EXCLUSIONS = (
+    "bo_composer_apply_canvas_dimensions",
+    "bo_composer_add_panel",
+    "bo_composer_capture_apply_aspect_",
+    "bo_composer_image_clear_",
     "bo_composer_image_upload_",
     "bo_composer_editor_",
     "bo_composer_pending_source_edit",
@@ -31948,6 +31987,7 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_captured_plots",
     "bo_composer_pending_captures",
     "bo_composer_pending_delete_indices",
+    "bo_composer_pending_import_state",
     "bo_composer_pending_panel_state",
     "bo_composer_pending_stack_order",
     "bo_composer_stack_",
@@ -32047,7 +32087,11 @@ def _composer_metadata(
 
 
 def _composer_config_signature(config: Mapping[str, Any]) -> str:
-    return hashlib.sha256(_composer_json_bytes(config)).hexdigest()[:16]
+    # Session-state exporters cache image bytes across UI-module reloads. A
+    # renderer update must invalidate them even when all user settings match.
+    source = Path(__file__).stat()
+    payload = {"renderer_version": (source.st_mtime_ns, source.st_size), "config": config}
+    return hashlib.sha256(_composer_json_bytes(payload)).hexdigest()[:16]
 
 
 def _composer_metadata_from_upload(data: bytes, file_name: str) -> dict[str, Any]:
@@ -32082,6 +32126,15 @@ def _composer_metadata_from_upload(data: bytes, file_name: str) -> dict[str, Any
 
 def _composer_apply_config(config: Mapping[str, Any]) -> None:
     """Stage saved widget values before composer widgets are constructed."""
+    # A loaded configuration replaces the draft. Runtime snapshots are excluded
+    # from persistence, but must also be discarded so an early rerun cannot
+    # restore the previous figure over the newly loaded preset.
+    revision = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    for key in ("bo_composer_pending_panel_state", "bo_composer_pending_stack_order",
+                "bo_composer_pending_canvas_resize", "bo_composer_pending_source_edit",
+                "bo_composer_pending_delete_indices", "bo_composer_pending_duplicates",
+                "bo_composer_stack_sources"):
+        st.session_state.pop(key, None)
     if "rescore_profile" in config:
         # Apply on the next app run, before the scoring selector is built.
         # None explicitly restores original recorded scoring.
@@ -32159,6 +32212,36 @@ def _composer_apply_config(config: Mapping[str, Any]) -> None:
         ):
             st.session_state["bo_composer_count"] = len(chosen_ids)
 
+    count = int(st.session_state.get("bo_composer_count", 0) or 0)
+    st.session_state["bo_composer_stack_sources"] = [
+        {"kind": st.session_state.get(f"bo_composer_kind_{index}"),
+         "capture_id": st.session_state.get(f"bo_composer_capture_id_{index}")}
+        for index in range(count)
+    ]
+    st.session_state["bo_composer_stack_revision"] = revision
+    # Scoring/session restoration may rerun or stop the app before Composer is
+    # reached. Widget cleanup must not discard the newly imported settings.
+    st.session_state["bo_composer_pending_import_state"] = _composer_widget_state(count)
+
+
+def _composer_apply_pending_import():
+    imported = st.session_state.pop("bo_composer_pending_import_state", None)
+    if isinstance(imported, Mapping):
+        st.session_state.update({
+            key: copy.deepcopy(value) for key, value in imported.items()
+            if isinstance(key, str) and key.startswith("bo_composer_")
+            and not any(key.startswith(prefix) for prefix in _COMPOSER_STATE_EXCLUSIONS)
+        })
+    # Older exports and an already-staged import may contain button values.
+    # Remove them before the corresponding widgets are instantiated. Even False
+    # is illegal as an explicitly assigned Streamlit button value.
+    for key in list(st.session_state):
+        if str(key).startswith(("bo_composer_apply_canvas_dimensions",
+                                "bo_composer_add_panel",
+                                "bo_composer_capture_apply_aspect_",
+                                "bo_composer_image_clear_")):
+            del st.session_state[key]
+
 
 def _composer_capture_changed(index):
     """Reset source-specific settings, including copies staged by layout reruns."""
@@ -32166,7 +32249,7 @@ def _composer_capture_changed(index):
     capture_id = st.session_state.get(selection_key)
     reset_fields = {f"bo_composer_{name}_{index}" for name in (
         "custom_title", "x_axis_title", "y_axis_title", "z_axis_title",
-        "colormap_override_enabled", "colorbar_geometry_enabled",
+        "colormap_override_enabled", "colorbar_geometry_enabled", "colorbar_label_enabled", "colorbar_label", "colorbar_label_orientation",
     )}
 
     def source_setting(key):
@@ -33701,6 +33784,11 @@ def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
     """Copy one new mouse-layout event into the manual coordinate controls."""
     if not isinstance(result, Mapping):
         return False
+    # Component values can arrive after a control has changed the panel shape.
+    # Never let geometry emitted for an older layout overwrite that change.
+    revision = int(st.session_state.get("bo_composer_stack_revision", 0))
+    if result.get("panel_revision", 0) != revision:
+        return False
     event_id = result.get("event_id")
     seen_key = "bo_composer_layout_editor_seen_event"
     if event_id is None or event_id == st.session_state.get(seen_key):
@@ -34629,7 +34717,7 @@ def _composer_plotly_tick_override(fig, name, axis_config, count, scene=None, re
     if explicit:
         if logarithmic and min(explicit) <= 0:
             raise ValueError(f'{name.upper()} tick values must be positive on a logarithmic axis.')
-        return {'tickmode': 'array', 'tickvals': explicit, 'ticktext': None}
+        return {'tickmode': 'array', 'tickvals': explicit, 'ticktext': None, 'showticklabels': True}
     if not count:
         return {}
     bounds = axis_config.get('range')
@@ -34659,7 +34747,7 @@ def _composer_plotly_tick_override(fig, name, axis_config, count, scene=None, re
     ticks = (np.geomspace(*bounds, count) if logarithmic else np.linspace(*bounds, count))
     if count == 1:
         ticks = [np.sqrt(bounds[0] * bounds[1]) if logarithmic else np.mean(bounds)]
-    return {'tickmode': 'array', 'tickvals': list(ticks), 'ticktext': None}
+    return {'tickmode': 'array', 'tickvals': list(ticks), 'ticktext': None, 'showticklabels': True}
 
 
 def _composer_apply_plotly_text_size(
@@ -34668,7 +34756,7 @@ def _composer_apply_plotly_text_size(
     canvas_width_px: float | None = None,
 ) -> go.Figure:
     """Apply one panel-local text size after global export styling."""
-    typography = _COMPOSER_PANEL_TYPOGRAPHY.get()
+    typography = dict(_COMPOSER_PANEL_TYPOGRAPHY.get())
     text_size = max(4.0, float(size))
     title_size = max(4.0, float(typography.get("title_size", text_size * 1.25)))
     label_size = max(4.0, float(typography.get("axis_label_size", text_size)))
@@ -34701,9 +34789,7 @@ def _composer_apply_plotly_text_size(
                 "tickfont": {
                     "size": max(
                         1.0,
-                        tick_size
-                        * _PLOTLY_3D_TICK_SCALE
-                        * min(1.0, width_ratio) ** 0.5,
+                        tick_size * _PLOTLY_3D_TICK_SCALE * min(1.0, width_ratio) ** 0.5,
                     ),
                 },
             }
@@ -34890,7 +34976,8 @@ def _composer_colorbar_geometry(spec):
 
 def _composer_apply_plotly_colorbar_geometry(figure, spec):
     geometry = _composer_colorbar_geometry(spec)
-    if geometry is None:
+    orientation = spec.get("colorbar_label_orientation", "Keep original")
+    if geometry is None and not spec.get("colorbar_label_enabled") and orientation == "Keep original":
         return
     bars = []
     for trace in figure.data:
@@ -34908,20 +34995,50 @@ def _composer_apply_plotly_colorbar_geometry(figure, spec):
         if re.fullmatch(r"coloraxis\d*", key) and figure.layout[key].showscale is not False:
             bars.append(figure.layout[key].colorbar)
     index = int(spec.get("colorbar_number", 1)) - 1
-    if 0 <= index < len(bars):
+    if 0 <= index < len(bars) and spec.get("colorbar_label_enabled"):
+        bars[index].title.text = str(spec.get("colorbar_label", ""))
+    if 0 <= index < len(bars) and orientation != "Keep original":
+        bars[index].title.side = "right" if orientation == "Vertical beside bar" else "top"
+    if 0 <= index < len(bars) and geometry is not None:
         bars[index].update(x=geometry["x"], y=geometry["y"], xanchor="center", yanchor="middle",
             len=geometry["length"], lenmode="fraction", thickness=geometry["thickness"], thicknessmode="fraction")
 
 
 def _composer_apply_matplotlib_colorbar_geometry(axes, spec, rect=(0, 0, 1, 1)):
     geometry = _composer_colorbar_geometry(spec)
-    if geometry is None:
+    orientation = spec.get("colorbar_label_orientation", "Keep original")
+    if geometry is None and not spec.get("colorbar_label_enabled") and orientation == "Keep original":
         return
     bars = [axis for axis in axes if _is_matplotlib_colorbar_axis(axis)]
     index = int(spec.get("colorbar_number", 1)) - 1
     if 0 <= index < len(bars):
         axis = bars[index]
         horizontal = getattr(getattr(axis, "_colorbar", None), "orientation", "vertical") == "horizontal"
+        if spec.get("colorbar_label_enabled"):
+            text = str(spec.get("colorbar_label", ""))
+            if axis.get_title():
+                axis.set_title(text)
+            elif horizontal:
+                axis.set_xlabel(text)
+            else:
+                axis.set_ylabel(text)
+        if orientation != "Keep original":
+            original_label = next((label for label in
+                (axis.title, axis.yaxis.label, axis.xaxis.label) if label.get_text()), axis.yaxis.label)
+            text = (str(spec.get("colorbar_label", "")) if spec.get("colorbar_label_enabled")
+                    else original_label.get_text())
+            font = copy.copy(original_label.get_fontproperties())
+            color = original_label.get_color()
+            axis.set_title("")
+            axis.set_xlabel("")
+            axis.set_ylabel("")
+            if orientation == "Horizontal above bar":
+                axis.set_title(text, fontproperties=font, color=color)
+            else:
+                axis.yaxis.set_label_position("right")
+                axis.set_ylabel(text, rotation=90, fontproperties=font, color=color)
+        if geometry is None:
+            return
         w, h = ((geometry["length"], geometry["thickness"]) if horizontal
                 else (geometry["thickness"], geometry["length"]))
         left, bottom, width, height = rect
@@ -35119,6 +35236,68 @@ def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
         suptitle.set_fontweight(_composer_font_weight(typography, 'title'))
 
 
+def _composer_scale_plotly_fonts(figure, factor):
+    """Compensate crop magnification after all panel/global text styling."""
+    def visit(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.endswith("font") and isinstance(child, dict) and child.get("size") is not None:
+                    child["size"] = max(1., float(child["size"]) * factor)
+                elif key != "meta":
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    layout = figure.layout.to_plotly_json()
+    visit(layout)
+    figure.update_layout(layout)
+    for trace in figure.data:
+        payload = trace.to_plotly_json()
+        visit(payload)
+        trace.update(payload)
+
+
+def _composer_trim_plotly_export(render, width, height, padding):
+    """Fit cropped content while keeping its original displayed text scale."""
+    from PIL import Image
+    def read(data):
+        with Image.open(BytesIO(data)) as image:
+            return image.convert("RGBA")
+    original = read(render(1.0))
+    base_scale = min(width / original.width, height / original.height)
+    image = original
+    factor = 1.0
+    # Text changes can slightly move the crop bounds. Refine from fresh source
+    # each time, rather than accumulating font multipliers.
+    for _ in range(4):
+        cropped = _composer_trim_blank_margins(image, padding)
+        fitted_scale = min(width / cropped.width, height / cropped.height)
+        desired = base_scale / fitted_scale
+        if abs(desired - factor) <= .01 * max(desired, .01):
+            break
+        factor = desired
+        image = read(render(factor))
+    cropped = _composer_trim_blank_margins(image, padding)
+    output = BytesIO()
+    cropped.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _composer_trim_blank_margins(image, padding_percent=2.0):
+    """Crop only exterior white/transparent space; retain all visible content."""
+    from PIL import Image, ImageChops
+    rgba = image.convert("RGBA")
+    white = Image.new("RGBA", rgba.size, "white")
+    flattened = Image.alpha_composite(white, rgba).convert("RGB")
+    bounds = ImageChops.difference(flattened, Image.new("RGB", rgba.size, "white")).getbbox()
+    if bounds is None:
+        return rgba
+    left, top, right, bottom = bounds
+    padding = max(0, round(max(right-left, bottom-top) * float(padding_percent) / 100.))
+    return rgba.crop((max(0, left-padding), max(0, top-padding),
+                      min(rgba.width, right+padding), min(rgba.height, bottom+padding)))
+
+
 def _composer_draw_embedded_figure(
     target_fig: plt.Figure,
     ax,
@@ -35165,22 +35344,27 @@ def _composer_draw_embedded_figure(
                     if not _is_matplotlib_colorbar_axis(axis):
                         _composer_clip_axes_y(axis)
         if isinstance(panel_figure, go.Figure):
-            # Plotly sizes text in pixels of the panel image, which is rendered
-            # at the figure DPI: convert the point size so a "Plot text" of N
-            # prints at N pt, matching the Matplotlib panels.
-            png = _plotly_png_bytes(
+            # Use one logical viewport at every output DPI. Changing Plotly's
+            # layout width changes tick selection, 3D text, marks and margins;
+            # Kaleido's raster scale increases resolution without reflow.
+            design_dpi = 220.0
+            design_width, design_height = _composer_panel_pixel_size(target_fig, rect, design_dpi)
+            render_panel = partial(_plotly_png_bytes,
                 panel_figure,
-                width=width_px,
-                height=height_px,
-                scale=1.5,
-                text_size=(
-                    None if text_size is None
-                    else float(text_size) * float(render_dpi) / 72.0
-                    * _PLOTLY_TEXT_CALIBRATION
-                ),
-                mark_scale=float(width_px) / _PLOTLY_MARK_DESIGN_WIDTH_PX,
+                width=design_width,
+                height=design_height,
+                scale=1.5 * float(render_dpi) / design_dpi,
+                text_size=(None if text_size is None else
+                           float(text_size) * design_dpi / 72.0 * _PLOTLY_TEXT_CALIBRATION),
+                mark_scale=float(design_width) / _PLOTLY_MARK_DESIGN_WIDTH_PX,
                 composer_colorbar_side=colorbar_side,
             )
+            if typography.get("capture_trim_blank_margins"):
+                png = _composer_trim_plotly_export(
+                    lambda factor: render_panel(trim_font_scale=factor), width_px, height_px,
+                    typography.get("capture_trim_padding", 2.0))
+            else:
+                png = render_panel()
             buffer = BytesIO(png)
         else:
             if _COMPOSER_JOURNAL_STYLE.get():
@@ -35227,7 +35411,11 @@ def _composer_draw_embedded_figure(
             ax._composer_vector_figure = panel_figure
             plt.close(panel_figure)
         with Image.open(buffer) as image:
-            ax.imshow(image.convert("RGBA"))
+            rendered_image = image.convert("RGBA")
+            if typography.get("capture_trim_blank_margins") and not isinstance(panel_figure, go.Figure):
+                rendered_image = _composer_trim_blank_margins(
+                    rendered_image, typography.get("capture_trim_padding", 2.0))
+            ax.imshow(rendered_image)
         ax.set_axis_off()
     except Exception as exc:
         _composer_error_panel(ax, str(exc))
@@ -35420,6 +35608,50 @@ def _composer_valid_limits(value: Any) -> tuple[float, float] | None:
     return float(low), float(high)
 
 
+def _composer_capture_aspect_changed(index, rect):
+    """Resize this panel before the layout editor and coordinate widgets render."""
+    choice = st.session_state.get(f"bo_composer_capture_aspect_{index}", "Captured view")
+    if choice == "Match panel":
+        return  # The view follows the existing panel, not the other way around.
+    ratio = {"Square (1:1)": 1., "Landscape (4:3)": 4/3, "Portrait (3:4)": 3/4}.get(choice)
+    if choice == "Custom":
+        ratio = (float(st.session_state.get(f"bo_composer_capture_aspect_width_{index}", 1.)) /
+                 float(st.session_state.get(f"bo_composer_capture_aspect_height_{index}", 1.)))
+    elif choice == "Captured view":
+        capture_id = st.session_state.get(f"bo_composer_capture_id_{index}")
+        capture = (st.session_state.get("bo_composer_captured_plots") or {}).get(capture_id, {})
+        source = capture.get("source_figure")
+        if isinstance(source, go.Figure):
+            metadata = source.layout.meta if isinstance(source.layout.meta, Mapping) else {}
+            viewport = metadata.get("bo_captured_viewport") or {}
+            ratio = float(viewport.get("width") or source.layout.width or 1200) / float(
+                viewport.get("height") or source.layout.height or 700)
+    if ratio is None or ratio <= 0:
+        return
+    canvas_width, canvas_height = _composer_canvas_inches(st.session_state.get("bo_composer_aspect"))
+    left, bottom, width, _ = map(float, rect)
+    height = width * canvas_width / (ratio * canvas_height)
+    fit = min(1., (1. - left) / width, (1. - bottom) / height)
+    updated = (left, bottom, width * fit, height * fit)
+    pending = st.session_state.get("bo_composer_pending_panel_state")
+    layout = st.session_state.get("bo_composer_layout", "Manual")
+    if layout != "Manual":
+        count = int(st.session_state.get("bo_composer_count", 1))
+        for other_index, other_rect in enumerate(_composer_layout_rects(count, layout)):
+            for field, value in zip(("left", "bottom", "width", "height"), other_rect):
+                key = f"bo_composer_{field}_{other_index}"
+                st.session_state[key] = value
+                if isinstance(pending, dict):
+                    pending[key] = value
+    for field, value in zip(("left", "bottom", "width", "height"), updated):
+        key = f"bo_composer_{field}_{index}"
+        st.session_state[key] = value
+        if isinstance(pending, dict):
+            pending[key] = value
+    st.session_state["bo_composer_layout"] = "Manual"
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+
+
 def _render_composer_capture_camera(index, capture, spec):
     """Edit a panel's 3D view without changing its shared captured source."""
     capture_id = str(spec["capture_id"])
@@ -35432,7 +35664,10 @@ def _render_composer_capture_camera(index, capture, spec):
         "3D view aspect ratio",
         ["Captured view", "Match panel", "Square (1:1)", "Landscape (4:3)", "Portrait (3:4)", "Custom"],
         key=f"bo_composer_capture_aspect_{index}",
-        help="Changes the plotting window's shape without changing the camera angle or zoom. Match panel fills the panel's available aspect ratio.",
+        on_change=_composer_capture_aspect_changed, args=(index, spec.get("rect", (0, 0, 1, 1))),
+        help="Updates this panel's shape in the mouse layout editor while keeping its position. "
+             "Keeps width where it fits; scales down if needed to stay inside the canvas. "
+             "Match panel instead makes the view follow the existing panel dimensions.",
     )
     ratio = None
     if aspect_choice == "Match panel":
@@ -35442,14 +35677,43 @@ def _render_composer_capture_camera(index, capture, spec):
     elif aspect_choice == "Custom":
         columns = st.columns(2)
         aspect_width = columns[0].number_input("View width ratio", .25, 10., 1., .05,
-            key=f"bo_composer_capture_aspect_width_{index}")
+            key=f"bo_composer_capture_aspect_width_{index}",
+            on_change=_composer_capture_aspect_changed, args=(index, spec.get("rect", (0, 0, 1, 1))))
         aspect_height = columns[1].number_input("View height ratio", .25, 10., 1., .05,
-            key=f"bo_composer_capture_aspect_height_{index}")
+            key=f"bo_composer_capture_aspect_height_{index}",
+            on_change=_composer_capture_aspect_changed, args=(index, spec.get("rect", (0, 0, 1, 1))))
         ratio = aspect_width / aspect_height
     else:
         ratio = {"Square (1:1)": 1., "Landscape (4:3)": 4/3, "Portrait (3:4)": 3/4}.get(aspect_choice)
+    st.button(
+        "Apply aspect ratio to panel", key=f"bo_composer_capture_apply_aspect_{index}",
+        on_click=_composer_capture_aspect_changed, args=(index, spec.get("rect", (0, 0, 1, 1))),
+        disabled=aspect_choice == "Match panel",
+        help="Reapply the selected aspect ratio to this panel in the mouse layout editor.",
+    )
     spec["capture_view_aspect"] = ratio
-    spec["capture_title_y"] = st.slider(
+    spec["capture_trim_blank_margins"] = st.checkbox(
+        "Trim blank margins in rendered panel", key=f"bo_composer_capture_trim_blank_margins_{index}",
+        help="Removes exterior white space from the rendered image and fits the result into this panel. "
+             "Enlarges the plot while preserving text size and camera perspective. May require additional render passes. Applies when rendering/exporting the figure.",
+    )
+    if spec["capture_trim_blank_margins"]:
+        spec["capture_trim_padding"] = st.slider(
+            "Padding around trimmed plot (%)", 0.0, 10.0, 2.0, .5,
+            key=f"bo_composer_capture_trim_padding_{index}",
+        )
+        st.caption("Click Render figure to see the trimmed panel. The interactive camera view keeps its original viewport.")
+    title_position_cols = st.columns(2)
+    source_title_x = getattr(getattr(capture.get("source_figure"), "layout", None), "title", None)
+    default_title_x = _finite_float(getattr(source_title_x, "x", None))
+    spec["capture_title_x"] = title_position_cols[0].slider(
+        "Title X (%)", 0.0, 100.0,
+        100.0 * min(1.0, max(0.0, default_title_x if default_title_x is not None else .5)), 1.0,
+        key=f"bo_composer_capture_title_x_{index}",
+        help="Horizontal position of the title's center within the complete panel image. "
+             "50 centers it; lower values move it left. Applies to preview and export.",
+    ) / 100.0
+    spec["capture_title_y"] = title_position_cols[1].slider(
         "Title height (%)", 0.0, 100.0, 98.0, 1.0,
         key=f"bo_composer_capture_title_y_{index}",
         help="Vertical position of the title's top edge within the complete panel image. "
@@ -35516,13 +35780,17 @@ def _composer_formatted_capture_figure(
                 figure.update_layout(width=round(view_width), height=view_height, autosize=False)
             metadata["bo_composer_preserve_3d_view"] = True
             metadata["bo_composer_title_y"] = float(spec.get("capture_title_y", .98))
+            if spec.get("capture_title_x") is not None:
+                metadata["bo_composer_title_x"] = float(spec["capture_title_x"])
         else:
             # Repair captures made when a vacant scene was mistaken for 3D.
             metadata.pop("bo_composer_preserve_3d_view", None)
-        if spec.get("colorbar_geometry_enabled"):
+        if (spec.get("colorbar_geometry_enabled") or spec.get("colorbar_label_enabled")
+                or spec.get("colorbar_label_orientation", "Keep original") != "Keep original"):
             metadata["bo_composer_colorbar_geometry"] = {
                 key: value for key, value in spec.items() if key.startswith("colorbar_")
             }
+        metadata["bo_composer_show_legend"] = show_legend
         figure.update_layout(meta=metadata)
         _composer_apply_plotly_colorbar_geometry(figure, spec)
         apply_capture_colors(figure, line_color, marker_color)
@@ -35617,6 +35885,7 @@ def _composer_formatted_capture_figure(
                     if len(sizes):
                         collection.set_sizes(np.asarray(sizes) * marker_scale ** 2)
         _composer_apply_matplotlib_colormap(figure.axes, spec)
+        _composer_apply_matplotlib_colorbar_geometry(figure.axes, spec)
         return figure
     return None
 
@@ -36296,6 +36565,99 @@ def _composer_build_hyperparameter_plot(
         aggregate=spec.get("aggregate", "Mean"),
         draw_cube_edges=spec.get("draw_cube_edges", False),
     )
+
+
+_COMPOSER_RENDER_GLOBAL_KEYS = (
+    "bo_composer_dpi", "bo_composer_aspect", "bo_composer_canvas_width_px",
+    "bo_composer_canvas_height_px", "bo_composer_font", "bo_composer_font_size",
+    "bo_composer_label_size", "bo_composer_journal_style",
+)
+_COMPOSER_RENDER_PANEL_FIELDS = (
+    "text_size", "title_size", "axis_label_size", "tick_size", "legend_size",
+    "colorbar_title_size", "colorbar_tick_size", "individual_axis_sizes",
+    "x_axis_size", "y_axis_size", "z_axis_size",
+    "title_weight", "axis_label_weight", "tick_weight", "legend_weight",
+)
+
+
+def _composer_restore_render_settings(config):
+    """Restore only rendering sizes; retain current sources and panel geometry."""
+    saved = config.get("state") or {}
+    updates = {key: copy.deepcopy(saved[key]) for key in _COMPOSER_RENDER_GLOBAL_KEYS if key in saved}
+    panels = config.get("panels") or []
+    used = set()
+    for index in range(int(st.session_state.get("bo_composer_count", 0))):
+        capture_id = st.session_state.get(f"bo_composer_capture_id_{index}")
+        label = st.session_state.get(f"bo_composer_label_{index}", chr(65+index))
+        source = next((i for i, panel in enumerate(panels)
+                       if capture_id and panel.get("capture_id") == capture_id and i not in used), None)
+        if source is None:
+            source = next((i for i in range(int(saved.get("bo_composer_count", len(panels))))
+                           if saved.get(f"bo_composer_label_{i}", chr(65+i)) == label and i not in used), None)
+        if source is None:
+            continue
+        used.add(source)
+        for field in _COMPOSER_RENDER_PANEL_FIELDS:
+            old_key = f"bo_composer_{field}_{source}"
+            if old_key in saved:
+                updates[f"bo_composer_{field}_{index}"] = copy.deepcopy(saved[old_key])
+    updates["bo_composer_reformat_text"] = False
+    for dimension in ("width", "height"):
+        key = f"bo_composer_canvas_{dimension}_px"
+        if key in updates:
+            updates[f"bo_composer_canvas_{dimension}_input"] = updates[key]
+    st.session_state["bo_composer_render_recovery_undo"] = {
+        key: (key in st.session_state, copy.deepcopy(st.session_state.get(key))) for key in updates
+    }
+    st.session_state.update(updates)
+    pending = st.session_state.get("bo_composer_pending_panel_state")
+    if isinstance(pending, dict):
+        pending.update({key:value for key,value in updates.items() if key in pending})
+    st.session_state.pop("bo_composer_pending_canvas_resize", None)
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_undo_dpi_shrink(design_dpi, changed_dpi):
+    """Repair legacy fixed-pixel DPI shrink without touching panel formatting."""
+    width, height = _composer_canvas_inches(st.session_state.get("bo_composer_aspect"))
+    factor = float(changed_dpi) / float(design_dpi)
+    dpi = int(st.session_state.get("bo_composer_dpi", 220))
+    updates = {"bo_composer_aspect": "Custom (pixels)", "bo_composer_reformat_text": False}
+    for dimension, inches in (("width", width), ("height", height)):
+        pixels = round(inches * factor * dpi)
+        updates[f"bo_composer_canvas_{dimension}_px"] = pixels
+        updates[f"bo_composer_canvas_{dimension}_input"] = pixels
+    st.session_state["bo_composer_render_recovery_undo"] = {
+        key: (key in st.session_state, copy.deepcopy(st.session_state.get(key))) for key in updates
+    }
+    st.session_state.update(updates)
+    st.session_state.pop("bo_composer_pending_canvas_resize", None)
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_undo_render_restore():
+    for key, (existed, value) in st.session_state.pop("bo_composer_render_recovery_undo", {}).items():
+        if existed:
+            st.session_state[key] = value
+        else:
+            st.session_state.pop(key, None)
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_dpi_changed(previous_dpi):
+    """Change raster density without changing the figure's physical dimensions."""
+    dpi = float(st.session_state.get("bo_composer_dpi", 220))
+    if (st.session_state.get("bo_composer_aspect") == "Custom (pixels)"
+            and not st.session_state.get("bo_composer_reformat_text", False)):
+        for dimension, default in (("width", 1980), ("height", 2200)):
+            key = f"bo_composer_canvas_{dimension}_px"
+            pixels = round(float(st.session_state.get(key, default)) * dpi / float(previous_dpi))
+            st.session_state[key] = pixels
+            st.session_state[f"bo_composer_canvas_{dimension}_input"] = pixels
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
 
 
 def _composer_canvas_inches(aspect):
@@ -38434,6 +38796,7 @@ def _render_figure_composer(
 ) -> None:
     _report_bo_loading(0.94, 'Preparing Figure Composer panels and preview...')
     _composer_restore_pending_panel_state()
+    _composer_apply_pending_import()
     _composer_pin_panel_state()
     pending_stack = st.session_state.pop("bo_composer_pending_stack_order", None)
     if pending_stack is not None:
@@ -38782,7 +39145,7 @@ def _render_figure_composer(
                     )
 
     st.session_state.setdefault("bo_composer_layout", "Manual")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, dpi_options = st.columns([1, 1, 1, 1, .85])
     aspect = c1.selectbox(
         "Canvas",
         [*COMPOSER_CANVAS_SIZES, "Custom (pixels)"],
@@ -38795,7 +39158,46 @@ def _render_figure_composer(
     )
     panel_count = int(c2.number_input("Panels", min_value=0, max_value=24, value=4, step=1, key="bo_composer_count"))
     preset = c3.selectbox("Layout", ["Manual", "Grid", "Main left + stack", "Top wide + grid"], key="bo_composer_layout")
-    dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25, key="bo_composer_dpi"))
+    dpi_options.checkbox(
+        "Reformat text", value=False, key="bo_composer_reformat_text",
+        disabled=aspect != "Custom (pixels)",
+        help="Off: preserve the physical figure and text sizes; changing DPI changes export resolution only. "
+             "On: keep custom canvas pixel dimensions fixed, so changing DPI changes physical size and text proportions. "
+             "This affects future DPI changes; it does not reset your font controls.",
+    )
+    dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25,
+        key="bo_composer_dpi", on_change=_composer_dpi_changed,
+        args=(int(st.session_state.get("bo_composer_dpi", 220)),),
+        help="Changes export resolution only. Physical canvas size, panel positions and typography stay fixed."))
+    with st.expander("Restore original render settings", expanded=False):
+        st.markdown("**Undo the earlier DPI-induced enlargement**")
+        st.caption("For a figure that looked correct at 220 DPI and became oversized after switching to 600: "
+                   "restore the canvas's physical size by 600 ÷ 220. Text values, panel positions and sources stay unchanged. "
+                   "Apply once; use Undo settings restore if needed.")
+        correction_cols = st.columns(3)
+        design_dpi = correction_cols[0].number_input("Original design DPI", 72, 600, 220,
+            key="bo_composer_render_recovery_design_dpi")
+        changed_dpi = correction_cols[1].number_input("DPI that caused enlargement", 72, 600, 600,
+            key="bo_composer_render_recovery_changed_dpi")
+        correction_cols[2].button("Undo DPI-induced enlargement",
+            key="bo_composer_render_recovery_dpi_apply", on_click=_composer_undo_dpi_shrink,
+            args=(design_dpi, changed_dpi), use_container_width=True)
+        st.markdown("**Alternatively, restore settings from a preset**")
+        st.caption("Restore canvas size, DPI and text sizes from a saved preset. Current plots, "
+                   "panel positions, letters, titles, camera views and colorbar placement are kept. "
+                   "Panels match by capture ID, then letter. This restores saved settings, not an unsaved historical render.")
+        recovery_names = list(saved_presets)
+        recovery_default = st.session_state.get("bo_composer_preset_name")
+        recovery_name = st.selectbox("Restore settings from preset", recovery_names,
+            index=recovery_names.index(recovery_default) if recovery_default in recovery_names else 0,
+            key="bo_composer_render_recovery_source")
+        recovery_cols = st.columns(2)
+        recovery_cols[0].button("Restore original render settings",
+            key="bo_composer_render_recovery_apply", on_click=_composer_restore_render_settings,
+            args=(saved_presets[recovery_name].get("config") or {},), use_container_width=True)
+        recovery_cols[1].button("Undo settings restore", key="bo_composer_render_recovery_undo_button",
+            on_click=_composer_undo_render_restore,
+            disabled=not bool(st.session_state.get("bo_composer_render_recovery_undo")), use_container_width=True)
     canvas_inches = _composer_canvas_inches(aspect)
     canvas_pixels = tuple(round(value * dpi) for value in canvas_inches)
     with st.expander("Canvas dimensions (workspace and export)", expanded=aspect == "Custom (pixels)"):
@@ -39304,6 +39706,22 @@ def _render_figure_composer(
                     key=f"bo_composer_colorbar_tick_size_{index}",
                     help="Size of the numbers beside the colorbar, independent of axis ticks.",
                 ))
+                spec["colorbar_label_enabled"] = st.checkbox(
+                    "Override colorbar label", key=f"bo_composer_colorbar_label_enabled_{index}",
+                    disabled=kind == "Image file" or (kind == "Captured plot" and not editable_capture),
+                )
+                if spec["colorbar_label_enabled"]:
+                    spec["colorbar_label"] = st.text_input(
+                        "Colorbar label text", key=f"bo_composer_colorbar_label_{index}",
+                        help="Replaces the selected colorbar's label. Leave blank to hide it.",
+                    )
+                spec["colorbar_label_orientation"] = st.selectbox(
+                    "Colorbar label orientation",
+                    ["Keep original", "Vertical beside bar", "Horizontal above bar"],
+                    key=f"bo_composer_colorbar_label_orientation_{index}",
+                    disabled=kind == "Image file" or (kind == "Captured plot" and not editable_capture),
+                    help="Sets the selected colorbar label's orientation in previews and exports.",
+                )
                 spec["colorbar_geometry_enabled"] = st.checkbox(
                     "Set colorbar size and position", key=f"bo_composer_colorbar_geometry_enabled_{index}",
                     disabled=kind == "Image file" or (kind == "Captured plot" and not editable_capture),
@@ -40422,7 +40840,7 @@ def _render_figure_composer(
                     if isinstance(source_figure, go.Figure) and _plotly_has_3d_traces(source_figure):
                         _render_composer_capture_camera(index, capture, spec)
                         st.caption(preview_caption)
-                    elif isinstance(capture.get("png_bytes"), (bytes, bytearray)) and not spec.get("capture_starting_point_appearance") and not spec.get("colormap_override_enabled"):
+                    elif isinstance(capture.get("png_bytes"), (bytes, bytearray)) and not spec.get("capture_starting_point_appearance") and not spec.get("colormap_override_enabled") and not spec.get("colorbar_label_enabled") and spec.get("colorbar_label_orientation", "Keep original") == "Keep original":
                         st.image(capture["png_bytes"], caption=preview_caption, width=520)
                     elif isinstance(source_figure, go.Figure):
                         preview_figure = _composer_formatted_capture_figure(capture, spec)

@@ -68,6 +68,11 @@ from core.processing import (
     rotate_offset_using_bracketing_minima,
     rotate_offset_using_prominent_bracketing_minima,
 )
+# Streamlit reruns app.py but can retain imported UI code in sys.modules.
+# Refresh before binding entry points, preserving the existing session/captures.
+from core.module_refresh import refresh_local_module
+refresh_local_module("bo_session_viewer")
+
 from bo_session_viewer import (
     _bo_swv_settings_key,
     _figure_layout_editor,

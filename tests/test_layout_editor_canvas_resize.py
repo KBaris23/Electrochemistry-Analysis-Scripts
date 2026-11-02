@@ -166,3 +166,52 @@ def test_stack_revision_refreshes_labels_and_geometry_even_with_dirty_editor():
         assert page.evaluate('rects') == [[.6,.5,.3,.3],[.1,.1,.3,.3]]
         assert page.evaluate('dirty') is False
         browser.close()
+
+
+def test_old_editor_event_cannot_undo_aspect_control_change():
+    state = {'bo_composer_capture_aspect_0': 'Square (1:1)',
+             'bo_composer_aspect': '4:3', 'bo_composer_kind_0': 'Captured plot'}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_capture_aspect_changed(0, (.1, .1, .4, .2))
+        new_height = state['bo_composer_height_0']
+        stale = {'event_id': 'late-drag', 'panel_revision': 0, 'rects': [[.1, .1, .4, .2]]}
+        assert not viewer._composer_apply_layout_editor_result(stale, 1)
+        assert state['bo_composer_height_0'] == new_height
+        current = dict(stale, event_id='new-drag', panel_revision=1)
+        assert viewer._composer_apply_layout_editor_result(current, 1)
+        assert state['bo_composer_height_0'] == .2
+
+
+def test_editor_accepts_aspect_update_over_dirty_browser_draft():
+    playwright = pytest.importorskip('playwright.sync_api')
+    component = Path(__file__).resolve().parents[1] / '.streamlit_components/figure_layout_editor/index.html'
+    with playwright.sync_playwright() as p:
+        try:
+            browser = p.chromium.launch(headless=True)
+        except playwright.Error:
+            browser = p.chromium.launch(headless=True, channel='chrome')
+        page = browser.new_page(viewport={'width': 1000, 'height': 900})
+        page.goto(component.as_uri())
+        page.evaluate("""() => {
+            window.payloads = [];
+            window.addEventListener('message', e => {
+                if (e.data.type === 'streamlit:setComponentValue') payloads.push(e.data.value);
+            });
+            window.postMessage({type:'streamlit:render', args:{rects:[[.1,.1,.4,.2]],
+                canvas_width_in:12, canvas_height_in:9, aspect:'4:3', panel_revision:0}}, '*');
+        }""")
+        page.locator('.panel').wait_for()
+        before = page.locator('.panel').bounding_box()
+        page.evaluate("""() => {
+            dirty = true;
+            window.postMessage({type:'streamlit:render', args:{rects:[[.1,.1,.4,.533333]],
+                canvas_width_in:12, canvas_height_in:9, aspect:'4:3', panel_revision:1}}, '*');
+        }""")
+        page.wait_for_function('rects[0][3] > .5')
+        after = page.locator('.panel').bounding_box()
+        assert after['height'] > before['height'] * 2
+        assert after['width'] == pytest.approx(before['width'], abs=1)
+        page.evaluate("publishLayout('draft saved; click Render to preview')")
+        page.wait_for_function('payloads.length > 0')
+        assert page.evaluate('payloads.at(-1).panel_revision') == 1
+        browser.close()

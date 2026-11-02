@@ -193,3 +193,79 @@ st.session_state['bo_composer_stack_sources'] = sources
     assert app.session_state['bo_composer_stack_sources'][1]['kind'] == 'Global trend'
     app.button[0].click().run()
     assert app.selectbox(key='bo_composer_kind_1').value == 'Global trend'
+
+
+def test_loading_preset_discards_old_layout_and_stack_sources():
+    from streamlit.testing.v1 import AppTest
+    app = AppTest.from_string('''
+import streamlit as st
+from bo_session_viewer import (_composer_load_named_preset, _composer_restore_pending_panel_state,
+    _composer_pin_panel_state, _composer_reletter_stack)
+config = {'state': {'bo_composer_count': 2, 'bo_composer_panel_stack_order': [1, 0],
+    'bo_composer_kind_0': 'Captured plot', 'bo_composer_kind_1': 'Captured plot',
+    'bo_composer_capture_id_0': 'first', 'bo_composer_capture_id_1': 'second',
+    'bo_composer_left_0': .1, 'bo_composer_left_1': .6}}
+_composer_restore_pending_panel_state()
+_composer_pin_panel_state()
+st.button('Load preset', on_click=_composer_load_named_preset, args=(config, 'Example', True))
+st.button('Re-letter', on_click=_composer_reletter_stack)
+for i in range(2):
+    st.selectbox('Figure', ['Global trend', 'Captured plot'], key=f'bo_composer_kind_{i}')
+''', default_timeout=15).run()
+    app.session_state['bo_composer_pending_panel_state'] = {
+        'bo_composer_kind_0': 'Global trend', 'bo_composer_kind_1': 'Global trend',
+        'bo_composer_left_0': .8}
+    app.session_state['bo_composer_stack_sources'] = [{'kind': 'Global trend'}, {'kind': 'Global trend'}]
+    app.button[0].click().run()
+    assert not app.exception
+    assert [widget.value for widget in app.selectbox] == ['Captured plot', 'Captured plot']
+    app.button[1].click().run()
+    assert not app.exception
+    assert [widget.value for widget in app.selectbox] == ['Captured plot', 'Captured plot']
+    assert app.session_state['bo_composer_capture_id_0'] == 'first'
+    assert app.session_state['bo_composer_capture_id_1'] == 'second'
+    assert app.session_state['bo_composer_left_0'] == .1
+    assert app.session_state['bo_composer_panel_stack_order'] == [1, 0]
+
+
+def test_import_survives_widget_cleanup_before_composer_is_reached():
+    from streamlit.testing.v1 import AppTest
+    app = AppTest.from_string('''
+import streamlit as st
+from bo_session_viewer import _composer_apply_config, _composer_apply_pending_import
+config = {'state':{'bo_composer_count':3, 'bo_composer_dpi':220,
+    'bo_composer_apply_canvas_dimensions':False,
+    'bo_composer_add_panel':False,
+    'bo_composer_capture_apply_aspect_0':False,
+    'bo_composer_image_clear_0':False,
+    **{f'bo_composer_kind_{i}':'Captured plot' for i in range(3)},
+    **{f'bo_composer_capture_id_{i}':f'capture-{i}' for i in range(3)},
+    **{f'bo_composer_title_size_{i}':30. for i in range(3)}}}
+def load():
+    _composer_apply_config(config)
+    # Also recover a pending snapshot produced by the previous app version.
+    st.session_state['bo_composer_pending_import_state']['bo_composer_apply_canvas_dimensions'] = False
+    st.session_state['bo_composer_apply_canvas_dimensions'] = False
+    st.session_state['test_skip_composer'] = True
+st.button('Import', on_click=load)
+if st.session_state.pop('test_skip_composer', False):
+    st.stop()  # Simulates a scoring/source rerun before the panel widgets exist.
+_composer_apply_pending_import()
+for action in ('apply_canvas_dimensions', 'add_panel', 'capture_apply_aspect_0', 'image_clear_0'):
+    st.button(action, key=f'bo_composer_{action}')
+for i in range(3):
+    st.selectbox('Figure', ['Global trend','Captured plot'], key=f'bo_composer_kind_{i}')
+    st.number_input('Title size', value=9., key=f'bo_composer_title_size_{i}')
+''', default_timeout=15).run()
+    assert not app.exception
+    app.button[0].click().run()
+    assert not app.exception
+    app.run()
+    assert not app.exception
+    for i in range(3):
+        assert app.selectbox(key=f'bo_composer_kind_{i}').value == 'Captured plot'
+        assert app.number_input(key=f'bo_composer_title_size_{i}').value == 30.
+        assert app.session_state[f'bo_composer_capture_id_{i}'] == f'capture-{i}'
+    # Import state is consumed once; subsequent user edits win.
+    app.selectbox(key='bo_composer_kind_0').select('Global trend').run()
+    assert app.selectbox(key='bo_composer_kind_0').value == 'Global trend'
