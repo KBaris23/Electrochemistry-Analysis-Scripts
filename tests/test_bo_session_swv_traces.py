@@ -2716,3 +2716,32 @@ def test_real_data_landscapes_expose_q_inputs_and_paired_derivatives():
         [observation], "Mean background RMS (µA)", "target", ["1"], False
     )
     assert noise_points["value"].iloc[0] == pytest.approx(0.3)
+
+
+def test_averaged_simulation_heatmap_retains_best_q_history():
+    points = {'measurement': pd.DataFrame({
+        'channel': ['Average'] * 4, 'group_id': [1, 1, 2, 2],
+        'iteration': [1, 2, 1, 2], 'value': [5., 2., 8., 3.],
+    })}
+    history = pd.DataFrame({
+        'ground_truth_channel': ['1', '1', '2', '2'],
+        'group_id': [1, 1, 2, 2], 'iteration': [1, 2, 1, 2],
+        'Q_run': [5., 2., 8., 3.],
+    })
+    enriched = _add_real_heatmap_history_columns(points, [], history)['measurement']
+    assert enriched['Q_run'].tolist() == [5., 2., 8., 3.]
+    assert enriched['best_Q'].tolist() == [5., 5., 8., 8.]
+    assert enriched['channel'].tolist() == ['Average'] * 4
+
+
+def test_average_history_join_does_not_guess_for_reused_group_ids():
+    points = {'measurement': pd.DataFrame({
+        'channel': ['Average'], 'group_id': [1], 'iteration': [1], 'value': [15.],
+    })}
+    history = pd.DataFrame({
+        'ground_truth_channel': ['1', '2'], 'group_id': [1, 1],
+        'iteration': [1, 1], 'Q_run': [10., 20.],
+    })
+    enriched = _add_real_heatmap_history_columns(points, [], history)['measurement']
+    assert len(enriched) == 1
+    assert enriched['best_Q'].isna().all()

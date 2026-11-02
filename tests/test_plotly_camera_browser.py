@@ -198,3 +198,22 @@ def test_scene_is_composited_without_nested_svg_images(page, tmp_path):
         };
     }""")
     assert_download_has_points(page, page, tmp_path)
+
+
+def test_cache_view_reads_live_zoom_instead_of_stale_last_event(page):
+    page.goto(COMPONENT.as_uri())
+    render_plot(page)
+    wait_for_scene(page)
+    camera = {'eye': {'x': .5, 'y': -.7, 'z': .4},
+              'center': {'x': .1, 'y': .2, 'z': 0}}
+    page.evaluate("camera => Plotly.relayout(graph, {'scene.camera': camera})", camera)
+    page.evaluate("""() => {
+        lastCamera = {eye: {x: 2, y: 2, z: 2}};
+        window.setComponentValue = value => {window.cachedPayload = value;};
+        cacheCurrentView();
+    }""")
+    payload = page.evaluate('cachedPayload')
+    assert payload['camera']['eye'] == pytest.approx(camera['eye'])
+    assert payload['camera']['center'] == pytest.approx(camera['center'])
+    assert payload['viewport']['width'] > 0
+    assert payload['viewport']['height'] > 0

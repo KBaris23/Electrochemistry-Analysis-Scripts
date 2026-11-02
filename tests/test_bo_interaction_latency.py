@@ -123,3 +123,72 @@ def test_bulk_history_overlay_keeps_method_identity_and_missing_values():
     assert actual.Q_run.tolist() == [3., -2., 50., 4.]
     assert actual.frequency.iloc[:3].tolist() == [150., 200., 300.]
     assert history.Q_run.tolist() == [10., -10., 50.]
+
+
+def test_history_overlay_does_not_expand_sparse_channel_records(monkeypatch):
+    def forbid_records(*args, **kwargs):
+        pytest.fail('Do not expand the wide history into dense row dictionaries')
+    monkeypatch.setattr(pd.DataFrame, 'to_dict', forbid_records)
+    session = {
+        'history': pd.DataFrame({'group_id': [1, 2], 'iteration': [1, 1], 'Q_run': [1., 2.]}),
+        'observations': [
+            {'group_id': 1, 'iteration': 1, 'Q_run': 3.,
+             'channel_metrics': {'1': {'Q_channel': 3.}}},
+            {'group_id': 2, 'iteration': 1, 'Q_run': 4.,
+             'channel_metrics': {'2': {'Q_channel': 4.}}},
+        ],
+    }
+    result = viewer._observation_table(session)
+    assert result.Q_run.tolist() == [3., 4.]
+    assert result.loc[0, 'ch1_Q_channel'] == 3.
+    assert pd.isna(result.loc[1, 'ch1_Q_channel'])
+    assert result.loc[1, 'ch2_Q_channel'] == 4.
+
+
+def test_loaded_session_reuses_data_and_invalidates_summary_changes(monkeypatch, tmp_path):
+    monkeypatch.setattr(viewer, 'st', SimpleNamespace(session_state={}))
+    calls = []
+    def load(root, callback):
+        calls.append(root)
+        return {'generation': len(calls)}
+    monkeypatch.setattr(viewer, 'load_bo_session', load)
+    first = viewer._viewer_loaded_session(tmp_path)
+    assert viewer._viewer_loaded_session(tmp_path) is first
+    summary = tmp_path / 'simulation_run_summary.csv'
+    summary.write_text('group_id\n1\n')
+    second = viewer._viewer_loaded_session(tmp_path)
+    assert second is not first
+    assert viewer._viewer_loaded_session(tmp_path) is second
+    summary.unlink()
+    assert viewer._viewer_loaded_session(tmp_path) is not second
+    assert len(calls) == 3
+
+
+def test_best_q_keeps_paired_runs_separate_and_orders_iterations():
+    history = pd.DataFrame({
+        'group_id': [1, 2, 1, 2, 1], 'iteration': [2, 2, 1, 1, 3],
+        'Q_run': [4., 2., 100., 5., 3.],
+        'objective': ['paired_response', 'measurement', 'measurement',
+                      'measurement', 'paired_response'],
+    })
+    actual = viewer._observation_table({'history': history, 'observations': []})
+    assert actual.best_Q.iloc[[0, 1, 3, 4]].tolist() == [4., 5., 5., 4.]
+    assert pd.isna(actual.best_Q.iloc[2])
+
+
+def test_prepared_history_is_shared_and_invalidated_for_new_sources(monkeypatch):
+    from contextlib import nullcontext
+    state, calls = {}, []
+    monkeypatch.setattr(viewer, 'st', SimpleNamespace(
+        session_state=state, spinner=lambda *args: nullcontext(),
+    ))
+    def build(session):
+        calls.append(session)
+        return pd.DataFrame({'Q_run': [len(calls)]})
+    monkeypatch.setattr(viewer, '_observation_table', build)
+    session = {'history': pd.DataFrame(), 'observations': []}
+    first = viewer._viewer_observation_table(session)
+    assert viewer._viewer_observation_table(dict(session)) is first
+    changed = {**session, 'observations': [{}]}
+    assert viewer._viewer_observation_table(changed) is not first
+    assert len(calls) == 2

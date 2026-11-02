@@ -8,7 +8,7 @@ from streamlit.testing.v1 import AppTest
 def test_actual_bo_app_passes_full_session_into_composer():
     import ast
     tree = ast.parse(Path('bo_session_viewer.py').read_text(encoding='utf-8'))
-    app = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'render_bo_session_app')
+    app = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_render_bo_session_app')
     calls = [n for n in ast.walk(app) if isinstance(n, ast.Call)
              and isinstance(n.func, ast.Name) and n.func.id == '_render_full_session_composer']
     assert len(calls) == 1

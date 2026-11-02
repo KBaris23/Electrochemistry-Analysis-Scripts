@@ -70,6 +70,10 @@
       background-size: 1% 1%;
       touch-action: none;
     }
+    #canvas-resize { position:absolute; right:0; bottom:0; width:22px; height:22px;
+      z-index:1000; cursor:nwse-resize; touch-action:none; border:0;
+      background:linear-gradient(135deg, transparent 40%, #2563eb 42%, #2563eb 52%, transparent 54%, transparent 65%, #2563eb 67%);
+    }
     .panel {
       position: absolute;
       box-sizing: border-box;
@@ -230,6 +234,10 @@
   </div>
   <script>
     const canvas = document.getElementById("canvas");
+    const canvasResize = document.createElement("button");
+    canvasResize.id = "canvas-resize";
+    canvasResize.title = "Drag to resize canvas and export dimensions (panel sizes stay fixed)";
+    canvasResize.setAttribute("aria-label", "Resize figure canvas");
     const menu = document.getElementById("context-menu");
     const selectionCount = document.getElementById("selection-count");
     const status = document.getElementById("status");
@@ -358,6 +366,9 @@
       streamlitMessage("streamlit:setComponentValue", {value});
     }
     function aspectRatio(name) {
+      if (Number(args.canvas_width_in) > 0 && Number(args.canvas_height_in) > 0) {
+        return Number(args.canvas_width_in) / Number(args.canvas_height_in);
+      }
       const explicit = Number(args.canvas_aspect);
       if (Number.isFinite(explicit) && explicit > 0) return explicit;
       if (name === "Sweep workspace (9 x 10 in)") return 9 / 10;
@@ -494,7 +505,7 @@
       });
     }
     function draw() {
-      canvas.replaceChildren();
+      canvas.replaceChildren(canvasResize);
       selected = new Set([...selected].filter(index => index < rects.length));
       rects.forEach((rect, index) => {
         const panel = document.createElement("div");
@@ -514,7 +525,7 @@
           });
           panel.appendChild(handle);
         });
-        panel.title = "Drag to move; Ctrl/Cmd-click to select; right-click to align";
+        panel.title = "Shift-click or Ctrl/Cmd-click to select multiple panels; drag a handle to resize the selection";
         updatePanel(panel, rect);
         panel.addEventListener("pointerdown", startGesture);
         panel.addEventListener("contextmenu", openContextMenu);
@@ -532,8 +543,9 @@
       hideContextMenu();
       const panel = event.currentTarget;
       const index = Number(panel.dataset.index);
-      const additive = event.ctrlKey || event.metaKey;
-      if (additive) {
+      const mode = event.target.classList.contains("resize-handle") ? "resize" : "move";
+      const additive = event.shiftKey || event.ctrlKey || event.metaKey;
+      if (additive && mode !== "resize") {
         if (selected.has(index)) selected.delete(index);
         else selected.add(index);
         updateSelectionAppearance();
@@ -541,8 +553,11 @@
       }
       if (!selected.has(index)) selected = new Set([index]);
       updateSelectionAppearance();
-      const mode = event.target.classList.contains("resize-handle") ? "resize" : "move";
-      const indices = mode === "move" ? [...selected] : [index];
+      const indices = [...selected];
+      if (mode === "resize" && indices.some(i => args.locked_sizes?.[i])) {
+        status.textContent = "— Selection includes a size-locked image. Deselect it to resize the other panels.";
+        return;
+      }
       gesture = {
         pointerId: event.pointerId,
         panel,
@@ -560,7 +575,7 @@
       panel.addEventListener("pointermove", moveGesture);
       panel.addEventListener("pointerup", endGesture);
       panel.addEventListener("pointercancel", endGesture);
-      status.textContent = mode === "resize" ? "— resizing" : "— moving";
+      status.textContent = mode === "resize" ? `— resizing ${indices.length} selected panel(s)` : "— moving";
     }
     function moveGesture(event) {
       if (!gesture || event.pointerId !== gesture.pointerId) return;
@@ -588,16 +603,29 @@
           updatePanel(canvas.querySelector(`[data-index="${index}"]`), rects[index]);
         });
       } else {
-        const start = gesture.startRects.get(gesture.index);
-        let [left, bottom, width, height] = start;
-        let right = left + width, top = bottom + height;
+        const starts = [...gesture.startRects.values()];
+        const originLeft = Math.min(...starts.map(r => r[0]));
+        const originBottom = Math.min(...starts.map(r => r[1]));
+        const originRight = Math.max(...starts.map(r => r[0] + r[2]));
+        const originTop = Math.max(...starts.map(r => r[1] + r[3]));
+        const width = originRight - originLeft, height = originTop - originBottom;
+        let left = originLeft, bottom = originBottom, right = originRight, top = originTop;
+        // Clamp the group as a whole so no panel gets individually squeezed
+        // against a canvas edge or below the editor's minimum panel size.
+        const minWidth = width * Math.max(...starts.map(r => .05 / r[2]));
+        const minHeight = height * Math.max(...starts.map(r => .05 / r[3]));
         const dir = gesture.direction;
-        if (dir.includes("w")) left = clamp(snapped(left + dx), 0, right - .05);
-        if (dir.includes("e")) right = clamp(snapped(right + dx), left + .05, 1);
-        if (dir.includes("s")) bottom = clamp(snapped(bottom + bottomDelta), 0, top - .05);
-        if (dir.includes("n")) top = clamp(snapped(top + bottomDelta), bottom + .05, 1);
-        rects[gesture.index] = normalizedRect([left, bottom, right - left, top - bottom], gesture.index);
-        updatePanel(gesture.panel, rects[gesture.index]);
+        if (dir.includes("w")) left = clamp(snapped(left + dx), 0, right - minWidth);
+        if (dir.includes("e")) right = clamp(snapped(right + dx), left + minWidth, 1);
+        if (dir.includes("s")) bottom = clamp(snapped(bottom + bottomDelta), 0, top - minHeight);
+        if (dir.includes("n")) top = clamp(snapped(top + bottomDelta), bottom + minHeight, 1);
+        const sx = (right - left) / width, sy = (top - bottom) / height;
+        gesture.indices.forEach(index => {
+          const start = gesture.startRects.get(index);
+          rects[index] = normalizedRect([left + (start[0] - originLeft) * sx,
+            bottom + (start[1] - originBottom) * sy, start[2] * sx, start[3] * sy], index);
+          updatePanel(canvas.querySelector(`[data-index="${index}"]`), rects[index]);
+        });
       }
     }
     function endGesture(event) {
@@ -742,15 +770,62 @@
         deleteSelected();
       }
     });
+    canvasResize.addEventListener("pointerdown", event => {
+      event.preventDefault(); event.stopPropagation();
+      const bounds = canvas.getBoundingClientRect();
+      const dpi = Number(args.canvas_dpi) || 220;
+      const pixelWidth = Number(args.canvas_width_in) * dpi;
+      const pixelHeight = Number(args.canvas_height_in) * dpi;
+      if (!(pixelWidth > 0 && pixelHeight > 0)) return;
+      const original = rects.map(r => [...r]);
+      const minWidth = Math.max(100, ...original.map(r => (r[0] + r[2]) * pixelWidth));
+      const minHeight = Math.max(100, ...original.map(r => (1 - r[1]) * pixelHeight));
+      let width = pixelWidth, height = pixelHeight;
+      const startX = event.clientX, startY = event.clientY;
+      gesture = {canvasResize: true};
+      canvasResize.setPointerCapture(event.pointerId);
+      const move = e => {
+        width = Math.max(Math.ceil(minWidth), Math.round(pixelWidth + (e.clientX - startX) * pixelWidth / bounds.width));
+        height = Math.max(Math.ceil(minHeight), Math.round(pixelHeight + (e.clientY - startY) * pixelHeight / bounds.height));
+        rects = original.map(([x,y,w,h]) => [x * pixelWidth / width,
+          1 - (1-y) * pixelHeight / height, w * pixelWidth / width, h * pixelHeight / height]);
+        canvas.style.width = `${bounds.width * width / pixelWidth}px`;
+        canvas.style.height = `${bounds.height * height / pixelHeight}px`;
+        canvas.querySelectorAll('.panel').forEach((panel, i) => updatePanel(panel, rects[i]));
+        status.textContent = `— Canvas ${width} × ${height} px`;
+        setFrameHeight(Math.ceil(Math.min(850, bounds.height * height / pixelHeight)
+          + document.getElementById('toolbar').offsetHeight + document.getElementById('edit-tools').offsetHeight + 18));
+      };
+      const finish = e => {
+        move(e);
+        canvasResize.removeEventListener('pointermove', move);
+        canvasResize.removeEventListener('pointerup', finish);
+        canvasResize.removeEventListener('pointercancel', finish);
+        gesture = null;
+        dirty = true;
+        args.canvas_width_in = width / dpi;
+        args.canvas_height_in = height / dpi;
+        // Old undo geometry belongs to the previous canvas dimensions.
+        undoStack = []; redoStack = [];
+        setComponentValue({event_id: `${Date.now()}-${Math.random()}`,
+          action: 'resize_canvas', width_px: width, height_px: height,
+          rects: rects.map(r => [...r])});
+      };
+      canvasResize.addEventListener('pointermove', move);
+      canvasResize.addEventListener('pointerup', finish);
+      canvasResize.addEventListener('pointercancel', finish);
+    });
     window.addEventListener("message", event => {
       if (!event.data || event.data.type !== "streamlit:render") return;
+      const previousPanelRevision = args.panel_revision;
       args = event.data.args || {};
+      const panelsChanged = args.panel_revision !== previousPanelRevision;
       if (!gesture) {
         const incoming = (args.rects || []).map(normalizedRect);
         const incomingSignature = JSON.stringify(incoming);
         latestIncoming = incoming.map(rect => [...rect]);
         // Preserve local edits through unrelated Streamlit renders until Apply.
-        const structuralChange = incoming.length !== rects.length;
+        const structuralChange = incoming.length !== rects.length || panelsChanged;
         const externalChange = !dirty && incomingSignature !== lastInputSignature && incomingSignature !== JSON.stringify(rects);
         if (!lastInputSignature || structuralChange || !dirty || incomingSignature === JSON.stringify(rects)) {
           if (structuralChange || externalChange) {

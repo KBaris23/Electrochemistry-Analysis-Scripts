@@ -224,7 +224,18 @@ def test_compact_session_load_reconstructs_normalized_observations(tmp_path):
         "frequency": [200.0, 100.0],
     }).to_csv(tmp_path / "history.csv", index=False)
 
-    session = load_bo_session(tmp_path)
+    progress = []
+    session = load_bo_session(
+        tmp_path,
+        progress_callback=lambda fraction, message: progress.append((fraction, message)),
+    )
+
+    fractions = [fraction for fraction, _ in progress]
+    assert fractions == sorted(fractions)
+    assert fractions[0] == 0.0
+    assert fractions[-1] == 1.0
+    assert any("2 history rows loaded" in message for _, message in progress)
+    assert any("Rebuilding observations" in message for _, message in progress)
 
     assert [obs["group_id"] for obs in session["observations"]] == [1, 2]
     assert [obs["channels"] for obs in session["observations"]] == [[1], [2]]

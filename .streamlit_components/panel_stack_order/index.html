@@ -1,0 +1,102 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+body {margin:0; font:14px system-ui,sans-serif; color:#31333f}
+.heading {font-weight:600; margin:4px 0 8px}
+.row {display:flex; align-items:center; gap:10px; border:1px solid #d5d7dc; border-radius:6px; padding:8px 12px; margin-bottom:6px; cursor:grab; user-select:none; background:#fff}
+.grip {font-size:21px; line-height:22px; color:#687080}
+.row:focus {outline:2px solid #ff4b4b}
+</style></head><body><div class="heading">Drag to reorder panels</div><div id="stack"></div><script>
+let args = {}, dragged = null;
+const bound = new WeakSet();
+function send(type, extra = {}) { window.parent.postMessage({isStreamlitMessage:true, type, ...extra}, '*'); }
+function headers() {
+  try {
+    const labels = args.labels || [];
+    return [...window.parent.document.querySelectorAll('[data-testid="stExpander"] summary')]
+      .filter(node => labels.includes(node.textContent.replace(/^⠿/, '').trim()) ||
+        [...node.querySelectorAll('p, [data-testid="stMarkdownContainer"]')]
+          .some(label => labels.includes(label.textContent.trim())));
+  } catch (_) { return []; }
+}
+function clearMarks() {
+  [...headers(), ...document.querySelectorAll('.row')].forEach(n => n.style.boxShadow = '');
+}
+function commit(from, to, below) {
+  if (from === to) return;
+  const order = (args.labels || []).map((_, i) => i).filter(i => i !== from);
+  order.splice(order.indexOf(to) + (below ? 1 : 0), 0, from);
+  send('streamlit:setComponentValue', {value: {order, revision:args.revision,
+    event_id:Date.now().toString() + Math.random().toString(36)}});
+}
+function attach(node, index) {
+  node.dataset.composerStackIndex = index;
+  node.draggable = true;
+  node.style.cursor = 'grab';
+  if (bound.has(node)) return;
+  bound.add(node);
+  node.addEventListener('dragstart', e => {
+    dragged = Number(node.dataset.composerStackIndex);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(dragged));
+  });
+  node.addEventListener('dragover', e => {
+    if (dragged === null) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+    const below = e.clientY > node.getBoundingClientRect().top + node.offsetHeight/2;
+    node.style.boxShadow = below ? '0 3px #ff4b4b' : '0 -3px #ff4b4b';
+  });
+  node.addEventListener('dragleave', () => node.style.boxShadow = '');
+  node.addEventListener('dragend', () => { dragged = null; clearMarks(); });
+  node.addEventListener('drop', e => {
+    if (dragged === null) return;
+    e.preventDefault(); e.stopPropagation();
+    commit(dragged, Number(node.dataset.composerStackIndex),
+      e.clientY > node.getBoundingClientRect().top + node.offsetHeight/2);
+    dragged = null; clearMarks();
+  });
+}
+function bindHeaders() {
+  const nodes = headers();
+  if (nodes.length !== (args.labels || []).length) return;
+  nodes.forEach((node, index) => {
+    attach(node, index);
+    // React can replace header children while retaining the summary node.
+    // Recreate the grip even if this summary already has drag listeners.
+    if (node.querySelector('.composer-stack-grip')) return;
+    const grip = node.ownerDocument.createElement('span');
+    grip.textContent = '⠿'; grip.className = 'composer-stack-grip';
+    grip.setAttribute('aria-label', 'Drag panel to reorder stack');
+    grip.title = 'Drag to reorder panel stack'; grip.draggable = true;
+    grip.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;width:26px;min-width:26px;font-size:23px;cursor:grab;user-select:none;color:#687080;margin-right:6px';
+    grip.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); });
+    node.prepend(grip);
+  });
+}
+function renderStack() {
+  const stack = document.getElementById('stack');
+  stack.replaceChildren();
+  (args.labels || []).forEach((label, index) => {
+    const row = document.createElement('div'); row.className = 'row'; row.tabIndex = 0;
+    const grip = document.createElement('span'); grip.className='grip'; grip.textContent='⠿';
+    row.append(grip, document.createTextNode(label));
+    row.title = 'Drag to reorder; or focus and use Alt + Up/Down';
+    row.addEventListener('keydown', e => {
+      if (!e.altKey) return;
+      if (e.key==='ArrowUp' && index>0) {e.preventDefault(); commit(index,index-1,false);}
+      if (e.key==='ArrowDown' && index<args.labels.length-1) {e.preventDefault(); commit(index,index+1,true);}
+    });
+    stack.append(row); attach(row,index);
+  });
+  send('streamlit:setFrameHeight', {height:document.body.scrollHeight + 4});
+}
+let observer;
+try {
+  observer = new MutationObserver(bindHeaders);
+  observer.observe(window.parent.document.body, {childList:true, subtree:true});
+} catch (_) { /* The visible stack works without parent DOM access. */ }
+window.addEventListener('message', e => {
+  if (e.data.type === 'streamlit:render') {args=e.data.args || {}; renderStack(); bindHeaders();}
+});
+window.addEventListener('unload', () => observer && observer.disconnect());
+send('streamlit:componentReady', {apiVersion:1});
+send('streamlit:setFrameHeight', {height:220});
+</script></body></html>
