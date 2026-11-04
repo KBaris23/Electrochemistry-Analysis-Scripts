@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from matplotlib.figure import Figure
+import pytest
 import pandas as pd
 from PIL import Image
 
@@ -445,7 +446,8 @@ def test_add_to_composer_queues_exact_plot_and_current_settings():
     assert capture["settings"]["tick_size"] == 22.5
     assert capture["camera"] == camera
     assert capture["reserved_panel_label"] == "A"
-    assert capture["source_figure"] is figure
+    assert capture["source_figure"] is not figure
+    assert capture["source_figure"].to_plotly_json() == figure.to_plotly_json()
     assert capture["source_kind"] == "plotly"
     assert "figure" not in capture
     assert capture["figure_config"]["traces"] == [
@@ -471,7 +473,8 @@ def test_add_to_composer_accepts_plotly_source_without_server_png():
 
     capture = state["bo_composer_captured_plots"][capture_id]
     assert capture["png_bytes"] is None
-    assert capture["source_figure"] is figure
+    assert capture["source_figure"] is not figure
+    assert capture["source_figure"].to_plotly_json() == figure.to_plotly_json()
     assert state["bo_composer_pending_captures"] == [capture_id]
 
 
@@ -882,8 +885,12 @@ else:
     assert [w.value for w in app.selectbox] == ['Image file', 'Captured plot']
     assert [w.value for w in app.text_input] == ['A', 'B']
     assert app.session_state['bo_composer_image_data_0'] == original_image
-    assert app.session_state['bo_composer_left_0'] == .12
-    assert app.session_state['bo_composer_bottom_0'] == .2
+    canvas_width = app.session_state['bo_composer_canvas_width_px']
+    canvas_height = app.session_state['bo_composer_canvas_height_px']
+    assert app.session_state['bo_composer_left_0'] * canvas_width == pytest.approx(.12 * 12 * 220)
+    # Existing image retains its pixel dimensions and distance from the top.
+    top = 1 - app.session_state['bo_composer_bottom_0'] - app.session_state['bo_composer_height_0']
+    assert top * canvas_height == pytest.approx((1 - .2) * 9 * 220 - 83)
     app.run()
     assert [w.value for w in app.selectbox] == ['Image file', 'Captured plot']
 
@@ -914,3 +921,924 @@ def test_embedded_capture_keeps_point_sizes_after_final_panel_resize():
         viewer._COMPOSER_PANEL_TYPOGRAPHY.reset(token)
         plt.close(source)
         plt.close(target)
+
+
+def test_captured_iteration_heatmap_preserves_shared_axis_label_placement():
+    points = pd.DataFrame([
+        {'channel': '1', 'iteration': iteration, 'value': float(iteration),
+         'group_id': 1, 'run_label': 'explore=0.1', 'exploration': 0.1}
+        for iteration in (1, 2)
+    ])
+    source = viewer._plot_real_channel_iteration_heatmap(
+        points, metric_label='Q', phase='measurement',
+    )
+    capture = {'source_figure': source}
+    defaults = viewer._composer_capture_format_defaults(capture)
+    assert defaults['xlabel'] == 'Iteration'
+    assert defaults['ylabel'] == 'Simulation condition'
+    result = viewer._composer_formatted_capture_figure(capture, {
+        'capture_xlabel': 'Iteration', 'capture_ylabel': 'Simulation condition',
+    })
+    assert [result.layout[key].title.text for key in ('yaxis', 'yaxis2', 'yaxis3', 'yaxis4')] == [
+        'Simulation condition', None, None, None,
+    ]
+    assert [result.layout[key].title.text for key in ('xaxis', 'xaxis2', 'xaxis3', 'xaxis4')] == [
+        '', '', '', 'Iteration',
+    ]
+    assert source.layout.yaxis2.title.text is None
+
+
+def test_composer_colorbar_sizes_are_independent_of_axis_text():
+    figure = viewer.go.Figure(viewer.go.Heatmap(z=[[1, 2], [3, 4]], colorbar_title='Q run'))
+    figure.update_layout(xaxis_title='Iteration', yaxis_title='Condition')
+    token = viewer._COMPOSER_PANEL_TYPOGRAPHY.set({
+        'axis_label_size': 12, 'tick_size': 9,
+        'colorbar_title_size': 18, 'colorbar_tick_size': 7,
+    })
+    try:
+        viewer._composer_apply_plotly_text_size(figure, 10)
+    finally:
+        viewer._COMPOSER_PANEL_TYPOGRAPHY.reset(token)
+    assert figure.data[0].colorbar.title.font.size == 18
+    assert figure.data[0].colorbar.tickfont.size == 7
+    assert figure.layout.xaxis.title.font.size == 12
+    assert figure.layout.xaxis.tickfont.size == 9
+
+
+def test_captured_cube_preserves_complete_camera_during_composer_styling():
+    camera = {
+        'eye': {'x': .6, 'y': .8, 'z': .7},
+        'center': {'x': .2, 'y': -.1, 'z': .3},
+        'up': {'x': 0, 'y': 1, 'z': 0},
+        'projection': {'type': 'orthographic'},
+    }
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1, 2], y=[2, 3], z=[3, 4]))
+    source.update_layout(scene_camera_eye=dict(x=2, y=2, z=2),
+                         scene_domain=dict(x=[0, 1], y=[0, 1]))
+    formatted = viewer._composer_formatted_capture_figure(
+        {'source_figure': source, 'camera': camera}, {})
+    token = viewer._COMPOSER_JOURNAL_STYLE.set(True)
+    try:
+        viewer._composer_apply_plotly_text_size(formatted, 12, 1200)
+    finally:
+        viewer._COMPOSER_JOURNAL_STYLE.reset(token)
+    assert formatted.layout.scene.camera.to_plotly_json() == camera
+    assert formatted.layout.scene.domain.to_plotly_json() == {'x': [0, 1], 'y': [0, 1]}
+    assert source.layout.scene.camera.eye.x == 2
+
+
+def test_captured_3d_viewport_keeps_zoom_in_thumbnail_and_export(monkeypatch):
+    camera = {'eye': {'x': .6, 'y': -.7, 'z': .4},
+              'center': {'x': .2, 'y': 0, 'z': .1},
+              'up': {'x': 0, 'y': 0, 'z': 1},
+              'projection': {'type': 'perspective'}}
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1, 2], y=[2, 3], z=[3, 4]))
+    source.update_layout(scene_camera=camera, scene_domain={'x': [.1, .9], 'y': [0, 1]},
+                         width=1600, height=800, margin=dict(l=80, r=80, t=40, b=40),
+                         meta={'bo_captured_viewport': {
+                             'width': 1200, 'height': 600,
+                             'margin': dict(l=60, r=60, t=30, b=30)}})
+    preview = viewer.go.Figure(source)
+    assert viewer._preserve_captured_plotly_view(source, preview, 520) == (520, 260)
+    assert preview.layout.margin.l == pytest.approx(26)
+    assert preview.layout.scene.camera.to_plotly_json() == camera
+    captured = viewer._composer_formatted_capture_figure({'source_figure': source, 'camera': camera}, {})
+    exported = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image', lambda figure, **kw: exported.append((figure, kw)) or b'png')
+    token = viewer._COMPOSER_JOURNAL_STYLE.set(True)
+    try:
+        viewer._plotly_png_bytes(captured, width=800, height=800, text_size=12,
+                                 composer_colorbar_side='left')
+    finally:
+        viewer._COMPOSER_JOURNAL_STYLE.reset(token)
+    figure, kwargs = exported[0]
+    assert (kwargs['width'], kwargs['height']) == (800, 400)
+    assert figure.layout.scene.camera.to_plotly_json() == camera
+    assert figure.layout.scene.domain.to_plotly_json() == source.layout.scene.domain.to_plotly_json()
+    assert figure.layout.margin.l == pytest.approx(40)
+
+
+def test_3d_capture_freezes_camera_and_viewport_before_source_changes():
+    state = {}
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1], y=[2], z=[3]))
+    camera = {'eye': {'x': .5, 'y': .7, 'z': .4}}
+    source.update_layout(width=1200, height=600)
+    with patch.object(viewer.st, 'session_state', state):
+        key = viewer._queue_plot_for_composer(None, label='cube', file_stem='cube',
+                                              figure=source, camera=camera)
+    source.update_layout(scene_camera_eye=dict(x=3, y=3, z=3), width=800)
+    captured = state['bo_composer_captured_plots'][key]['source_figure']
+    assert captured is not source
+    assert captured.layout.scene.camera.to_plotly_json() == camera
+    assert captured.layout.width == 1200
+
+
+def test_expanding_custom_canvas_preserves_panel_pixels():
+    state = {
+        'bo_composer_count': 1, 'bo_composer_layout': 'Manual',
+        'bo_composer_canvas_width_input': 2400, 'bo_composer_canvas_height_input': 1600,
+        'bo_composer_canvas_keep_panels': True,
+        'bo_composer_left_0': .1, 'bo_composer_bottom_0': .2,
+        'bo_composer_width_0': .8, 'bo_composer_height_0': .7,
+    }
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_apply_canvas_dimensions((1200, 800))
+    assert state['bo_composer_aspect'] == 'Custom (pixels)'
+    assert state['bo_composer_left_0'] * 2400 == pytest.approx(120)
+    assert state['bo_composer_width_0'] * 2400 == pytest.approx(960)
+    assert state['bo_composer_height_0'] * 1600 == pytest.approx(560)
+    top = 1 - state['bo_composer_bottom_0'] - state['bo_composer_height_0']
+    assert top * 1600 == pytest.approx(80)
+
+
+def test_custom_canvas_exports_exact_requested_pixels():
+    figure = viewer._build_composer_figure(
+        {}, pd.DataFrame(), [], {}, {}, False, [], (6, 4),
+        'DejaVu Sans', 9, 16, '', render_dpi=100,
+    )
+    try:
+        png = viewer._composer_figure_bytes(figure, 'png', 100)
+        with Image.open(BytesIO(png)) as image:
+            assert image.size == (600, 400)
+    finally:
+        viewer.plt.close(figure)
+
+
+def test_two_full_canvas_captures_keep_equal_pixel_sizes():
+    state = {'bo_composer_count': 0, 'bo_composer_dpi': 100,
+             'bo_composer_aspect': 'Custom (pixels)',
+             'bo_composer_canvas_width_px': 1200, 'bo_composer_canvas_height_px': 800}
+    source = viewer.go.Figure(viewer.go.Heatmap(z=[[1, 2], [3, 4]]))
+    source.update_layout(width=1200, height=800)
+    with patch.object(viewer.st, 'session_state', state):
+        for _ in range(2):
+            viewer._queue_plot_for_composer(None, label='heatmap', file_stem='heatmap', figure=source)
+            viewer._composer_apply_pending_captures()
+        width, height = state['bo_composer_canvas_width_px'], state['bo_composer_canvas_height_px']
+        rects = viewer._composer_manual_rects(2)
+    assert width >= 2400
+    for x, y, w, h in rects:
+        assert w * width == pytest.approx(1200, abs=.5)
+        assert h * height == pytest.approx(800, abs=.5)
+    assert rects[1][0] >= rects[0][0] + rects[0][2]
+    assert rects[0][0] * width == pytest.approx(24, abs=.5)
+    assert (1 - rects[0][1] - rects[0][3]) * height == pytest.approx(24, abs=.5)
+
+
+@pytest.mark.parametrize('width,height', [(1000, 300), (300, 1000)])
+def test_iteration_heatmap_resizes_despite_legacy_empty_scene(monkeypatch, width, height):
+    source = viewer._plot_real_channel_iteration_heatmap(
+        pd.DataFrame([{'channel': '1', 'iteration': i, 'value': i,
+                       'group_id': 1, 'exploration': .1} for i in (1, 2)]),
+        metric_label='Q', phase='measurement')
+    capture = {'source_figure': source}
+    viewer._composer_capture_format_defaults(capture)
+    # Old captures already contain a scene added by reading the Z-label default.
+    source.update_layout(scene={'zaxis': {'title': {'text': ''}}})
+    metadata = dict(source.layout.meta)
+    metadata['bo_composer_preserve_3d_view'] = True
+    source.update_layout(meta=metadata)
+    formatted = viewer._composer_formatted_capture_figure(capture, {})
+    assert not formatted.layout.meta.get('bo_composer_preserve_3d_view')
+    exports = []
+    def to_image(figure, **kwargs):
+        exports.append(kwargs)
+        return b'png'
+    monkeypatch.setattr(viewer.go.Figure, 'to_image', to_image)
+    viewer._plotly_png_bytes(formatted, width=width, height=height, text_size=12)
+    assert exports[-1]['width'] == width
+    assert exports[-1]['height'] == height
+    # Direct exports of old captures must also ignore the invalid lock.
+    viewer._plotly_png_bytes(source, width=width, height=height)
+    assert exports[-1]['width'] == width
+    assert exports[-1]['height'] == height
+
+
+def test_starting_point_composer_uses_cached_camera_and_viewport(monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    camera = {
+        'eye': {'x': .45, 'y': -.7, 'z': .35},
+        'center': {'x': .15, 'y': -.2, 'z': .1},
+        'up': {'x': 0, 'y': 0, 'z': 1},
+        'projection': {'type': 'orthographic'},
+    }
+    viewport = {'width': 1200, 'height': 650,
+                'margin': {'l': 65, 'r': 90, 't': 60, 'b': 60}}
+    monkeypatch.setattr(viewer, '_plotly_camera_capture', lambda **kwargs: {
+        'type': 'cache_view', 'camera': camera, 'viewport': viewport,
+    })
+    app = AppTest.from_string('''
+import pandas as pd
+from bo_session_viewer import _render_starting_point_influence
+history = pd.DataFrame({
+    'run_index': [1, 1, 2, 2], 'iteration': [1, 2, 1, 2],
+    'frequency': [100., 110., 200., 210.],
+    'amplitude': [.1, .11, .2, .21],
+    'step_potential': [.001, .001, .002, .002],
+    'Q_run': [1., 2., 3., 4.], 'ground_truth_channel': [1, 1, 1, 1],
+})
+_render_starting_point_influence(history, config={}, scope_key='camera_test')
+''', default_timeout=30).run()
+    assert not app.exception
+    next(button for button in app.button if button.label == 'Add to Composer').click().run()
+    assert not app.exception
+    capture = next(iter(app.session_state['bo_composer_captured_plots'].values()))
+    assert capture['camera'] == camera
+    source = capture['source_figure']
+    assert source.layout.scene.camera.to_plotly_json() == camera
+    assert source.layout.meta['bo_captured_viewport'] == viewport
+    formatted = viewer._composer_formatted_capture_figure(capture, {})
+    exported = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image',
+                        lambda figure, **kwargs: exported.append((figure, kwargs)) or b'png')
+    viewer._plotly_png_bytes(formatted, width=600, height=600)
+    figure, options = exported[0]
+    assert figure.layout.scene.camera.to_plotly_json() == camera
+    assert (options['width'], options['height']) == (600, 325)
+
+
+def test_composer_panel_cache_view_is_isolated_and_used_for_export(monkeypatch):
+    original_camera = {'eye': {'x': 2, 'y': 2, 'z': 2}}
+    selected_camera = {'eye': {'x': .4, 'y': -.6, 'z': .3},
+                       'projection': {'type': 'orthographic'}}
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1, 2], y=[2, 3], z=[3, 4]))
+    source.update_layout(width=1200, height=600, scene_camera=original_camera)
+    capture = {'source_figure': source, 'camera': original_camera}
+    viewport = {'width': 520, 'height': 260, 'margin': {'l': 20, 'r': 20, 't': 20, 'b': 20}}
+    monkeypatch.setattr(viewer, '_plotly_camera_capture', lambda **kwargs: {
+        'type': 'cache_view', 'camera': selected_camera, 'viewport': viewport,
+    })
+    state = {}
+    spec = {'capture_id': 'shared-source'}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._render_composer_capture_camera(0, capture, spec)
+        assert state['bo_composer_auto_render']
+        assert spec['capture_camera'] == selected_camera
+        assert spec['capture_viewport'] == viewport
+        rerun_spec = {'capture_id': 'shared-source'}
+        viewer._render_composer_capture_camera(0, capture, rerun_spec)
+        assert rerun_spec['capture_camera'] == selected_camera
+    edited = viewer._composer_formatted_capture_figure(capture, spec)
+    other_panel = viewer._composer_formatted_capture_figure(capture, {})
+    assert edited.layout.scene.camera.to_plotly_json() == selected_camera
+    assert other_panel.layout.scene.camera.to_plotly_json() == original_camera
+    assert source.layout.scene.camera.to_plotly_json() == original_camera
+    exported = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image',
+                        lambda figure, **kwargs: exported.append((figure, kwargs)) or b'png')
+    viewer._plotly_png_bytes(edited, width=800, height=800)
+    figure, options = exported[0]
+    assert figure.layout.scene.camera.to_plotly_json() == selected_camera
+    assert (options['width'], options['height']) == (800, 400)
+
+
+def test_starting_point_panel_edges_and_colormap_preserve_camera(monkeypatch):
+    response = pd.DataFrame({
+        'frequency': [100., 200.], 'amplitude': [.1, .2],
+        'step_potential': [.001, .002], 'metric_value': [1., 3.],
+        'ground_truth_channel': [1, 1],
+    })
+    source, _ = viewer._plot_starting_point_response(response,
+        axes=('frequency', 'amplitude', 'step_potential'), metric_label='Q', aggregate='Mean')
+    viewer._apply_starting_point_appearance(source, {'colorscale': 'Viridis', 'cube_edges': False})
+    camera = {'eye': {'x': .3, 'y': -.8, 'z': .5}}
+    spec = {'capture_camera': camera, 'capture_starting_point_appearance': {
+        'colorscale': 'Plasma', 'reverse': True, 'cube_edges': True}}
+    formatted = viewer._composer_formatted_capture_figure({'source_figure': source}, spec)
+    edges = [t for t in formatted.data if viewer._plotly_trace_role(t) == 'cube_edges']
+    assert len(edges) == 1
+    assert len(edges[0].x) == 36  # Twelve edges, each with two ends and a separator.
+    assert edges[0].line.color == 'black'
+    assert formatted.data[0].marker.colorscale == viewer.go.scatter3d.Marker(colorscale='Plasma').colorscale
+    assert formatted.data[0].marker.reversescale
+    assert formatted.layout.scene.camera.to_plotly_json() == camera
+    assert len(source.data) == 1
+    monkeypatch.setattr(viewer, '_plotly_colorscale_override', lambda: 'Greys')
+    viewer._apply_plotly_global_plot_style(formatted)
+    assert formatted.data[0].marker.colorscale == viewer.go.scatter3d.Marker(colorscale='Plasma').colorscale
+    viewer._apply_starting_point_appearance(formatted, {'colorscale': 'Cividis', 'cube_edges': False})
+    assert len(formatted.data) == 1
+    assert formatted.layout.scene.camera.to_plotly_json() == camera
+
+
+def test_panel_colorbar_geometry_survives_export_without_moving_camera(monkeypatch):
+    camera = {'eye': {'x': .4, 'y': -.7, 'z': .6}}
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1, 2], y=[1, 2], z=[1, 2],
+        marker={'color': [1, 2], 'showscale': True}))
+    source.update_layout(width=1000, height=500, scene_camera=camera)
+    spec = {'colorbar_geometry_enabled': True, 'colorbar_x': 20., 'colorbar_y': 65.,
+            'colorbar_length': 40., 'colorbar_thickness': 2.}
+    capture = viewer._composer_formatted_capture_figure({'source_figure': source, 'camera': camera}, spec)
+    exported = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image',
+                        lambda figure, **kwargs: exported.append(figure) or b'png')
+    viewer._plotly_png_bytes(capture, width=800, height=400)
+    bar = exported[0].data[0].marker.colorbar
+    assert (bar.x, bar.y, bar.len, bar.thickness) == (.2, .65, .4, .02)
+    assert bar.lenmode == bar.thicknessmode == 'fraction'
+    assert exported[0].layout.scene.camera.to_plotly_json() == camera
+    assert source.data[0].marker.colorbar.x is None
+
+
+def test_colorbar_geometry_selects_one_scale_and_handles_matplotlib():
+    spec = {'colorbar_geometry_enabled': True, 'colorbar_number': 2,
+            'colorbar_x': 30., 'colorbar_y': 60., 'colorbar_length': 50., 'colorbar_thickness': 4.}
+    plot = viewer.go.Figure([viewer.go.Heatmap(z=[[1, 2]], coloraxis='coloraxis'),
+                            viewer.go.Heatmap(z=[[3, 4]], coloraxis='coloraxis2')])
+    plot.update_layout(coloraxis={'colorbar': {'x': .9}}, coloraxis2={'colorbar': {'x': 1.1}})
+    viewer._composer_apply_plotly_colorbar_geometry(plot, spec)
+    assert plot.layout.coloraxis.colorbar.x == .9
+    assert plot.layout.coloraxis2.colorbar.x == .3
+    fig = Figure()
+    ax = fig.subplots()
+    im = ax.imshow([[1, 2], [3, 4]])
+    first = fig.colorbar(im, ax=ax)
+    second = fig.colorbar(im, ax=ax)
+    first_bounds = first.ax.get_position().bounds
+    viewer._composer_apply_matplotlib_colorbar_geometry(fig.axes, spec)
+    assert first.ax.get_position().bounds == first_bounds
+    assert second.ax.get_position().bounds == pytest.approx((.28, .35, .04, .5))
+
+
+def test_four_same_title_captures_keep_panel_assignments_on_rerun():
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_string('''
+import streamlit as st
+from bo_session_viewer import _composer_capture_choice_label
+captures = {f'capture-{i}': {'seq': i + 1, 'label': 'Starting-point influence'} for i in range(4)}
+for i in range(4):
+    key = f'panel_{i}'
+    st.session_state.setdefault(key, f'capture-{i}')
+    st.selectbox('Captured plot', list(captures), key=key,
+                 format_func=lambda value: _composer_capture_choice_label(value, captures))
+st.button('Render')
+''').run()
+    assert not app.exception
+    assert len(set(app.selectbox[0].options)) == 4
+    app.button[0].click().run()
+    assert [box.value for box in app.selectbox] == [f'capture-{i}' for i in range(4)]
+    app.selectbox[2].select('capture-0').run()
+    app.button[0].click().run()
+    assert [box.value for box in app.selectbox] == ['capture-0', 'capture-1', 'capture-0', 'capture-3']
+
+
+def test_reusing_2d_source_does_not_replace_earlier_captures():
+    state = {}
+    source = viewer.go.Figure(viewer.go.Heatmap(z=[[0, 0]]))
+    with patch.object(viewer.st, 'session_state', state):
+        keys = []
+        for i in range(4):
+            source.data[0].z = [[i, i]]
+            keys.append(viewer._queue_plot_for_composer(None, label='Same title',
+                         file_stem='same', figure=source))
+    assert [state['bo_composer_captured_plots'][key]['source_figure'].data[0].z[0][0]
+            for key in keys] == [0, 1, 2, 3]
+
+
+def test_repair_duplicate_assignments_preserves_layout_and_renders_four_sources(monkeypatch):
+    registry = {}
+    for i in range(4):
+        registry[f'capture-{i}'] = {
+            'seq': i + 1, 'label': 'Same title',
+            'source_figure': viewer.go.Figure(viewer.go.Scatter3d(
+                x=[i, i+1], y=[i, i+2], z=[i, i+3])),
+        }
+    state = {'bo_composer_captured_plots': registry}
+    for i in range(4):
+        state[f'bo_composer_capture_id_{i}'] = 'capture-3'
+        state[f'bo_composer_width_{i}'] = .35
+    rendered = []
+    def render_png(figure, **kwargs):
+        rendered.append(figure.data[0].x[0])
+        buffer = BytesIO()
+        Image.new('RGB', (20, 20), (20 * int(figure.data[0].x[0]), 0, 0)).save(buffer, format='PNG')
+        return buffer.getvalue()
+    monkeypatch.setattr(viewer, '_plotly_png_bytes', render_png)
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_restore_capture_assignments(tuple((i, f'capture-{i}') for i in range(4)))
+        assert state['bo_composer_repair_preview_requested']
+        assert all(state[f'bo_composer_width_{i}'] == .35 for i in range(4))
+        specs = [{'kind': 'Captured plot', 'capture_id': state[f'bo_composer_capture_id_{i}'],
+                  'rect': (.05 + .5*(i%2), .05 + .5*(i//2), .35, .35), 'show_label': False}
+                 for i in range(4)]
+        figure = viewer._build_composer_figure({'config': {}, 'root': Path('.')},
+            pd.DataFrame(), [], {}, {}, False, specs, '4:3', 'DejaVu Sans', 9, 12, '')
+        viewer.plt.close(figure)
+    assert rendered == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize('trace', [
+    viewer.go.Heatmap(z=[[1, 2], [3, 4]]),
+    viewer.go.Surface(z=[[1, 2], [3, 4]]),
+    viewer.go.Scatter(x=[1, 2], y=[2, 3], marker={'color': [1, 2], 'showscale': True}),
+    viewer.go.Parcoords(dimensions=[{'values': [1, 2]}, {'values': [2, 3]}], line={'color': [1, 2]}),
+])
+def test_panel_colormap_applies_to_editable_plotly_scales(trace):
+    source = viewer.go.Figure(trace)
+    spec = {'colormap_override_enabled': True, 'panel_colormap': 'Magma', 'panel_colormap_reverse': True}
+    formatted = viewer._composer_formatted_capture_figure({'source_figure': source}, spec)
+    target = formatted.data[0]
+    if target.type == 'scatter':
+        target = target.marker
+    elif target.type == 'parcoords':
+        target = target.line
+    assert target.colorscale == viewer.go.Heatmap(colorscale='Magma_r').colorscale
+    assert formatted.layout.meta['bo_local_colorscale'] == 'Magma_r'
+
+
+def test_panel_colormap_preserves_metadata_strips_and_updates_shared_scale():
+    plot = viewer.go.Figure([
+        viewer.go.Heatmap(z=[[1, 2]], colorscale='Greys', meta={'bo_trace_role': 'metadata_strip'}),
+        viewer.go.Scatter(x=[1, 2], y=[1, 2], marker={'color': [1, 2], 'coloraxis': 'coloraxis'}),
+    ])
+    plot.update_layout(coloraxis={'colorscale': 'Viridis', 'cmin': 0, 'cmax': 10})
+    strip_scale = plot.data[0].colorscale
+    viewer._composer_apply_plotly_colormap(plot, {'colormap_override_enabled': True, 'panel_colormap': 'Plasma'})
+    assert plot.data[0].colorscale == strip_scale
+    assert plot.layout.coloraxis.colorscale == viewer.go.Heatmap(colorscale='Plasma').colorscale
+    assert (plot.layout.coloraxis.cmin, plot.layout.coloraxis.cmax) == (0, 10)
+
+
+def test_matplotlib_capture_colormap_updates_mappable_and_colorbar_without_mutating_source():
+    source = Figure()
+    ax = source.subplots()
+    mesh = ax.imshow([[1, 2], [3, 4]], vmin=0, vmax=5, cmap='viridis')
+    source.colorbar(mesh, ax=ax)
+    formatted = viewer._composer_formatted_capture_figure({'source_figure': source}, {
+        'colormap_override_enabled': True, 'panel_colormap': 'Inferno', 'panel_colormap_reverse': True})
+    assert formatted.axes[0].images[0].get_cmap().name == 'inferno_r'
+    assert formatted.axes[0].images[0].get_clim() == (0, 5)
+    assert formatted.axes[1]._colorbar.mappable.get_cmap().name == 'inferno_r'
+    assert mesh.get_cmap().name == 'viridis'
+
+
+def test_composer_camera_preview_fits_complete_plot_after_global_size_override(monkeypatch):
+    camera = {'eye': {'x': .6, 'y': -.8, 'z': .5}}
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1, 2], y=[2, 3], z=[3, 4]))
+    source.update_layout(width=1200, height=800, scene_camera=camera,
+                         meta={'bo_composer_preserve_3d_view': True,
+                               'bo_captured_viewport': {'width': 1200, 'height': 800,
+                                                       'margin': {'l': 60, 'r': 90, 't': 60, 'b': 60}}})
+    width, height = viewer._preserve_captured_plotly_view(source, source, 520)
+    monkeypatch.setattr(viewer, '_apply_global_plot_style',
+                        lambda fig: fig.update_layout(width=1200, height=800))
+    calls = []
+    monkeypatch.setattr(viewer, '_plotly_camera_capture', lambda **kwargs: calls.append(kwargs))
+    with patch.object(viewer.st, 'session_state', {}):
+        viewer._render_camera_persistent_plotly(viewer.st, source, key='preview-fit',
+            camera_storage_key='preview-fit', height=height, export_width=width,
+            export_height=height, file_stem='panel')
+    args = calls[0]
+    assert args['figure']['layout']['width'] == width
+    assert args['figure']['layout']['height'] == args['height'] == height
+    assert args['show_cache_view']
+    assert args['figure']['layout']['scene']['camera'] == camera
+
+
+@pytest.mark.parametrize('ratio,expected', [(1., (600, 600)), (4/3, (600, 450)), (.75, (450, 600))])
+def test_captured_3d_aspect_changes_window_without_changing_camera(monkeypatch, ratio, expected):
+    camera = {'eye': {'x': .7, 'y': -.9, 'z': .6}, 'projection': {'type': 'orthographic'}}
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1, 2], y=[2, 3], z=[3, 4]))
+    source.update_layout(width=1200, height=600, scene_camera=camera,
+                         meta={'bo_captured_viewport': {'width': 1200, 'height': 600}})
+    formatted = viewer._composer_formatted_capture_figure({'source_figure': source, 'camera': camera},
+        {'capture_view_aspect': ratio})
+    assert formatted.layout.width / formatted.layout.height == pytest.approx(ratio)
+    exported = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image',
+                        lambda fig, **kwargs: exported.append((fig, kwargs)) or b'png')
+    viewer._plotly_png_bytes(formatted, width=600, height=600)
+    figure, options = exported[0]
+    assert (options['width'], options['height']) == expected
+    assert figure.layout.scene.camera.to_plotly_json() == camera
+    assert source.layout.height == 600
+
+
+@pytest.mark.parametrize('size,mode,expected', [(20, 'diameter', 10),
+    ([8, 16], 'diameter', [4, 8]), ([8, 16], 'area', [2, 4]), (None, 'diameter', 3)])
+def test_captured_plotly_marker_size_reaches_preview_and_export(monkeypatch, size, mode, expected):
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1, 2], y=[2, 3], z=[3, 4],
+        mode='markers', marker={'size': size, 'sizemode': mode}))
+    formatted = viewer._composer_formatted_capture_figure({'source_figure': source},
+        {'capture_marker_scale': .5})
+    assert formatted.data[0].marker.size == expected or tuple(formatted.data[0].marker.size) == tuple(expected)
+    exports = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image',
+                        lambda fig, **kwargs: exports.append(fig) or b'png')
+    viewer._plotly_png_bytes(formatted, width=600, height=600)
+    import numpy as np
+    assert np.asarray(exports[0].data[0].marker.size) == pytest.approx(expected)
+    original = source.data[0].marker.size
+    assert original == size or tuple(original) == tuple(size)
+
+
+def test_changing_capture_refreshes_labels_in_widgets_and_preserves_layout():
+    from streamlit.testing.v1 import AppTest
+    app = AppTest.from_string('''
+import streamlit as st
+import plotly.graph_objects as go
+from bo_session_viewer import (_composer_capture_changed, _composer_capture_format_defaults,
+    _composer_pin_panel_state, _composer_restore_pending_panel_state)
+_composer_restore_pending_panel_state()
+_composer_pin_panel_state()
+first = go.Figure(go.Scatter(x=[1], y=[2]))
+first.update_layout(title='Old heatmap', xaxis_title='Iteration', yaxis_title='Channel')
+second = go.Figure(go.Scatter3d(x=[1], y=[2], z=[3]))
+second.update_layout(title='New tensor', scene=dict(xaxis_title='Amplitude', yaxis_title='Step size', zaxis_title='Frequency'))
+captures = {'first': {'source_figure': first}, 'second': {'source_figure': second}}
+st.session_state.setdefault('bo_composer_left_0', .17)
+st.session_state.setdefault('bo_composer_text_size_0', 14)
+selected = st.selectbox('Captured plot', list(captures), key='bo_composer_capture_id_0',
+    on_change=_composer_capture_changed, args=(0,))
+st.text_input('Custom panel title', key='bo_composer_custom_title_0')
+st.text_input('X axis name', key='bo_composer_x_axis_title_0')
+defaults = _composer_capture_format_defaults(captures[selected])
+for name in ('title', 'xlabel', 'ylabel', 'zlabel'):
+    st.text_input(name, value=defaults[name], key=f'bo_composer_capture_{name}_0')
+st.button('Rerender')
+''').run()
+    app.text_input(key='bo_composer_custom_title_0').set_value('Old override').run()
+    app.text_input(key='bo_composer_x_axis_title_0').set_value('Old X override').run()
+    app.text_input(key='bo_composer_capture_title_0').set_value('My old title').run()
+    # A layout/stack rerun may have staged the old controls before the selection changes.
+    app.session_state['bo_composer_pending_panel_state'] = {
+        'bo_composer_capture_id_0': 'first',
+        'bo_composer_capture_title_0': 'My old title',
+        'bo_composer_custom_title_0': 'Old override',
+        'bo_composer_x_axis_title_0': 'Old X override',
+        'bo_composer_left_0': .17,
+    }
+    app.selectbox[0].select('second').run()
+    assert not app.exception
+    assert [app.text_input(key=f'bo_composer_capture_{name}_0').value
+            for name in ('title', 'xlabel', 'ylabel', 'zlabel')] == ['New tensor', 'Amplitude', 'Step size', 'Frequency']
+    assert app.text_input(key='bo_composer_custom_title_0').value == ''
+    assert app.text_input(key='bo_composer_x_axis_title_0').value == ''
+    assert app.session_state['bo_composer_left_0'] == .17
+    assert app.session_state['bo_composer_text_size_0'] == 14
+    app.text_input(key='bo_composer_capture_xlabel_0').set_value('Edited amplitude').run()
+    app.button[0].click().run()
+    assert app.text_input(key='bo_composer_capture_xlabel_0').value == 'Edited amplitude'
+    app.selectbox[0].select('first').run()
+    assert app.text_input(key='bo_composer_capture_zlabel_0').value == ''
+
+
+@pytest.mark.parametrize("aspect,title_y,title_x", [(2.5, .98, .35), (.75, .82, .7)])
+def test_3d_title_position_survives_aspect_and_export(monkeypatch, aspect, title_y, title_x):
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1], y=[2], z=[3]))
+    camera = dict(eye=dict(x=1.2, y=1.4, z=.7))
+    source.update_layout(width=800, height=600, title=dict(text="Tensor", y=1., yanchor="bottom"),
+                         scene_camera=camera, margin=dict(t=10))
+    formatted = viewer._composer_formatted_capture_figure(
+        {"source_figure": source}, {"capture_title": "Tensor", "capture_view_aspect": aspect,
+                                    "capture_title_y": title_y, "capture_title_x": title_x})
+    exports = []
+    monkeypatch.setattr(viewer.go.Figure, "to_image",
+                        lambda fig, **kwargs: exports.append((fig, kwargs)) or b"png")
+    viewer._plotly_png_bytes(formatted, width=1000, height=1000)
+    exported, options = exports[0]
+    assert formatted.layout.title.x == title_x
+    assert exported.layout.title.x == title_x
+    assert exported.layout.title.xref == "container"
+    assert exported.layout.title.xanchor == "center"
+    assert exported.layout.title.y == title_y
+    assert exported.layout.title.yref == "container"
+    assert exported.layout.title.yanchor == "top"
+    assert exported.layout.title.pad.t == 0
+    assert options["width"] / options["height"] == pytest.approx(aspect, abs=.002)
+    assert exported.layout.scene.camera.to_plotly_json() == camera
+    assert source.layout.title.yanchor == "bottom"
+
+
+@pytest.mark.parametrize('choice,expected', [('Square (1:1)', 1.), ('Landscape (4:3)', 4/3),
+    ('Portrait (3:4)', .75), ('Custom', 2.)])
+def test_3d_aspect_updates_editor_dimensions_and_staged_state(choice, expected):
+    state = {'bo_composer_aspect': 'Custom (pixels)', 'bo_composer_canvas_width_px': 1200,
+             'bo_composer_canvas_height_px': 900, 'bo_composer_dpi': 100,
+             'bo_composer_capture_aspect_0': choice, 'bo_composer_capture_aspect_width_0': 2.,
+             'bo_composer_capture_aspect_height_0': 1., 'bo_composer_kind_0': 'Captured plot',
+             'bo_composer_capture_id_0': 'first', 'bo_composer_left_1': .6,
+             'bo_composer_width_1': .3, 'bo_composer_capture_view_0': {'camera': {'eye': {'x': 2}}},
+             'bo_composer_pending_panel_state': {'bo_composer_height_0': .2}}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_capture_aspect_changed(0, (.1, .1, .4, .2))
+        viewer._composer_restore_pending_panel_state()
+    assert state['bo_composer_width_0'] * 1200 / (state['bo_composer_height_0'] * 900) == pytest.approx(expected)
+    assert state['bo_composer_left_0'] == state['bo_composer_bottom_0'] == .1
+    assert state['bo_composer_left_1'] == .6 and state['bo_composer_width_1'] == .3
+    assert state['bo_composer_capture_id_0'] == 'first'
+    assert state['bo_composer_capture_view_0']['camera']['eye']['x'] == 2
+    assert state['bo_composer_stack_revision'] == 1
+    assert state['bo_composer_layout'] == 'Manual'
+
+
+def test_3d_match_panel_does_not_resize_editor():
+    state = {'bo_composer_capture_aspect_0': 'Match panel'}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_capture_aspect_changed(0, (.1, .1, .4, .2))
+    assert state == {'bo_composer_capture_aspect_0': 'Match panel'}
+
+
+@pytest.mark.parametrize('dpi', [180, 300, 600])
+def test_captured_3d_tick_values_and_point_sizes_survive_export(monkeypatch, dpi):
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1,2], y=[2,3], z=[3,4]))
+    source.update_layout(scene=dict(xaxis=dict(showticklabels=False)),
+                         meta={'bo_composer_preserve_3d_view': True})
+    token = viewer._COMPOSER_PANEL_TYPOGRAPHY.set({
+        'tick_size': 10, 'title_size': 12, 'x_tick_values': [1, 1.5, 2]})
+    exports = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image', lambda fig, **kw: exports.append(fig) or b'png')
+    try:
+        scale = dpi / 72 * viewer._PLOTLY_TEXT_CALIBRATION
+        viewer._plotly_png_bytes(source, width=dpi * 4, height=dpi * 3,
+                                 text_size=12 * scale)
+    finally:
+        viewer._COMPOSER_PANEL_TYPOGRAPHY.reset(token)
+    axis = exports[0].layout.scene.xaxis
+    assert axis.showticklabels is True
+    assert list(axis.tickvals) == [1, 1.5, 2]
+    assert axis.tickfont.size == pytest.approx(
+        10 * viewer._PLOTLY_3D_TICK_SCALE * min(1., viewer._PLOTLY_3D_REFERENCE_WIDTH_PX / (dpi * 4)) ** .5)
+    assert exports[0].layout.title.font.size == pytest.approx(12)
+    assert source.layout.scene.xaxis.showticklabels is False
+
+
+@pytest.mark.parametrize('is_3d', [False, True])
+def test_tick_export_fix_preserves_other_panel_font_sizes(is_3d):
+    trace = (viewer.go.Scatter3d(x=[1,2], y=[2,3], z=[3,4],
+                marker=dict(color=[1,2], showscale=True)) if is_3d else
+             viewer.go.Heatmap(z=[[1,2],[3,4]]))
+    source = viewer.go.Figure(trace)
+    source.update_layout(xaxis_title='X', yaxis_title='Y',
+        scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'),
+        meta={'bo_composer_preserve_3d_view': is_3d})
+    settings = {'title_size': 12, 'axis_label_size': 11, 'tick_size': 9,
+                'legend_size': 8, 'colorbar_title_size': 10, 'colorbar_tick_size': 7}
+    token = viewer._COMPOSER_PANEL_TYPOGRAPHY.set(settings)
+    try:
+        before = viewer._composer_apply_plotly_text_size(viewer.go.Figure(source), 24, 1200)
+        after = viewer._composer_apply_plotly_text_size(viewer.go.Figure(source), 24, 3600)
+    finally:
+        viewer._COMPOSER_PANEL_TYPOGRAPHY.reset(token)
+    assert after.layout.title.font.size == before.layout.title.font.size == 12
+    assert after.layout.legend.font.size == before.layout.legend.font.size == 8
+    for name in ('xaxis', 'yaxis', 'zaxis'):
+        assert after.layout.scene[name].title.font.size == before.layout.scene[name].title.font.size
+    for name in ('xaxis', 'yaxis'):
+        assert after.layout[name].tickfont.size == before.layout[name].tickfont.size == 9
+    bars = [fig.data[0].marker.colorbar if is_3d else fig.data[0].colorbar for fig in (before, after)]
+    assert bars[0].title.font.size == bars[1].title.font.size == 10
+    assert bars[0].tickfont.size == bars[1].tickfont.size == 7
+
+
+def test_colorbar_label_override_without_moving_or_resizing():
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1,2],y=[2,3],z=[3,4],
+        marker=dict(color=[1,2], showscale=True, colorbar=dict(title='Original', x=.9, len=.6))))
+    spec = {'colorbar_label_enabled': True, 'colorbar_label': 'Paired response Q'}
+    viewer._composer_apply_plotly_colorbar_geometry(source, spec)
+    assert source.data[0].marker.colorbar.title.text == 'Paired response Q'
+    assert source.data[0].marker.colorbar.x == .9
+    assert source.data[0].marker.colorbar.len == .6
+    fig, ax = viewer.plt.subplots()
+    try:
+        bar = fig.colorbar(ax.imshow([[1,2],[3,4]]), ax=ax)
+        bar.set_label('Original')
+        position = bar.ax.get_position().bounds
+        viewer._composer_apply_matplotlib_colorbar_geometry(fig.axes, spec)
+        assert bar.ax.get_ylabel() == 'Paired response Q'
+        assert bar.ax.get_position().bounds == position
+    finally:
+        viewer.plt.close(fig)
+
+
+@pytest.mark.parametrize('orientation,side', [('Vertical beside bar','right'), ('Horizontal above bar','top')])
+def test_colorbar_orientation_preview_and_export(monkeypatch, orientation, side):
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1,2], y=[2,3], z=[3,4],
+        marker=dict(color=[1,2], showscale=True, colorbar=dict(title=dict(text='Q run', side='top')))))
+    spec = {'colorbar_label_orientation': orientation}
+    preview = viewer._composer_formatted_capture_figure({'source_figure':source}, spec)
+    assert preview.data[0].marker.colorbar.title.side == side
+    exports = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image', lambda fig, **kw: exports.append(fig) or b'png')
+    viewer._plotly_png_bytes(preview, width=600, height=600)
+    assert exports[0].data[0].marker.colorbar.title.side == side
+    assert exports[0].data[0].marker.colorbar.title.text == 'Q run'
+    assert source.data[0].marker.colorbar.title.side == 'top'
+
+
+@pytest.mark.parametrize('horizontal', [False, True])
+def test_matplotlib_colorbar_orientation_preserves_label_and_size(horizontal):
+    fig, ax = viewer.plt.subplots()
+    try:
+        bar = fig.colorbar(ax.imshow([[1,2],[3,4]]), ax=ax,
+                          orientation='horizontal' if horizontal else 'vertical')
+        bar.set_label('Q run', fontsize=13)
+        position = bar.ax.get_position().bounds
+        for orientation in ['Horizontal above bar', 'Vertical beside bar', 'Vertical beside bar']:
+            viewer._composer_apply_matplotlib_colorbar_geometry(fig.axes,
+                {'colorbar_label_orientation':orientation})
+            label = bar.ax.title if orientation.startswith('Horizontal') else bar.ax.yaxis.label
+            assert label.get_text() == 'Q run'
+            assert label.get_fontsize() == 13
+            assert bar.ax.get_position().bounds == position
+    finally:
+        viewer.plt.close(fig)
+
+
+@pytest.mark.parametrize('show_legend', [False, True])
+def test_panel_legend_choice_wins_over_global_style_in_preview_and_export(monkeypatch, show_legend):
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1,2], y=[2,3], z=[3,4], name='trace 0',
+        marker=dict(color=[1,2], showscale=True)))
+    formatted = viewer._composer_formatted_capture_figure({'source_figure':source},
+        {'capture_show_legend': show_legend})
+    monkeypatch.setattr(viewer, '_apply_global_plot_style',
+                        lambda fig: fig.update_layout(showlegend=not show_legend))
+    previews = []
+    monkeypatch.setattr(viewer, '_plotly_camera_capture', lambda **kw: previews.append(kw))
+    with patch.object(viewer.st, 'session_state', {}):
+        viewer._render_camera_persistent_plotly(viewer.st, formatted, key='legend-test',
+            camera_storage_key='legend-test', height=400, file_stem='panel')
+    assert previews[0]['figure']['layout']['showlegend'] is show_legend
+    exports = []
+    monkeypatch.setattr(viewer.go.Figure, 'to_image', lambda fig, **kw: exports.append(fig) or b'png')
+    viewer._plotly_png_bytes(formatted, width=500, height=400)
+    assert exports[0].layout.showlegend is show_legend
+    assert exports[0].data[0].marker.showscale is True
+    assert source.layout.showlegend is None
+
+
+@pytest.mark.parametrize('background', ['white', (0,0,0,0)])
+def test_trim_blank_margins_keeps_labels_colorbar_and_faint_content(background):
+    from PIL import ImageDraw
+    image = Image.new('RGBA', (600,400), background)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((150,120,350,300), fill='blue')
+    draw.rectangle((380,100,395,300), fill='green')  # colorbar
+    draw.text((170,70), 'Plot title', fill='black')
+    draw.point((100,310), fill=(254,254,254,255))  # faint tick/edge
+    cropped = viewer._composer_trim_blank_margins(image, 0)
+    assert cropped.width == 296
+    assert cropped.height >= 230
+    assert cropped.getpixel((0,cropped.height-1)) == (254,254,254,255)
+    assert cropped.getpixel((295,cropped.height-11)) == (0,128,0,255)
+    padded = viewer._composer_trim_blank_margins(image, 2)
+    assert padded.width > cropped.width and padded.height > cropped.height
+    assert image.size == (600,400)
+
+
+def test_blank_panel_trim_is_noop():
+    image = Image.new('RGB', (120,80), 'white')
+    assert viewer._composer_trim_blank_margins(image).size == image.size
+
+
+def test_trimmed_render_keeps_displayed_text_height():
+    from PIL import ImageDraw
+    factors = []
+    def render(factor):
+        factors.append(factor)
+        image = Image.new('RGB', (800,600), 'white')
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((200,150,599,449), outline='blue')
+        # A text-height marker, wholly inside the plot's fixed bounds.
+        draw.rectangle((300,200,309,200+round(20*factor)-1), fill='black')
+        buffer = BytesIO()
+        image.save(buffer, format='PNG')
+        return buffer.getvalue()
+    result = viewer._composer_trim_plotly_export(render, 800, 600, 0)
+    with Image.open(BytesIO(result)) as image:
+        import numpy as np
+        pixels = np.array(image)
+        rows = np.where((pixels[:,:,:3] == 0).all(axis=2).any(axis=1))[0]
+        final_scale = min(800/image.width, 600/image.height)
+        assert len(rows) * final_scale == pytest.approx(20, abs=1)
+        assert image.size == (400,300)
+    assert factors == [1., .5]
+
+
+def test_trim_font_compensation_applies_to_all_text_without_mutating_metadata():
+    fig = viewer.go.Figure(viewer.go.Scatter3d(x=[1], y=[2], z=[3],
+        marker=dict(color=[1], colorbar=dict(title=dict(text='Q', font=dict(size=14)), tickfont=dict(size=12)))))
+    fig.update_layout(font=dict(size=10), title=dict(font=dict(size=16)),
+        scene=dict(xaxis=dict(title=dict(font=dict(size=14)), tickfont=dict(size=12))),
+        meta={'original_font': {'size': 100}})
+    viewer._composer_scale_plotly_fonts(fig, .5)
+    assert fig.layout.title.font.size == 8
+    assert fig.layout.scene.xaxis.tickfont.size == 6
+    assert fig.data[0].marker.colorbar.title.font.size == 7
+    assert fig.data[0].marker.colorbar.tickfont.size == 6
+    assert fig.layout.meta['original_font']['size'] == 100
+
+
+
+def test_composer_render_signature_invalidates_after_renderer_update(monkeypatch):
+    from types import SimpleNamespace
+    config = {'panels': [{'kind':'Captured plot', 'capture_trim_blank_margins':True}]}
+    with patch.object(viewer.Path, 'stat', return_value=SimpleNamespace(st_mtime_ns=1, st_size=100)):
+        before = viewer._composer_config_signature(config)
+        assert viewer._composer_config_signature(config) == before
+    with patch.object(viewer.Path, 'stat', return_value=SimpleNamespace(st_mtime_ns=2, st_size=100)):
+        assert viewer._composer_config_signature(config) != before
+
+
+def test_dpi_change_preserves_custom_canvas_inches_and_panel_state():
+    state = {'bo_composer_dpi':220, 'bo_composer_aspect':'Custom (pixels)',
+             'bo_composer_canvas_width_px':2200, 'bo_composer_canvas_height_px':1760,
+             'bo_composer_width_0':.4, 'bo_composer_capture_id_0':'capture'}
+    with patch.object(viewer.st, 'session_state', state):
+        before = viewer._composer_canvas_inches('Custom (pixels)')
+        state['bo_composer_dpi'] = 600
+        viewer._composer_dpi_changed(220)
+        assert viewer._composer_canvas_inches('Custom (pixels)') == before
+        assert state['bo_composer_canvas_width_input'] == 6000
+        assert state['bo_composer_width_0'] == .4
+        assert state['bo_composer_capture_id_0'] == 'capture'
+        state['bo_composer_dpi'] = 220
+        viewer._composer_dpi_changed(600)
+        assert state['bo_composer_canvas_width_px'] == 2200
+
+
+def test_plotly_dpi_change_only_changes_raster_scale(monkeypatch):
+    calls = []
+    def export(fig, **kwargs):
+        calls.append(kwargs)
+        image = Image.new('RGB',(20,20),'white')
+        buf = BytesIO(); image.save(buf,format='PNG'); return buf.getvalue()
+    monkeypatch.setattr(viewer, '_plotly_png_bytes', export)
+    source = viewer.go.Figure(viewer.go.Scatter3d(x=[1],y=[2],z=[3]))
+    for dpi in (220,600):
+        target = viewer.plt.figure(figsize=(10,8))
+        try:
+            axis = target.add_axes((.1,.1,.4,.4))
+            viewer._composer_draw_embedded_figure(target, axis, source, (.1,.1,.4,.4),dpi,9)
+        finally:
+            viewer.plt.close(target)
+    assert calls[1]['scale'] / calls[0]['scale'] == pytest.approx(600/220)
+    assert {k:v for k,v in calls[0].items() if k != 'scale'} == {k:v for k,v in calls[1].items() if k != 'scale'}
+
+
+
+def test_reformat_text_opt_in_keeps_custom_pixel_dimensions():
+    state = {'bo_composer_dpi':600, 'bo_composer_aspect':'Custom (pixels)',
+             'bo_composer_canvas_width_px':2200, 'bo_composer_canvas_height_px':1760,
+             'bo_composer_reformat_text':True, 'bo_composer_title_size_0':30}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_dpi_changed(220)
+        assert state['bo_composer_canvas_width_px'] == 2200
+        assert viewer._composer_canvas_inches('Custom (pixels)') == pytest.approx((2200/600,1760/600))
+        state['bo_composer_dpi'] = 220
+        viewer._composer_dpi_changed(600)
+        assert viewer._composer_canvas_inches('Custom (pixels)') == (10,8)
+        assert state['bo_composer_title_size_0'] == 30
+
+
+def test_restore_render_settings_preserves_panel_sources_layout_and_content():
+    state = {'bo_composer_count':2, 'bo_composer_dpi':600,
+        'bo_composer_aspect':'Custom (pixels)', 'bo_composer_canvas_width_px':500,
+        'bo_composer_canvas_height_px':400, 'bo_composer_title_size_0':30,
+        'bo_composer_capture_id_0':'cube', 'bo_composer_label_0':'B',
+        'bo_composer_capture_id_1':'heatmap', 'bo_composer_label_1':'A',
+        'bo_composer_left_0':.4, 'bo_composer_width_0':.35,
+        'bo_composer_capture_title_0':'My title', 'bo_composer_colorbar_x_0':105,
+        'bo_composer_capture_view_0':{'camera':{'eye':{'x':2}}}}
+    before = dict(state)
+    config = {'state':{'bo_composer_count':2,'bo_composer_dpi':220,
+        'bo_composer_aspect':'Custom (pixels)', 'bo_composer_canvas_width_px':2200,
+        'bo_composer_canvas_height_px':1760, 'bo_composer_title_size_0':12,
+        'bo_composer_title_size_1':14, 'bo_composer_label_0':'A', 'bo_composer_label_1':'B'},
+        'panels':[{'capture_id':'heatmap'},{'capture_id':'cube'}]}
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_restore_render_settings(config)
+        assert state['bo_composer_dpi'] == 220
+        assert state['bo_composer_canvas_width_input'] == 2200
+        assert state['bo_composer_title_size_0'] == 14
+        assert state['bo_composer_title_size_1'] == 12
+        for key in ('bo_composer_capture_id_0','bo_composer_capture_id_1','bo_composer_label_0',
+                    'bo_composer_left_0','bo_composer_width_0','bo_composer_capture_title_0',
+                    'bo_composer_colorbar_x_0','bo_composer_capture_view_0'):
+            assert state[key] == before[key]
+        viewer._composer_undo_render_restore()
+        for key,value in before.items():
+            assert state[key] == value
+        assert 'bo_composer_title_size_1' not in state
+
+
+
+def test_legacy_dpi_shrink_recovery_keeps_text_and_layout():
+    state = {'bo_composer_dpi':220, 'bo_composer_aspect':'Custom (pixels)',
+             'bo_composer_canvas_width_px':1168, 'bo_composer_canvas_height_px':812,
+             'bo_composer_title_size_0':30, 'bo_composer_tick_size_0':24,
+             'bo_composer_left_0':.39, 'bo_composer_width_0':.376,
+             'bo_composer_capture_id_0':'cube'}
+    original = dict(state)
+    with patch.object(viewer.st, 'session_state', state):
+        viewer._composer_undo_dpi_shrink(220,600)
+        assert state['bo_composer_canvas_width_px'] == round(1168*600/220)
+        assert state['bo_composer_canvas_height_px'] == round(812*600/220)
+        for key in ('bo_composer_title_size_0','bo_composer_tick_size_0',
+                    'bo_composer_left_0','bo_composer_width_0','bo_composer_capture_id_0'):
+            assert state[key] == original[key]
+        viewer._composer_undo_render_restore()
+        assert state['bo_composer_canvas_width_px'] == 1168
+        assert state['bo_composer_canvas_height_px'] == 812

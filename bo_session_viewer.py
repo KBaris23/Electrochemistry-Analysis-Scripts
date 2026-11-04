@@ -16,7 +16,7 @@ import inspect
 from concurrent.futures import FIRST_COMPLETED, wait
 from contextlib import ExitStack
 from functools import lru_cache
-from functools import partial
+from functools import partial, wraps
 from io import BytesIO, StringIO
 import math
 import os
@@ -85,6 +85,9 @@ _figure_layout_editor = components.declare_component(
     "figure_layout_editor",
     path=str(_FIGURE_LAYOUT_EDITOR_COMPONENT_DIR),
 )
+_panel_stack_order = components.declare_component(
+    "panel_stack_order", path=str(Path(__file__).parent / ".streamlit_components" / "panel_stack_order"),
+)
 _SHARED_3D_CAMERA_STORAGE_KEY = "bo_viewer_camera:latest_3d_perspective"
 _INDIVIDUAL_PLOT_SETTINGS_CLIPBOARD_KEY = (
     "bo_viewer:individual_plot_settings_clipboard"
@@ -145,7 +148,7 @@ COMPOSER_PNG_METADATA_KEY = "SWVFigureComposer"
 COMPOSER_PRESET_STORE = Path(__file__).with_name("figure_composer_presets.json")
 LEGACY_COMPOSER_PRESET_STORE = Path(__file__).with_name(".figure_composer_presets.json")
 COMPOSER_SETTINGS_CACHE_DIR = Path(__file__).with_name(".figure_composer_settings")
-COMPOSER_RENDER_VERSION = 'best-parameters-heading-v12'
+COMPOSER_RENDER_VERSION = 'stable-layout-and-settings-v13'
 OBSERVED_PATH_COLORS = ("#e31a1c", "#000000")
 SWV_PHASE_COLORS = {
     "buffer": "#1f77b4",
@@ -643,7 +646,10 @@ def _bo_session_choice_label(path: Path, search_root: Path) -> str:
     return f"{folder_label} ({', '.join(details)})" if details else folder_label
 
 
-def _compact_simulation_observations_from_history(history: pd.DataFrame) -> list[dict]:
+def _compact_simulation_observations_from_history(
+    history: pd.DataFrame,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> list[dict]:
     """Rebuild lightweight observations for compact simulation exports."""
     observations = []
     if history is None or history.empty:
@@ -651,11 +657,19 @@ def _compact_simulation_observations_from_history(history: pd.DataFrame) -> list
     # iterrows constructs a pandas Series and performs indexed lookups for every
     # cell. Large compact sweeps can contain tens of thousands of history rows,
     # making that representation several times slower than reading plain records.
-    rows = history.sort_values(
+    ordered_history = history.sort_values(
         ["group_id", "iteration"],
         kind="mergesort",
-    ).to_dict(orient="records")
-    for row in rows:
+    )
+    row_count = len(ordered_history)
+    columns = ordered_history.columns
+    for row_index, values in enumerate(ordered_history.itertuples(index=False, name=None)):
+        row = dict(zip(columns, values))
+        if progress_callback and row_index % 5000 == 0:
+            progress_callback(
+                row_index / row_count,
+                f"Rebuilding observations: {row_index:,} / {row_count:,} rows",
+            )
         try:
             iteration = int(row.get("iteration"))
             group_id = int(row.get("group_id", 1))
@@ -1024,8 +1038,87 @@ def _normalize_simulated_channel_identities(
     return normalized_observations, normalized_history, normalized_config
 
 
-def load_bo_session(folder: str | Path) -> dict:
+def _load_channel_tokens(value) -> set[str]:
+    if isinstance(value, (list, tuple, set)):
+        return {token for item in value for token in _load_channel_tokens(item)}
+    if value is None:
+        return set()
+    return {
+        _simulation_channel_identity_text(part.strip())
+        for part in str(value).split(",")
+        if part.strip() and part.strip().lower() not in {"nan", "none", "<na>"}
+    }
+
+
+def _bo_load_channel_options(folder) -> list[str]:
+    """Discover channels without reconstructing simulation observations."""
+    root = Path(folder)
+    config_path = root / "bo_config_snapshot.json"
+    config = _read_json(config_path) if config_path.is_file() else {}
+    metadata = config.get("simulation_metadata") or {}
+    channels = _load_channel_tokens((metadata.get("settings") or {}).get("ground_truth_channels"))
+    channels.update(_load_channel_tokens(config.get("channels")))
+    for group in config.get("channel_groups") or []:
+        channels.update(_load_channel_tokens(group.get("ground_truth_channel") or group.get("channels")))
+    # History channel identities are authoritative for simulated runs, whose
+    # group/channel IDs in older snapshots can be synthetic run numbers.
+    history_path = root / "history.csv"
+    if history_path.is_file():
+        columns = pd.read_csv(history_path, nrows=0).columns
+        identity = next((name for name in ("ground_truth_channel", "channels") if name in columns), None)
+        if identity:
+            recorded = set()
+            for chunk in pd.read_csv(history_path, usecols=[identity], chunksize=50000):
+                for value in chunk[identity].dropna().unique():
+                    recorded.update(_load_channel_tokens(value))
+            if recorded:
+                channels = recorded
+    if not channels:
+        state_path = root / "bo_state.json"
+        state = _read_json(state_path) if state_path.is_file() else {}
+        for observation in state.get("observations") or []:
+            channels.update(_load_channel_tokens(observation.get("channels")))
+    return sorted(channels, key=_channel_sort_key)
+
+
+def _filter_bo_channel_rows(frame, selected, group_channels):
+    if frame.empty:
+        return frame
+    def matches(row):
+        channels = _load_channel_tokens(row.get("ground_truth_channel"))
+        if not channels:
+            channels = _load_channel_tokens(row.get("channels", row.get("channel")))
+        if not channels:
+            group_id = _finite_float(row.get("group_id"))
+            channels = group_channels.get(str(int(group_id)) if group_id is not None else "", set())
+        # Unknown identities must not be silently discarded.
+        return not channels or bool(channels & selected)
+    identity_columns = [column for column in ("ground_truth_channel", "channels", "channel", "group_id") if column in frame]
+    identities = frame[identity_columns]
+    unique = identities.drop_duplicates()
+    allowed = unique.apply(matches, axis=1)
+    if identity_columns:
+        mask = pd.MultiIndex.from_frame(identities).isin(pd.MultiIndex.from_frame(unique.loc[allowed]))
+        frame = frame.loc[mask].copy()
+    unwanted = []
+    for column in frame:
+        match = re.fullmatch(r"(?:Q_ch|paired_Q_ch|ch)(\d+(?:_(?:min|max))?)(?:_.*)?", str(column))
+        if match and match.group(1) not in selected:
+            unwanted.append(column)
+    return frame.drop(columns=unwanted).reset_index(drop=True)
+
+
+def load_bo_session(
+    folder: str | Path,
+    progress_callback: Callable[[float, str], None] | None = None,
+    *, selected_channels: Sequence[str] | None = None,
+) -> dict:
     """Load a BO record folder without depending on experiment_automation."""
+    def report(fraction: float, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(fraction, message)
+
+    report(0.0, "Checking BO session files...")
     root = Path(folder).expanduser().resolve()
     state_path = root / "bo_state.json"
     history_path = root / "history.csv"
@@ -1034,13 +1127,38 @@ def load_bo_session(folder: str | Path) -> dict:
         raise ValueError(f"BO session folder does not exist: {root}")
     if not state_path.is_file():
         raise ValueError(f"Not a BO session: {state_path.name} is missing")
+    report(0.05, "Reading session state...")
     state = _read_json(state_path)
     observations = state.get("observations") or []
     if not isinstance(observations, list):
         raise ValueError("bo_state.json observations must be a list")
-    history = pd.read_csv(history_path) if history_path.is_file() else pd.DataFrame()
     config_path = root / "bo_config_snapshot.json"
     config = _read_json(config_path) if config_path.is_file() else {}
+    selected = None if selected_channels is None else _load_channel_tokens(selected_channels)
+    if selected is not None and not selected:
+        raise ValueError("Choose at least one channel to load.")
+    group_channels = {
+        str(group.get("id")): _load_channel_tokens(group.get("ground_truth_channel") or group.get("channels"))
+        for group in (config.get("channel_groups") or state.get("channel_groups") or [])
+    }
+    def read_table(path):
+        if not path.is_file():
+            return pd.DataFrame()
+        if selected is None:
+            return pd.read_csv(path)
+        chunks = []
+        scanned = retained = 0
+        for chunk in pd.read_csv(path, chunksize=50000):
+            scanned += len(chunk)
+            chunk = _filter_bo_channel_rows(chunk, selected, group_channels)
+            retained += len(chunk)
+            chunks.append(chunk)
+            report(0.20 if path == history_path else 0.40,
+                   f"Reading {path.name}: {scanned:,} rows scanned; {retained:,} selected rows")
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+    report(0.15, "Reading iteration history...")
+    history = read_table(history_path)
+    report(0.30, f"Reading configuration ({len(history):,} history rows loaded)...")
     metadata = state.get("simulation_metadata") or {}
     records = (config.get("records") or {}) if isinstance(config, dict) else {}
     if (
@@ -1050,12 +1168,48 @@ def load_bo_session(folder: str | Path) -> dict:
             or records.get("compact_simulation_export")
         )
     ):
+        report(0.35, "Merging simulation run summaries...")
         history = _merge_compact_simulation_summary_into_history(root, history)
+    report(0.40, "Reading simulation ground truth...")
     simulation_ground_truth = (
-        pd.read_csv(simulation_ground_truth_path)
-        if simulation_ground_truth_path.is_file()
-        else pd.DataFrame()
+        read_table(simulation_ground_truth_path)
     )
+    if selected is not None:
+        kept = []
+        for observation in observations:
+            channels = _load_channel_tokens(observation.get("ground_truth_channel"))
+            if not channels:
+                channels = _load_channel_tokens(observation.get("channels"))
+            if channels and not channels & selected:
+                continue
+            observation = dict(observation)
+            observation["channels"] = sorted(channels & selected, key=_channel_sort_key)
+            for field in ("channel_metrics", "buffer_channel_metrics", "target_channel_metrics"):
+                if field in observation:
+                    observation[field] = {key: value for key, value in observation[field].items() if str(key) in selected}
+            quality = dict(observation.get("quality") or {})
+            for field in ("channel_components", "Q_channels"):
+                if isinstance(quality.get(field), dict):
+                    quality[field] = {key: value for key, value in quality[field].items() if str(key) in selected}
+            observation["quality"] = quality
+            kept.append(observation)
+        observations = kept
+        state["observations"] = observations
+        retained_ids = set(pd.to_numeric(history.get("group_id", pd.Series(dtype=float)), errors="coerce").dropna().astype(int))
+        retained_ids.update(int(obs.get("group_id", 1)) for obs in observations)
+        for container in (state, config):
+            groups = []
+            for group in container.get("channel_groups") or []:
+                channels = _load_channel_tokens(group.get("ground_truth_channel") or group.get("channels"))
+                if int(group.get("id", 1)) in retained_ids or not channels or channels & selected:
+                    groups.append({**group, "channels": sorted(channels & selected, key=_channel_sort_key)})
+            container["channel_groups"] = groups
+        config["channels"] = sorted(selected, key=_channel_sort_key)
+        if metadata.get("compact_export") and "group_id" in history:
+            metadata["run_count"] = int(history["group_id"].nunique())
+            metadata.pop("planned_run_count", None)
+        state.pop("best_observation", None)
+    report(0.45, "Preparing simulation channels and groups...")
     observations, history, config = _normalize_simulated_channel_identities(
         observations,
         history,
@@ -1066,7 +1220,14 @@ def load_bo_session(folder: str | Path) -> dict:
             # Normalize the tabular channel identities first, then reconstruct
             # compact observations once. Previously every reconstructed record
             # went through a second, redundant dictionary-normalization pass.
-            observations = _compact_simulation_observations_from_history(history)
+            report(0.65, f"Preparing {len(history):,} simulation observations...")
+            observations = _compact_simulation_observations_from_history(
+                history,
+                progress_callback=lambda fraction, message: report(
+                    0.65 + 0.35 * fraction, message,
+                ),
+            )
+    report(1.0, "BO session data loaded.")
     return {
         "root": root,
         "state": state,
@@ -1078,7 +1239,53 @@ def load_bo_session(folder: str | Path) -> dict:
             _read_json(root / "local_snapshot.json")
             if (root / "local_snapshot.json").is_file() else None
         ),
+        "loaded_channels": None if selected is None else tuple(sorted(selected, key=_channel_sort_key)),
     }
+
+
+def _viewer_loaded_session(folder, progress_callback=None, selected_channels=None):
+    """Reuse the loaded data on reruns; invalidate when any input file changes."""
+    root = Path(folder).expanduser().resolve()
+    versions = []
+    for name in (
+        "bo_state.json", "history.csv", "bo_config_snapshot.json",
+        "simulation_ground_truth_tensor.csv", "simulation_run_summary.csv",
+    ):
+        path = root / name
+        try:
+            stat = path.stat()
+            versions.append((name, stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            versions.append((name, None, None))
+    channel_key = None if selected_channels is None else tuple(sorted(map(str, selected_channels)))
+    key = (str(root), tuple(versions), channel_key)
+    cached = st.session_state.get("_bo_runtime_loaded_session")
+    if cached is None or cached["key"] != key:
+        # Release the previous scope's tables and Composer snapshots before
+        # allocating another session, especially when narrowing a large sweep.
+        for state_key in list(st.session_state):
+            if str(state_key).startswith("_bo_runtime_") and state_key != "_bo_runtime_channel_options":
+                st.session_state.pop(state_key, None)
+        cached = None
+        kwargs = {} if selected_channels is None else {"selected_channels": selected_channels}
+        cached = {"key": key, "session": load_bo_session(root, progress_callback, **kwargs)}
+        st.session_state["_bo_runtime_loaded_session"] = cached
+    return cached["session"]
+
+
+def _viewer_observation_table(session):
+    """Share the prepared table between the viewer and Composer."""
+    key = (id(session.get("observations")), id(session.get("history")),
+           id(session.get("active_rescore_profile")))
+    cached = st.session_state.get("_bo_runtime_observation_table")
+    if cached is None or cached["key"] != key:
+        with st.spinner("Preparing analysis table and best-Q histories..."):
+            cached = {"key": key, "source": session,
+                      "history": _observation_table(session)}
+        st.session_state["_bo_runtime_observation_table"] = cached
+    else:
+        _report_bo_loading(0.75, "Reusing prepared analysis table...")
+    return cached["history"]
 
 
 def _bo_swv_settings_key(values: Mapping[str, Any]) -> tuple[float, float, float] | None:
@@ -1974,6 +2181,7 @@ def _best_run_q_observation(
 
 def _observation_table(session: dict) -> pd.DataFrame:
     def add_best_q_column(frame: pd.DataFrame) -> pd.DataFrame:
+        _report_bo_loading(0.74, "Computing best-Q history for each run...")
         if frame.empty or "Q_run" not in frame.columns:
             return frame
         result = frame.copy()
@@ -1996,24 +2204,26 @@ def _observation_table(session: dict) -> pd.DataFrame:
             "q_value": q_values,
             "_source_order": range(len(result)),
         }, index=result.index)
-        for _group_id, group_rows in order_frame.groupby("group_id", sort=False):
-            ordered = group_rows.sort_values(
-                ["iteration", "_source_order"],
-                kind="mergesort",
-            )
-            if "objective" in result.columns:
-                paired_rows = result.loc[ordered.index, "objective"].map(
-                    lambda value: str(value).lower() == "paired_response"
-                )
-                if paired_rows.any():
-                    ordered = ordered.loc[paired_rows]
-            best_q.loc[ordered.index] = ordered["q_value"].cummax()
+        ordered = order_frame.sort_values(
+            ["group_id", "iteration", "_source_order"], kind="mergesort",
+        )
+        if "objective" in result.columns:
+            paired_rows = result["objective"].astype(str).str.lower().eq("paired_response")
+            has_paired = paired_rows.groupby(group_ids, sort=False).transform("any")
+            ordered = ordered.loc[(paired_rows | ~has_paired).reindex(ordered.index)]
+        best_q.loc[ordered.index] = ordered.groupby("group_id", sort=False)["q_value"].cummax()
         result["best_Q"] = best_q
         return result
 
     history = session["history"].copy()
     rows = []
-    for obs in session["observations"]:
+    observation_count = len(session["observations"])
+    for row_index, obs in enumerate(session["observations"]):
+        if row_index % 5000 == 0:
+            _report_bo_loading(
+                0.55 + 0.06 * row_index / max(observation_count, 1),
+                f"Preparing analysis records: {row_index:,} / {observation_count:,}",
+            )
         quality = obs.get("quality") or {}
         row = {
             "iteration": obs.get("iteration"),
@@ -2053,20 +2263,35 @@ def _observation_table(session: dict) -> pd.DataFrame:
                     # fields; channel_metrics may still contain recorded scores.
                     row[f"ch{channel}_{key}"] = value
         rows.append(row)
-    observation_frame = pd.DataFrame(rows)
     if history.empty:
-        return add_best_q_column(observation_frame)
-    if observation_frame.empty:
+        return add_best_q_column(pd.DataFrame(rows))
+    if not rows:
         return add_best_q_column(history)
 
+    # Infer overlay dtypes without allocating a dense row-by-channel frame.
+    # Each simulated observation only contains metrics for its own channel.
+    _report_bo_loading(0.61, "Preparing analysis columns...")
+    column_values = {}
+    for row in rows:
+        for column, value in row.items():
+            column_values.setdefault(column, []).append(value)
+    observation_dtypes = {}
+    for column in list(column_values):
+        values = column_values.pop(column)
+        if len(values) < len(rows):
+            values.append(np.nan)
+        observation_dtypes[column] = pd.Series(values).dtype
+    del column_values, values
+
+    _report_bo_loading(0.63, "Allocating channel metric columns...")
     missing_columns = [
-        column for column in observation_frame.columns
+        column for column in observation_dtypes
         if column not in history.columns
     ]
     if missing_columns:
         missing_data = {}
         for column in missing_columns:
-            observation_dtype = observation_frame[column].dtype
+            observation_dtype = observation_dtypes[column]
             is_numeric = (
                 pd.api.types.is_numeric_dtype(observation_dtype)
                 and not pd.api.types.is_bool_dtype(observation_dtype)
@@ -2083,13 +2308,13 @@ def _observation_table(session: dict) -> pd.DataFrame:
             ],
             axis=1,
         )
+        del missing_data
     # CSV history columns containing only blanks are inferred as float64. The
     # observation overlay later writes saved text metadata into those columns.
     # Pandas 2 allowed that implicit upcast with a warning; pandas 3 raises a
     # TypeError. Promote textual/boolean overlay columns explicitly, while
     # preserving numeric columns for plotting and aggregation.
-    for column in observation_frame.columns:
-        observation_dtype = observation_frame[column].dtype
+    for column, observation_dtype in observation_dtypes.items():
         is_numeric = (
             pd.api.types.is_numeric_dtype(observation_dtype)
             and not pd.api.types.is_bool_dtype(observation_dtype)
@@ -2104,6 +2329,7 @@ def _observation_table(session: dict) -> pd.DataFrame:
                 history[column],
                 errors="coerce",
             ).astype(float)
+    _report_bo_loading(0.65, "Indexing history rows...")
     history_group = pd.to_numeric(
         history.get("group_id", pd.Series(1, index=history.index)),
         errors="coerce",
@@ -2118,7 +2344,15 @@ def _observation_table(session: dict) -> pd.DataFrame:
                        for key in ("method_id", "optimization_direction", "objective") if key in history}
     matched_indices = set()
     matched_positions, matched_rows, unmatched_rows = [], [], []
-    for row in observation_frame.to_dict('records'):
+    # Keep the original sparse records. Expanding the wide per-channel frame
+    # back to dictionaries adds every other channel's missing metrics to every
+    # row (tens of millions of entries for large simulation sweeps).
+    for row_index, row in enumerate(rows):
+        if row_index % 5000 == 0:
+            _report_bo_loading(
+                0.66 + 0.03 * row_index / max(len(rows), 1),
+                f"Matching analysis records: {row_index:,} / {len(rows):,}",
+            )
         candidates = list(positions.get((int(row.get("group_id", 1)), int(row["iteration"])), []))
         # A group can evaluate both directions at the same iteration. Match
         # the saved identity before overlaying scores, and never reuse a row.
@@ -2139,15 +2373,23 @@ def _observation_table(session: dict) -> pd.DataFrame:
         for identity, values in identity_values.items():
             if pd.notna(row.get(identity)):
                 values[position] = row[identity]
-    if matched_rows:
-        overlay = pd.DataFrame(matched_rows)
-        targets = np.asarray(matched_positions)
+    # Bound temporary wide tables instead of materializing a second complete
+    # 350,000-row, multi-channel frame alongside the destination history.
+    for start in range(0, len(matched_rows), 5000):
+        _report_bo_loading(
+            0.69 + 0.04 * start / max(len(matched_rows), 1),
+            f"Updating analysis table: {start:,} / {len(matched_rows):,} rows",
+        )
+        overlay = pd.DataFrame(matched_rows[start:start + 5000])
+        targets = np.asarray(matched_positions[start:start + 5000])
         for column in overlay:
             valid = overlay[column].notna().to_numpy()
             if valid.any():
                 history.iloc[targets[valid], history.columns.get_loc(column)] = overlay.loc[valid, column].to_numpy()
+        del overlay
     if unmatched_rows:
         history = pd.concat([history, pd.DataFrame(unmatched_rows)], ignore_index=True)
+    del rows, matched_rows, unmatched_rows, positions, identity_values
     return add_best_q_column(history)
 
 
@@ -3460,6 +3702,7 @@ def _plot_trend(
     trace_opacity: float = 1.0,
     moving_average_window: int | None = None,
 ):
+    _report_bo_loading(0.93, 'Rendering run history plot...')
     if metric not in frame.columns:
         fig = go.Figure()
         fig.add_annotation(
@@ -4424,6 +4667,41 @@ def _starting_point_response_grouped(
     )
 
 
+def _starting_point_appearance_controls(prefix, defaults=None, *, is_3d=True):
+    defaults = defaults or {}
+    columns = st.columns(3)
+    palettes = ["Viridis", "Plasma", "Cividis", "Turbo", "Inferno", "Magma", "RdBu", "Spectral", "Greys"]
+    palette = defaults.get("colorscale", "Viridis")
+    if palette not in palettes:
+        palettes.append(palette)
+    colorscale = columns[0].selectbox("Colormap", palettes,
+        index=palettes.index(palette), key=f"{prefix}_colorscale")
+    reverse = columns[1].checkbox("Reverse colormap", value=bool(defaults.get("reverse", False)),
+        key=f"{prefix}_reverse")
+    edges = columns[2].checkbox("Draw full cube edges", value=bool(defaults.get("cube_edges", False)),
+        disabled=not is_3d, key=f"{prefix}_cube_edges")
+    return {"colorscale": colorscale, "reverse": reverse, "cube_edges": edges and is_3d}
+
+
+def _apply_starting_point_appearance(figure, appearance):
+    figure.data = tuple(trace for trace in figure.data if _plotly_trace_role(trace) != "cube_edges")
+    palette = appearance.get("colorscale", "Viridis")
+    for trace in figure.data:
+        if trace.type in ("scatter", "scatter3d"):
+            trace.marker.update(colorscale=palette, reversescale=bool(appearance.get("reverse")))
+    if appearance.get("cube_edges"):
+        points = [pd.DataFrame({"x": trace.x, "y": trace.y, "z": trace.z})
+                  for trace in figure.data if trace.type == "scatter3d"]
+        if points:
+            _add_plotly_cube_edges(figure, pd.concat(points, ignore_index=True),
+                                  "x", "y", "z", line_color="black")
+    metadata = dict(figure.layout.meta or {})
+    metadata["bo_starting_point_appearance"] = dict(appearance)
+    metadata["bo_local_colorscale"] = palette
+    figure.update_layout(meta=metadata)
+    return figure
+
+
 def _plot_starting_point_response(
     response: pd.DataFrame,
     *,
@@ -4708,6 +4986,14 @@ def _render_starting_point_influence(
         ]
         plot_frames.sort(key=lambda item: _channel_sort_key(item[0]))
 
+    appearance = _starting_point_appearance_controls(
+        f"bo_start_map_appearance_{scope_key}", is_3d=len(axes) == 3,
+    )
+    if len(axes) == 3:
+        st.caption(
+            "Rotate and zoom to your preferred 3D view, then click Cache view "
+            "before Add to Composer to preserve that perspective."
+        )
     grouped_frames = []
     for plot_channel, plot_response in plot_frames:
         if plot_channel is not None:
@@ -4718,6 +5004,7 @@ def _render_starting_point_influence(
             metric_label=metric_label,
             aggregate=aggregate,
         )
+        _apply_starting_point_appearance(figure, appearance)
         if plot_channel is not None:
             figure.update_layout(
                 title=f"{figure.layout.title.text} | Ch {plot_channel}"
@@ -4726,13 +5013,18 @@ def _render_starting_point_influence(
             re.sub(r"[^A-Za-z0-9._-]+", "_", plot_channel).strip("_")
             if plot_channel is not None else "combined"
         )
-        st.plotly_chart(
+        plot_key = (
+            f"bo_start_map_plot_{scope_key}_{metric}_{summary_mode}_"
+            f"{'_'.join(axes)}_{plot_channel_token}"
+        )
+        _render_downloadable_plotly(
+            st,
             figure,
-            use_container_width=True,
-            key=(
-                f"bo_start_map_plot_{scope_key}_{metric}_{summary_mode}_"
-                f"{'_'.join(axes)}_{plot_channel_token}"
-            ),
+            key=plot_key,
+            file_stem=f"starting_point_influence_{plot_channel_token}",
+            width_percent=100,
+            camera_storage_key=f"{plot_key}_camera" if len(axes) == 3 else None,
+            eager_png=False,
         )
         if not grouped.empty:
             grouped = grouped.copy()
@@ -5754,6 +6046,7 @@ def _plot_channel_trend(
     trace_opacity: float = 1.0,
     moving_average_window: int | None = None,
 ):
+    _report_bo_loading(0.93, 'Rendering channel history plots...')
     iterations = pd.to_numeric(
         frame.get("iteration", pd.Series(range(1, len(frame) + 1))),
         errors="coerce",
@@ -7455,6 +7748,18 @@ def _add_real_heatmap_history_columns(
             work["__history_channel"] = work["channel"].map(
                 _simulation_channel_identity_text
             )
+            # Averaging a simulation observation replaces its display channel
+            # with "Average", even when that run belongs to exactly one real
+            # channel. Recover that unambiguous identity for the history join.
+            # Never collapse reused group IDs across multiple real channels.
+            averaged = work["channel"].astype(str).eq("Average")
+            if averaged.any():
+                identities = values[["group_id", "iteration", "ground_truth_channel"]].drop_duplicates()
+                identities = identities.loc[
+                    ~identities.duplicated(["group_id", "iteration"], keep=False)
+                ].set_index(["group_id", "iteration"])["ground_truth_channel"]
+                keys = pd.MultiIndex.from_frame(work.loc[averaged, ["__group_id", "__iteration"]])
+                work.loc[averaged, "__history_channel"] = identities.reindex(keys).to_numpy()
             left_keys.append("__history_channel")
             right_keys.append("ground_truth_channel")
         merged = work.merge(
@@ -26080,6 +26385,11 @@ def _force_plotly_tick_font_size(fig: go.Figure, size: float) -> None:
         fig.update_layout(**layout_updates)
 
 
+def _plotly_has_3d_traces(fig: go.Figure) -> bool:
+    return any(str(getattr(trace, "type", "")).lower() in PLOTLY_3D_TRACE_TYPES
+               for trace in fig.data)
+
+
 def _plotly_plot_kind(fig: go.Figure) -> str:
     trace_types = {str(getattr(trace, "type", "") or "").lower() for trace in fig.data}
     if any(trace_type.endswith("3d") or trace_type in {"surface", "mesh3d", "volume", "isosurface", "cone"} for trace_type in trace_types):
@@ -26108,7 +26418,8 @@ def _apply_plotly_global_plot_style(fig: go.Figure) -> go.Figure:
     tick_text_size = _plot_tick_text_size_points()
     line_scale = _plot_line_width_scale()
     line_color_override = _plot_line_color_override()
-    colorscale_override = _plotly_colorscale_override()
+    local_metadata = fig.layout.meta if isinstance(fig.layout.meta, Mapping) else {}
+    colorscale_override = local_metadata.get("bo_local_colorscale") or _plotly_colorscale_override()
     plot_kind = _plotly_plot_kind(fig)
     has_highlighted_slice_perimeter = _has_plotly_highlighted_slice_perimeter(fig)
     title_override = _plot_text_override("bo_plot_title_override")
@@ -27691,6 +28002,48 @@ def _render_downloadable_pyplot(
     return png_bytes
 
 
+def _preserve_captured_plotly_view(source: go.Figure, target: go.Figure,
+                                  width: int, height: int | None = None) -> tuple[int, int]:
+    """Scale the saved viewport uniformly, keeping camera and scene geometry."""
+    metadata = source.layout.meta if isinstance(source.layout.meta, Mapping) else {}
+    viewport = metadata.get("bo_captured_viewport") or {}
+    source_width = float(viewport.get("width") or source.layout.width or width)
+    source_height = float(viewport.get("height") or source.layout.height or height or 700)
+    ratio = float(width) / source_width
+    if height is not None:
+        ratio = min(ratio, float(height) / source_height)
+    result_width = max(1, round(source_width * ratio))
+    result_height = max(1, round(source_height * ratio))
+    margin = viewport.get("margin") or source.layout.margin.to_plotly_json()
+    target.update_layout(width=result_width, height=result_height, autosize=False,
+                         margin={key: float(margin.get(key, 0)) * ratio
+                                 for key in ("l", "r", "t", "b", "pad")})
+    for key in source.layout.to_plotly_json():
+        if re.fullmatch(r"scene\d*", key):
+            original = source.layout[key].to_plotly_json()
+            target.update_layout(**{key: {name: original[name] for name in
+                ("camera", "domain", "aspectmode", "aspectratio") if name in original}})
+    _composer_apply_plotly_title_position(target)
+    return result_width, result_height
+
+
+def _composer_apply_plotly_title_position(figure):
+    """Anchor the title inside the full image, independently of scene margins."""
+    metadata = figure.layout.meta if isinstance(figure.layout.meta, Mapping) else {}
+    horizontal = _finite_float(metadata.get("bo_composer_title_x"))
+    if horizontal is not None:
+        figure.update_layout(title=dict(
+            x=min(1.0, max(0.0, horizontal)), xref="container", xanchor="center",
+            pad=dict(l=0, r=0),
+        ))
+    position = _finite_float(metadata.get("bo_composer_title_y"))
+    if position is not None:
+        figure.update_layout(title=dict(
+            y=min(1.0, max(0.0, position)), yref="container", yanchor="top",
+            pad=dict(t=0, b=0),
+        ))
+
+
 def _plotly_png_bytes(
     fig: go.Figure,
     *,
@@ -27700,6 +28053,7 @@ def _plotly_png_bytes(
     text_size: float | None = None,
     mark_scale: float | None = None,
     composer_colorbar_side: str | None = None,
+    trim_font_scale: float = 1.0,
 ) -> bytes:
     export_fig = go.Figure(fig)
     _apply_global_plot_style(export_fig)
@@ -27723,7 +28077,45 @@ def _plotly_png_bytes(
                 line.showscale = False
     if mark_scale is not None:
         _composer_scale_plotly_marks(export_fig, mark_scale)
+    metadata = fig.layout.meta if isinstance(fig.layout.meta, Mapping) else {}
+    if metadata.get("bo_composer_preserve_3d_view") and _plotly_has_3d_traces(fig):
+        width, height = _preserve_captured_plotly_view(fig, export_fig, width, height)
+    geometry_spec = dict(_COMPOSER_PANEL_TYPOGRAPHY.get())
+    geometry_spec.update(metadata.get("bo_composer_colorbar_geometry") or {})
+    _composer_apply_plotly_colorbar_geometry(export_fig, geometry_spec)
+    palette_spec = dict(_COMPOSER_PANEL_TYPOGRAPHY.get())
+    palette_spec.update(metadata.get("bo_composer_colormap") or {})
+    _composer_apply_plotly_colormap(export_fig, palette_spec)
+    _composer_apply_plotly_title_position(export_fig)
+    # Plotly's WebGL auto-tick density can depend on raster scale even with a
+    # fixed logical viewport. Resolve automatic ticks before rasterization.
+    if _COMPOSER_PANEL_TYPOGRAPHY.get():
+        for scene_name, scene in export_fig.layout.to_plotly_json().items():
+            if not re.fullmatch(r"scene\d*", scene_name):
+                continue
+            for name in ("x", "y", "z"):
+                axis = scene.get(name + "axis", {})
+                if axis.get("tickmode") in {"array", "linear"} or axis.get("tickvals") is not None:
+                    continue
+                ticks = _composer_plotly_tick_override(export_fig, name, axis, 5, scene=scene_name)
+                ticks.pop("showticklabels", None)
+                export_fig.layout[scene_name][name + "axis"].update(ticks)
+    if "bo_composer_show_legend" in metadata:
+        export_fig.update_layout(showlegend=bool(metadata["bo_composer_show_legend"]))
+    if trim_font_scale != 1.0:
+        _composer_scale_plotly_fonts(export_fig, trim_font_scale)
     try:
+        from core.plotly_export import prepare_plotly_export
+        prepare_plotly_export()
+        if metadata.get("bo_composer_preserve_3d_view"):
+            import tempfile
+            diagnostic = Path(tempfile.gettempdir()) / "bo-composer-3d-export-diagnostic.json"
+            try:
+                diagnostic.write_text(json.dumps({"figure": json.loads(export_fig.to_json()),
+                    "width": width, "height": int(height or export_fig.layout.height or 800),
+                    "scale": scale, "typography": dict(_COMPOSER_PANEL_TYPOGRAPHY.get())}, default=str))
+            except OSError:
+                pass
         return export_fig.to_image(
             format="png",
             width=width,
@@ -27732,8 +28124,7 @@ def _plotly_png_bytes(
         )
     except Exception as exc:
         raise RuntimeError(
-            "Plotly PNG export requires plotly==5.24.1 with kaleido==0.2.1. "
-            "Install the updated requirements and restart the app."
+            f"Plotly PNG export failed: {exc}"
         ) from exc
 
 
@@ -27896,6 +28287,9 @@ def _valid_plotly_camera(camera: Any) -> dict | None:
                 cleaned_part[axis] = float(numeric)
         if cleaned_part:
             cleaned[part] = cleaned_part
+    projection = camera.get("projection")
+    if isinstance(projection, dict) and projection.get("type") in {"perspective", "orthographic"}:
+        cleaned["projection"] = {"type": projection["type"]}
     return cleaned if "eye" in cleaned else None
 
 
@@ -28018,6 +28412,10 @@ def _render_camera_persistent_plotly(
 ) -> dict | None:
     _apply_plotly_colorbar_height(fig)
     _apply_global_plot_style(fig)
+    metadata = fig.layout.meta if isinstance(fig.layout.meta, Mapping) else {}
+    _composer_apply_plotly_colorbar_geometry(fig, metadata.get("bo_composer_colorbar_geometry") or {})
+    if "bo_composer_show_legend" in metadata:
+        fig.update_layout(showlegend=bool(metadata["bo_composer_show_legend"]))
     effective_export_width = int(export_width or _plot_width_px())
     storage_key = f"bo_viewer_camera:{camera_storage_key}"
     shared_storage_key = shared_camera_storage_key or _SHARED_3D_CAMERA_STORAGE_KEY
@@ -28041,6 +28439,14 @@ def _render_camera_persistent_plotly(
         current_camera = sync_camera
         st.session_state[camera_state_key] = sync_camera
         st.session_state[applied_nonce_key] = apply_nonce
+    # Global styling can restore the source plot's large dimensions after a
+    # Composer thumbnail was fitted. Keep Plotly and its iframe in agreement.
+    if metadata.get("bo_composer_preserve_3d_view"):
+        effective_export_width, height = _preserve_captured_plotly_view(
+            fig, fig, effective_export_width, height,
+        )
+    else:
+        fig.update_layout(height=int(height))
     component_figure = json.loads(
         json.dumps(fig.to_plotly_json(), cls=PlotlyJSONEncoder)
     )
@@ -28071,6 +28477,16 @@ def _render_camera_persistent_plotly(
             returned_camera = render_component()
     else:
         returned_camera = render_component()
+    viewport_key = f"{camera_state_key}_viewport"
+    if isinstance(returned_camera, dict) and isinstance(returned_camera.get("viewport"), dict):
+        viewport = returned_camera["viewport"]
+        if all((_finite_float(viewport.get(key)) or 0) > 0 for key in ("width", "height")):
+            st.session_state[viewport_key] = viewport
+    viewport = st.session_state.get(viewport_key)
+    if isinstance(viewport, dict):
+        metadata = dict(fig.layout.meta) if isinstance(fig.layout.meta, Mapping) else {}
+        metadata["bo_captured_viewport"] = viewport
+        fig.update_layout(meta=metadata)
     if isinstance(returned_camera, dict) and returned_camera.get("type") == "cache_view":
         cached_camera = _valid_plotly_camera(returned_camera.get("camera"))
         if cached_camera is not None:
@@ -28910,6 +29326,13 @@ def _queue_plot_for_composer(
         raise ValueError("Select an existing Composer panel before replacing it.")
     if replace_index is None and current_panel_count + len(pending) >= 24:
         raise ValueError("Figure Composer already has 24 panels queued or in use.")
+    if isinstance(figure, go.Figure):
+        # Every panel owns a snapshot, including 2D sources reused by plotting code.
+        figure = go.Figure(figure)
+        if _plotly_has_3d_traces(figure):
+            _apply_plotly_camera(figure, camera)
+    elif isinstance(figure, plt.Figure):
+        figure = copy.deepcopy(figure)
     reserved_index = replace_index if replace_index is not None else current_panel_count + len(pending)
     reserved_label = chr(ord("A") + reserved_index)
     captured_png = (
@@ -29355,6 +29778,14 @@ def _render_downloadable_plotly(
             selection_mode=selection_mode,
             key=chart_key,
         )
+        if not eager_png:
+            _render_add_to_composer_button(
+                plot_column,
+                None,
+                key=key,
+                file_stem=file_stem,
+                figure=fig,
+            )
     if eager_png:
         try:
             png_bytes = _plotly_png_bytes(
@@ -29914,6 +30345,8 @@ def _figures_to_gif(
             _apply_plotly_3d_turntable_dragmode(figure)
             _apply_plotly_camera(figure, plotly_camera)
             try:
+                from core.plotly_export import prepare_plotly_export
+                prepare_plotly_export()
                 png = figure.to_image(
                     format="png",
                     width=plotly_width,
@@ -30585,14 +31018,14 @@ def _viewer_scored_session(session, profile):
     """Reuse an unchanged scoring view across tab switches, with file invalidation."""
     versions = []
     for name in ('bo_state.json', 'history.csv', 'bo_config_snapshot.json',
-                 'simulation_ground_truth_tensor.csv'):
+                 'simulation_ground_truth_tensor.csv', 'simulation_run_summary.csv'):
         path = Path(session['root']) / name
         try:
             stat = path.stat()
             versions.append((name, stat.st_mtime_ns, stat.st_size))
         except OSError:
             versions.append((name, None, None))
-    key = (str(session['root']), tuple(versions), _composer_config_signature(profile))
+    key = (str(session['root']), tuple(versions), session.get('loaded_channels'), _composer_config_signature(profile))
     cached = st.session_state.get('_bo_runtime_scored_session')
     if cached is None or cached['key'] != key:
         cached = {'key': key, 'session': _session_with_rescore_profile(session, profile)}
@@ -30606,6 +31039,8 @@ def _persist_rescored_bo_session(
     scoring: Mapping[str, Any],
     analysis: Mapping[str, Any] | None = None,
 ) -> list[Path]:
+    if session.get("loaded_channels") is not None:
+        raise ValueError("Load all channels before saving rescored values to the source BO session.")
     root = Path(session["root"])
     state_path = root / "bo_state.json"
     config_path = root / "bo_config_snapshot.json"
@@ -31596,6 +32031,8 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_settings_cache_",
     "bo_composer_pending_duplicates",
     "bo_composer_add_panel",
+    "bo_composer_apply_canvas_dimensions",
+    "bo_composer_capture_apply_aspect_",
     "bo_composer_image_upload_",
     "bo_composer_image_clear_",
     "bo_composer_editor_",
@@ -31605,6 +32042,9 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_source_route",
     "bo_composer_jump_tab",
     "bo_composer_capture_counter",
+    "bo_composer_capture_assignment_backup",
+    "bo_composer_restore_capture_assignments",
+    "bo_composer_repair_preview_requested",
     "bo_composer_consumed_seq",
     "bo_composer_render_",
     "bo_composer_final_export_button",
@@ -31616,7 +32056,16 @@ _COMPOSER_STATE_EXCLUSIONS = (
     "bo_composer_captured_plots",
     "bo_composer_pending_captures",
     "bo_composer_pending_delete_indices",
+    "bo_composer_pending_import_state",
     "bo_composer_pending_panel_state",
+    "bo_composer_pending_stack_order",
+    # Exclude panel-order events without dropping chronological-stack settings.
+    "bo_composer_stack_revision",
+    "bo_composer_stack_sources",
+    "bo_composer_stack_order_v2",
+    "bo_composer_stack_seen_event",
+    "bo_composer_reletter_stack",
+    "bo_composer_restore_last_layout",
     "bo_composer_capture_flash",
     "bo_composer_capture_preview_",
     "bo_composer_add_flash_",
@@ -31821,7 +32270,11 @@ def _composer_metadata(
 
 
 def _composer_config_signature(config: Mapping[str, Any]) -> str:
-    return hashlib.sha256(_composer_json_bytes(config)).hexdigest()[:16]
+    # Session-state exporters cache image bytes across UI-module reloads. A
+    # renderer update must invalidate them even when all user settings match.
+    source = Path(__file__).stat()
+    payload = {"renderer_version": (source.st_mtime_ns, source.st_size), "config": config}
+    return hashlib.sha256(_composer_json_bytes(payload)).hexdigest()[:16]
 
 
 def _composer_metadata_from_upload(data: bytes, file_name: str) -> dict[str, Any]:
@@ -31856,6 +32309,15 @@ def _composer_metadata_from_upload(data: bytes, file_name: str) -> dict[str, Any
 
 def _composer_apply_config(config: Mapping[str, Any]) -> None:
     """Stage saved widget values before composer widgets are constructed."""
+    # A loaded configuration replaces the draft. Runtime snapshots are excluded
+    # from persistence, but must also be discarded so an early rerun cannot
+    # restore the previous figure over the newly loaded preset.
+    revision = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    for key in ("bo_composer_pending_panel_state", "bo_composer_pending_stack_order",
+                "bo_composer_pending_canvas_resize", "bo_composer_pending_source_edit",
+                "bo_composer_pending_delete_indices", "bo_composer_pending_duplicates",
+                "bo_composer_stack_sources"):
+        st.session_state.pop(key, None)
     if "rescore_profile" in config:
         # Apply on the next app run, before the scoring selector is built.
         # None explicitly restores original recorded scoring.
@@ -31933,6 +32395,125 @@ def _composer_apply_config(config: Mapping[str, Any]) -> None:
         ):
             st.session_state["bo_composer_count"] = len(chosen_ids)
 
+    count = int(st.session_state.get("bo_composer_count", 0) or 0)
+    st.session_state["bo_composer_stack_sources"] = [
+        {"kind": st.session_state.get(f"bo_composer_kind_{index}"),
+         "capture_id": st.session_state.get(f"bo_composer_capture_id_{index}")}
+        for index in range(count)
+    ]
+    st.session_state["bo_composer_stack_revision"] = revision
+    # Scoring/session restoration may rerun or stop the app before Composer is
+    # reached. Widget cleanup must not discard the newly imported settings.
+    st.session_state["bo_composer_pending_import_state"] = _composer_widget_state(count)
+
+
+def _composer_apply_pending_import():
+    imported = st.session_state.pop("bo_composer_pending_import_state", None)
+    if isinstance(imported, Mapping):
+        st.session_state.update({
+            key: copy.deepcopy(value) for key, value in imported.items()
+            if isinstance(key, str) and key.startswith("bo_composer_")
+            and not any(key.startswith(prefix) for prefix in _COMPOSER_STATE_EXCLUSIONS)
+        })
+    # Older exports and an already-staged import may contain button values.
+    # Remove them before the corresponding widgets are instantiated. Even False
+    # is illegal as an explicitly assigned Streamlit button value.
+    for key in list(st.session_state):
+        if str(key).startswith(("bo_composer_apply_canvas_dimensions",
+                                "bo_composer_add_panel",
+                                "bo_composer_capture_apply_aspect_",
+                                "bo_composer_image_clear_")):
+            del st.session_state[key]
+
+
+def _composer_capture_changed(index):
+    """Reset source-specific settings, including copies staged by layout reruns."""
+    selection_key = f"bo_composer_capture_id_{index}"
+    capture_id = st.session_state.get(selection_key)
+    reset_fields = {f"bo_composer_{name}_{index}" for name in (
+        "custom_title", "x_axis_title", "y_axis_title", "z_axis_title",
+        "colormap_override_enabled", "colorbar_geometry_enabled", "colorbar_label_enabled", "colorbar_label", "colorbar_label_orientation",
+    )}
+
+    def source_setting(key):
+        name = str(key)
+        return ((name != selection_key and name.startswith("bo_composer_capture_")
+                 and name.endswith(f"_{index}"))
+                or name.startswith(f"bo_composer_start_map_{index}_")
+                or name in reset_fields)
+
+    for key in list(st.session_state):
+        if source_setting(key):
+            del st.session_state[key]
+    # Layout snapshots must preserve geometry without resurrecting a previous
+    # capture or its labels on the next early rerun.
+    pending = st.session_state.get("bo_composer_pending_panel_state")
+    if isinstance(pending, dict):
+        for key in list(pending):
+            if source_setting(key):
+                del pending[key]
+        if capture_id is not None:
+            pending[selection_key] = capture_id
+    sources = st.session_state.get("bo_composer_stack_sources")
+    if isinstance(sources, list) and 0 <= index < len(sources):
+        sources[index] = {"kind": "Captured plot", "capture_id": capture_id}
+
+    capture = (st.session_state.get("bo_composer_captured_plots") or {}).get(capture_id)
+    if isinstance(capture, Mapping):
+        defaults = _composer_capture_format_defaults(capture)
+        for name in ("title", "xlabel", "ylabel", "zlabel"):
+            st.session_state[f"bo_composer_capture_{name}_{index}"] = str(defaults[name])
+    for name in ("custom_title", "x_axis_title", "y_axis_title", "z_axis_title"):
+        st.session_state[f"bo_composer_{name}_{index}"] = ""
+
+
+def _composer_restore_capture_assignments(assignments):
+    """Repair explicit panel selections without changing layout or formatting."""
+    registry = st.session_state.get("bo_composer_captured_plots") or {}
+    if any(capture_id not in registry for _, capture_id in assignments):
+        return
+    st.session_state["bo_composer_capture_assignment_backup"] = {
+        str(index): st.session_state.get(f"bo_composer_capture_id_{index}")
+        for index, _ in assignments
+    }
+    for index, capture_id in assignments:
+        if st.session_state.get(f"bo_composer_capture_id_{index}") != capture_id:
+            st.session_state[f"bo_composer_capture_id_{index}"] = capture_id
+            _composer_capture_changed(index)
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_capture_assignment_controls(specs):
+    registry = st.session_state.get("bo_composer_captured_plots") or {}
+    panels = [(index, spec.get("capture_id")) for index, spec in enumerate(specs)
+              if spec.get("kind") == "Captured plot"]
+    if not panels:
+        return
+    with st.expander("Panel capture assignments", expanded=False):
+        st.dataframe([
+            {"Panel": chr(65 + index), "Capture number": registry.get(key, {}).get("seq"),
+             "Capture ID": key, "Plot": registry.get(key, {}).get("label", "Missing capture")}
+            for index, key in panels
+        ], hide_index=True, use_container_width=True)
+    if len({key for _, key in panels}) < len(panels):
+        st.warning("Some panels currently select the same captured plot. Rerunning alone does not restore selections changed by the earlier dropdown bug.")
+        ordered = sorted(registry, key=lambda key: registry[key].get("seq", 0))
+        if len(ordered) >= len(panels):
+            assignments = tuple((index, key) for (index, _), key in zip(panels, ordered[-len(panels):]))
+            st.button("Restore distinct captures to panels", key="bo_composer_restore_capture_assignments",
+                on_click=_composer_restore_capture_assignments, args=(assignments,),
+                help="Assign the most recent captures in capture order, one per captured-plot panel. Keep panel positions, sizes and formatting, then refresh the preview.")
+            st.caption("Recovery uses the most recent captures in capture order. For a different order, choose each panel's Captured plot manually.")
+
+
+def _composer_capture_choice_label(capture_id, captures):
+    """Selectbox display strings must be unique: Streamlit uses them as UI IDs."""
+    capture = captures[capture_id]
+    label = str(capture.get("label") or "Captured plot")
+    sequence = capture.get("seq")
+    prefix = f"Capture {sequence}: " if sequence is not None else ""
+    return f"{prefix}{label} [{capture_id}]"
+
 
 def _composer_apply_pending_captures() -> tuple[int, int]:
     """Append queued snapshots without changing existing panels or their letters."""
@@ -31956,8 +32537,8 @@ def _composer_apply_pending_captures() -> tuple[int, int]:
     st.session_state["bo_composer_count"] = panel_count
     for capture_id in accepted:
         index = panel_count + added
-        _composer_add_panel()
         capture = registry.get(str(capture_id))
+        _composer_add_panel(capture=capture)
         st.session_state[f"bo_composer_kind_{index}"] = "Captured plot"
         st.session_state[f"bo_composer_capture_id_{index}"] = str(capture_id)
         st.session_state[f"bo_composer_label_{index}"] = chr(ord("A") + index)
@@ -31975,11 +32556,31 @@ def _composer_apply_pending_captures() -> tuple[int, int]:
     return added, skipped
 
 
-def _composer_add_panel() -> None:
+def _composer_append_capture_rects(rects, canvas, panel_pixels):
+    """Place a capture beside existing panels, growing rather than shrinking."""
+    width, height = canvas
+    # Work in pixels, anchored at the top left, so canvas expansion cannot
+    # alter the existing panel sizes or positions.
+    boxes = [(x * width, (1 - y - h) * height, w * width, h * height)
+             for x, y, w, h in rects]
+    gap = 24.0
+    left = max((x + w for x, top, w, h in boxes), default=0) + gap
+    top = min((top for x, top, w, h in boxes), default=gap)
+    boxes.append((left, top, panel_pixels[0], panel_pixels[1]))
+    new_width = max(width, math.ceil(left + panel_pixels[0] + gap))
+    new_height = max(height, math.ceil(max(t + h for x, t, w, h in boxes) + gap))
+    return ([(x / new_width, 1 - (t + h) / new_height, w / new_width, h / new_height)
+             for x, t, w, h in boxes], (new_width, new_height))
+
+
+def _composer_add_panel(capture: Mapping[str, Any] | None = None) -> None:
     """Append an image panel without replacing content or rearranging existing panels."""
     count = int(st.session_state.get("bo_composer_count", 4))
     if count >= 24:
         return
+    if capture is not None:
+        st.session_state.setdefault("bo_composer_aspect",
+                                    next(iter(COMPOSER_CANVAS_SIZES)) if count == 0 else "4:3")
     layout = st.session_state.get("bo_composer_layout", "Manual")
     rects = (_composer_manual_rects(count) if layout == "Manual"
              else _composer_layout_rects(count, layout))
@@ -31987,8 +32588,38 @@ def _composer_add_panel() -> None:
     for key in list(st.session_state):
         if re.fullmatch(rf"bo_composer_.+_{count}", str(key)):
             del st.session_state[key]
-    new_rect = _composer_layout_rects(count + 1, "Grid")[-1]
-    for index, rect in enumerate([*rects, new_rect]):
+    if capture is not None:
+        dpi = float(st.session_state.get("bo_composer_dpi", 220))
+        canvas = tuple(round(value * dpi) for value in
+                       _composer_canvas_inches(st.session_state.get("bo_composer_aspect")))
+        default_rect = _composer_layout_rects(1, "Grid")[0]
+        fallback = st.session_state.setdefault("bo_composer_capture_default_size_px",
+            (default_rect[2] * canvas[0], default_rect[3] * canvas[1]))
+        settings = capture.get("settings") or {}
+        source = capture.get("source_figure")
+        viewport = {}
+        if isinstance(source, go.Figure):
+            meta = source.layout.meta if isinstance(source.layout.meta, Mapping) else {}
+            viewport = meta.get("bo_captured_viewport") or {}
+            source_size = (source.layout.width, source.layout.height)
+        elif isinstance(source, plt.Figure):
+            source_size = tuple(value * dpi for value in source.get_size_inches())
+        else:
+            source_size = (None, None)
+        pixels = tuple(float(viewport.get(key) or settings.get(key) or source_size[i] or fallback[i])
+                       for i, key in enumerate(("width", "height")))
+        rects, new_canvas = _composer_append_capture_rects(rects, canvas, pixels)
+        if new_canvas != canvas:
+            st.session_state.update({
+                "bo_composer_aspect": "Custom (pixels)",
+                "bo_composer_canvas_width_px": new_canvas[0],
+                "bo_composer_canvas_height_px": new_canvas[1],
+                "bo_composer_canvas_width_input": new_canvas[0],
+                "bo_composer_canvas_height_input": new_canvas[1],
+            })
+    else:
+        rects = [*rects, _composer_layout_rects(count + 1, "Grid")[-1]]
+    for index, rect in enumerate(rects):
         for field, value in zip(("left", "bottom", "width", "height"), rect):
             st.session_state[f"bo_composer_{field}_{index}"] = value
     st.session_state[f"bo_composer_kind_{count}"] = "Image file"
@@ -31996,6 +32627,128 @@ def _composer_add_panel() -> None:
     st.session_state["bo_composer_count"] = count + 1
     st.session_state["bo_composer_layout"] = "Manual"
     st.session_state["bo_composer_active_panel"] = count
+
+
+def _composer_stack_indices(count):
+    saved = st.session_state.get("bo_composer_panel_stack_order") or []
+    order = list(dict.fromkeys(i for i in saved if type(i) is int and 0 <= i < count))
+    return order + [i for i in range(count) if i not in order]
+
+
+def _composer_restore_stack_sources():
+    """Keep source identities independent of Streamlit widget cleanup."""
+    sources = st.session_state.get("bo_composer_stack_sources")
+    count = int(st.session_state.get("bo_composer_count", 0))
+    if not isinstance(sources, list) or len(sources) != count:
+        return
+    for index, source in enumerate(sources):
+        st.session_state[f"bo_composer_kind_{index}"] = source["kind"]
+        if source.get("capture_id"):
+            st.session_state[f"bo_composer_capture_id_{index}"] = source["capture_id"]
+
+
+def _composer_pin_panel_state():
+    # Detach persistent keyed values from widgets before their expanders move
+    # to another position. Otherwise Streamlit can discard an old widget ID
+    # during the reorder and initialize its replacement to the first option.
+    # Use widget metadata to exclude buttons and upload triggers; those
+    # cannot safely be assigned through Session State.
+    _preserve_bo_widget_choices(prefix="bo_composer_")
+
+
+def _composer_reorder_stack(order):
+    """Reorder only the settings list; stable panel slots and geometry never move."""
+    count = int(st.session_state.get("bo_composer_count", 0))
+    if (not isinstance(order, list) or any(type(value) is not int for value in order)
+            or sorted(order) != list(range(count))):
+        return False
+    _composer_restore_stack_sources()
+    previous = _composer_stack_indices(count)
+    st.session_state["bo_composer_panel_stack_order"] = [previous[i] for i in order]
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    return True
+
+
+def _composer_move_stack_panel(index, offset):
+    count = int(st.session_state.get("bo_composer_count", 0))
+    stack = _composer_stack_indices(count)
+    position = stack.index(index)
+    destination = position + offset
+    if 0 <= destination < count:
+        order = list(range(count))
+        order[position], order[destination] = order[destination], order[position]
+        _composer_reorder_stack(order)
+
+
+def _composer_last_rendered_layout(rendered, specs):
+    """Recover a good saved layout even after captures have been replaced."""
+    try:
+        raw = rendered.get("metadata") or b"{}"
+        metadata = raw if isinstance(raw, Mapping) else json.loads(raw)
+        previous = metadata.get("config", {}).get("panels", [])
+        if len(previous) != len(specs):
+            return []
+        rects = [_composer_normalize_rect(old.get("rect")) for old in previous]
+        if any(rect is None for rect in rects):
+            return []
+        from core.composer_bounds import overlapping_rectangles
+        if overlapping_rectangles(rects):
+            return []
+        matched = {}
+        used = set()
+        # Prefer unambiguous source matches. Earlier versions could save
+        # duplicate capture IDs, so do not discard the entire recovery then.
+        for index, spec in enumerate(specs):
+            capture_id = spec.get("capture_id")
+            matches = [i for i, old in enumerate(previous)
+                       if capture_id and old.get("capture_id") == capture_id]
+            if len(matches) == 1 and matches[0] not in used:
+                matched[index] = matches[0]
+                used.add(matches[0])
+        for index, spec in enumerate(specs):
+            if index in matched:
+                continue
+            matches = [i for i, old in enumerate(previous)
+                       if i not in used and spec.get("label") and old.get("label") == spec.get("label")]
+            if len(matches) == 1:
+                matched[index] = matches[0]
+                used.add(matches[0])
+        remaining = iter(i for i in range(len(previous)) if i not in used)
+        for index in range(len(specs)):
+            if index not in matched:
+                matched[index] = next(remaining)
+        return [(index, rects[matched[index]]) for index in range(len(specs))]
+    except (TypeError, ValueError, AttributeError):
+        return []
+
+
+def _composer_restore_rendered_layout(assignments):
+    for index, rect in assignments:
+        for name, value in zip(("left", "bottom", "width", "height"), rect):
+            st.session_state[f"bo_composer_{name}_{index}"] = value
+    st.session_state["bo_composer_layout"] = "Manual"
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_reletter_stack():
+    _composer_restore_stack_sources()
+    count = int(st.session_state.get("bo_composer_count", 0))
+    for position, index in enumerate(_composer_stack_indices(count)):
+        key = f"bo_composer_label_{index}"
+        letter = chr(65 + position)
+        st.session_state[key] = letter
+        # Update only labels in any pending snapshot; never restore geometry
+        # or apply a pending drag as a side effect of re-lettering.
+        pending = st.session_state.get("bo_composer_pending_panel_state")
+        if isinstance(pending, dict) and key in pending:
+            pending[key] = letter
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_stack_label(index):
+    return f"Panel {st.session_state.get(f'bo_composer_label_{index}', chr(65 + index))}"
 
 
 def _composer_swap_panels(
@@ -32111,6 +32864,9 @@ def _composer_delete_panels(
             )
         st.session_state[f"{prefix}{new_index}"] = value
 
+    st.session_state["bo_composer_panel_stack_order"] = [
+        old_to_new[i] for i in _composer_stack_indices(panel_count) if i in old_to_new
+    ]
     active = st.session_state.get("bo_composer_active_panel")
     st.session_state["bo_composer_active_panel"] = old_to_new.get(active)
     new_count = len(remaining)
@@ -32146,6 +32902,7 @@ def _composer_stage_panel_state(panel_count: int) -> None:
         key: copy.deepcopy(value)
         for key, value in _composer_widget_state(panel_count).items()
         if re.fullmatch(r"bo_composer_.+_\d+", key)
+        or key.startswith("bo_composer_start_map_")
     }
 
 
@@ -33262,8 +34019,7 @@ def _composer_native_image_size(index: int) -> tuple[int, int] | None:
 
 def _composer_native_image_rect(rect, pixels, canvas=None, dpi=None):
     """Keep one source pixel per output PNG pixel, without rounding the size."""
-    canvas = canvas or COMPOSER_CANVAS_SIZES.get(
-        st.session_state.get("bo_composer_aspect"), (12, 9))
+    canvas = canvas or _composer_canvas_inches(st.session_state.get("bo_composer_aspect"))
     dpi = float(dpi or st.session_state.get("bo_composer_dpi", 220))
     width, height = pixels[0] / (canvas[0] * dpi), pixels[1] / (canvas[1] * dpi)
     if width > 1 or height > 1:
@@ -33279,10 +34035,33 @@ def _composer_apply_layout_editor_result(result: Any, panel_count: int) -> bool:
     """Copy one new mouse-layout event into the manual coordinate controls."""
     if not isinstance(result, Mapping):
         return False
+    # Component values can arrive after a control has changed the panel shape.
+    # Never let geometry emitted for an older layout overwrite that change.
+    revision = int(st.session_state.get("bo_composer_stack_revision", 0))
+    if result.get("panel_revision", 0) != revision:
+        return False
     event_id = result.get("event_id")
     seen_key = "bo_composer_layout_editor_seen_event"
     if event_id is None or event_id == st.session_state.get(seen_key):
         return False
+    if result.get('action') == 'resize_canvas':
+        width, height = (_finite_float(result.get(key)) for key in ('width_px', 'height_px'))
+        raw_rects = result.get('rects')
+        if width is None or height is None or min(width, height) < 100:
+            return False
+        if not isinstance(raw_rects, list) or len(raw_rects) != panel_count:
+            return False
+        if any(_composer_normalize_rect(rect) is None for rect in raw_rects):
+            return False
+        # Resizing reruns before panel widgets are recreated. Preserve their
+        # selections just as deletion/duplication do, before Streamlit cleans
+        # up widgets that were not rendered in this interrupted run.
+        _composer_stage_panel_state(panel_count)
+        st.session_state["bo_composer_pending_canvas_resize"] = {
+            "width": round(width), "height": round(height), "rects": raw_rects,
+        }
+        st.session_state[seen_key] = event_id
+        return True
     if result.get('action') == 'edit_panel':
         active_index = result.get('active_index')
         if isinstance(active_index, int) and 0 <= active_index < panel_count:
@@ -34208,7 +34987,7 @@ def _composer_plotly_tick_override(fig, name, axis_config, count, scene=None, re
     if explicit:
         if logarithmic and min(explicit) <= 0:
             raise ValueError(f'{name.upper()} tick values must be positive on a logarithmic axis.')
-        return {'tickmode': 'array', 'tickvals': explicit, 'ticktext': None}
+        return {'tickmode': 'array', 'tickvals': explicit, 'ticktext': None, 'showticklabels': True}
     if not count:
         return {}
     bounds = axis_config.get('range')
@@ -34238,7 +35017,7 @@ def _composer_plotly_tick_override(fig, name, axis_config, count, scene=None, re
     ticks = (np.geomspace(*bounds, count) if logarithmic else np.linspace(*bounds, count))
     if count == 1:
         ticks = [np.sqrt(bounds[0] * bounds[1]) if logarithmic else np.mean(bounds)]
-    return {'tickmode': 'array', 'tickvals': list(ticks), 'ticktext': None}
+    return {'tickmode': 'array', 'tickvals': list(ticks), 'ticktext': None, 'showticklabels': True}
 
 
 def _composer_apply_plotly_text_size(
@@ -34247,7 +35026,7 @@ def _composer_apply_plotly_text_size(
     canvas_width_px: float | None = None,
 ) -> go.Figure:
     """Apply one panel-local text size after global export styling."""
-    typography = _COMPOSER_PANEL_TYPOGRAPHY.get()
+    typography = dict(_COMPOSER_PANEL_TYPOGRAPHY.get())
     text_size = max(4.0, float(size))
     title_size = max(4.0, float(typography.get("title_size", text_size * 1.25)))
     label_size = max(4.0, float(typography.get("axis_label_size", text_size)))
@@ -34280,9 +35059,7 @@ def _composer_apply_plotly_text_size(
                 "tickfont": {
                     "size": max(
                         1.0,
-                        tick_size
-                        * _PLOTLY_3D_TICK_SCALE
-                        * min(1.0, width_ratio) ** 0.5,
+                        tick_size * _PLOTLY_3D_TICK_SCALE * min(1.0, width_ratio) ** 0.5,
                     ),
                 },
             }
@@ -34379,19 +35156,11 @@ def _composer_apply_plotly_text_size(
                     axis_title = getattr(getattr(scene, axis_name).title, "text", None)
                     if axis_title in {"frequency", "amplitude", "step_potential"}:
                         getattr(scene, axis_name).title.text = _metric_label(axis_title)
-                eye = getattr(getattr(scene, "camera", None), "eye", None)
-                base = (
-                    (eye.x, eye.y, eye.z)
-                    if eye is not None and eye.x is not None
-                    else (1.5, 1.5, 1.1)
-                )
-                # Earlier exports multiplied this by 1.28, overriding the
-                # user's Composer zoom and leaving compact cubes tiny.  Keep
-                # only a small safety margin for axis labels.
-                scene.camera = {
-                    "eye": {"x": base[0], "y": base[1], "z": base[2]}
-                }
-                scene.domain = {"x": [0.08, 0.98], "y": [0.03, 0.97]}
+                # Keep eye, center, up, and projection: together they define
+                # the saved zoom, pan, and perspective.
+                metadata = fig.layout.meta
+                if not (isinstance(metadata, Mapping) and metadata.get("bo_composer_preserve_3d_view")):
+                    scene.domain = {"x": [0.08, 0.98], "y": [0.03, 0.97]}
     for annotation in fig.layout.annotations or ():
         annotation.font = {
             **(annotation.font.to_plotly_json() if annotation.font else {}),
@@ -34408,8 +35177,146 @@ def _composer_apply_plotly_text_size(
                     text_size=text_size,
                     tick_text_size=tick_size,
                 )
+    colorbars = [
+        bar for trace in fig.data
+        for bar in (getattr(trace, "colorbar", None),
+                    getattr(getattr(trace, "marker", None), "colorbar", None))
+        if bar is not None
+    ]
+    colorbars.extend(fig.layout[key].colorbar for key in fig.layout.to_plotly_json()
+                     if re.fullmatch(r"coloraxis\d*", key))
+    for colorbar in colorbars:
+        if typography.get("colorbar_title_size") is not None:
+            colorbar.title.font.size = float(typography["colorbar_title_size"])
+        if typography.get("colorbar_tick_size") is not None:
+            colorbar.tickfont.size = float(typography["colorbar_tick_size"])
     _composer_apply_plotly_font_weights(fig, typography)
     return fig
+
+
+def _composer_panel_colormap(spec):
+    if not spec.get("colormap_override_enabled"):
+        return None
+    return str(spec.get("panel_colormap", "Viridis")) + ("_r" if spec.get("panel_colormap_reverse") else "")
+
+
+def _composer_apply_plotly_colormap(figure, spec):
+    palette = _composer_panel_colormap(spec)
+    if not palette:
+        return
+    for trace in figure.data:
+        if _plotly_trace_role(trace) in {"metadata_strip", "optimum_marker", "cube_edges", "static_export_line_fill"}:
+            continue
+        for target in (trace, getattr(trace, "marker", None), getattr(trace, "line", None)):
+            if target is not None and hasattr(target, "colorscale"):
+                target.colorscale = palette
+                if hasattr(target, "reversescale"):
+                    target.reversescale = False
+    for key in figure.layout.to_plotly_json():
+        if re.fullmatch(r"coloraxis\d*", key):
+            figure.layout[key].update(colorscale=palette, reversescale=False)
+    metadata = dict(figure.layout.meta or {})
+    metadata["bo_local_colorscale"] = palette
+    metadata["bo_composer_colormap"] = {
+        key: spec[key] for key in ("colormap_override_enabled", "panel_colormap", "panel_colormap_reverse") if key in spec
+    }
+    figure.update_layout(meta=metadata)
+
+
+def _composer_apply_matplotlib_colormap(axes, spec):
+    palette = _composer_panel_colormap(spec)
+    if not palette:
+        return
+    for axis in axes:
+        # Mappables retain their data, limits, and colorbar linkage.
+        for artist in [*axis.images, *axis.collections]:
+            if artist.get_array() is not None:
+                artist.set_cmap(palette.lower())
+        colorbar = getattr(axis, "_colorbar", None)
+        if colorbar is not None:
+            colorbar.mappable.set_cmap(palette.lower())
+
+
+def _composer_colorbar_geometry(spec):
+    if not spec.get("colorbar_geometry_enabled"):
+        return None
+    return {name: float(spec.get(f"colorbar_{name}", default)) / 100
+            for name, default in (("x", 95), ("y", 50), ("length", 70), ("thickness", 3))}
+
+
+def _composer_apply_plotly_colorbar_geometry(figure, spec):
+    geometry = _composer_colorbar_geometry(spec)
+    orientation = spec.get("colorbar_label_orientation", "Keep original")
+    if geometry is None and not spec.get("colorbar_label_enabled") and orientation == "Keep original":
+        return
+    bars = []
+    for trace in figure.data:
+        if getattr(trace, "coloraxis", None):
+            continue
+        bar = getattr(trace, "colorbar", None)
+        if bar is not None and getattr(trace, "showscale", None) is not False:
+            bars.append(bar)
+        marker = getattr(trace, "marker", None)
+        if marker is not None and not getattr(marker, "coloraxis", None):
+            color = getattr(marker, "color", None)
+            if color is not None and not isinstance(color, str) and not np.isscalar(color) and marker.showscale is not False:
+                bars.append(marker.colorbar)
+    for key in figure.layout.to_plotly_json():
+        if re.fullmatch(r"coloraxis\d*", key) and figure.layout[key].showscale is not False:
+            bars.append(figure.layout[key].colorbar)
+    index = int(spec.get("colorbar_number", 1)) - 1
+    if 0 <= index < len(bars) and spec.get("colorbar_label_enabled"):
+        bars[index].title.text = str(spec.get("colorbar_label", ""))
+    if 0 <= index < len(bars) and orientation != "Keep original":
+        bars[index].title.side = "right" if orientation == "Vertical beside bar" else "top"
+    if 0 <= index < len(bars) and geometry is not None:
+        bars[index].update(x=geometry["x"], y=geometry["y"], xanchor="center", yanchor="middle",
+            len=geometry["length"], lenmode="fraction", thickness=geometry["thickness"], thicknessmode="fraction")
+
+
+def _composer_apply_matplotlib_colorbar_geometry(axes, spec, rect=(0, 0, 1, 1)):
+    geometry = _composer_colorbar_geometry(spec)
+    orientation = spec.get("colorbar_label_orientation", "Keep original")
+    if geometry is None and not spec.get("colorbar_label_enabled") and orientation == "Keep original":
+        return
+    bars = [axis for axis in axes if _is_matplotlib_colorbar_axis(axis)]
+    index = int(spec.get("colorbar_number", 1)) - 1
+    if 0 <= index < len(bars):
+        axis = bars[index]
+        horizontal = getattr(getattr(axis, "_colorbar", None), "orientation", "vertical") == "horizontal"
+        if spec.get("colorbar_label_enabled"):
+            text = str(spec.get("colorbar_label", ""))
+            if axis.get_title():
+                axis.set_title(text)
+            elif horizontal:
+                axis.set_xlabel(text)
+            else:
+                axis.set_ylabel(text)
+        if orientation != "Keep original":
+            original_label = next((label for label in
+                (axis.title, axis.yaxis.label, axis.xaxis.label) if label.get_text()), axis.yaxis.label)
+            text = (str(spec.get("colorbar_label", "")) if spec.get("colorbar_label_enabled")
+                    else original_label.get_text())
+            font = copy.copy(original_label.get_fontproperties())
+            color = original_label.get_color()
+            axis.set_title("")
+            axis.set_xlabel("")
+            axis.set_ylabel("")
+            if orientation == "Horizontal above bar":
+                axis.set_title(text, fontproperties=font, color=color)
+            else:
+                axis.yaxis.set_label_position("right")
+                axis.set_ylabel(text, rotation=90, fontproperties=font, color=color)
+        if geometry is None:
+            return
+        w, h = ((geometry["length"], geometry["thickness"]) if horizontal
+                else (geometry["thickness"], geometry["length"]))
+        left, bottom, width, height = rect
+        axis.set_axes_locator(None)
+        axis.set_box_aspect(None)
+        axis.set_aspect("auto")
+        axis.set_position([left + width * (geometry["x"] - w/2),
+                           bottom + height * (geometry["y"] - h/2), width*w, height*h])
 
 
 def _composer_place_plotly_colorbars(fig: go.Figure, side: str | None) -> go.Figure:
@@ -34552,6 +35459,12 @@ def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
         if hasattr(axis, "zaxis"):
             axis.zaxis.label.set_fontsize(label_size)
         axis.tick_params(labelsize=tick_size)
+        if _is_matplotlib_colorbar_axis(axis):
+            colorbar_title_size = float(typography.get("colorbar_title_size", label_size))
+            axis.title.set_fontsize(colorbar_title_size)
+            axis.xaxis.label.set_fontsize(colorbar_title_size)
+            axis.yaxis.label.set_fontsize(colorbar_title_size)
+            axis.tick_params(labelsize=float(typography.get("colorbar_tick_size", tick_size)))
         legend = axis.get_legend()
         if legend is not None:
             for legend_text in legend.get_texts():
@@ -34568,6 +35481,8 @@ def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
                 annotation.set_fontsize(note_size)
         if not _is_matplotlib_colorbar_axis(axis):
             _composer_axis_overrides(axis, typography)
+    _composer_apply_matplotlib_colorbar_geometry(fig.axes, typography)
+    _composer_apply_matplotlib_colormap(fig.axes, typography)
     for figure_text in fig.texts:
         figure_text.set_fontsize(note_size)
     suptitle = getattr(fig, "_suptitle", None)
@@ -34589,6 +35504,68 @@ def _composer_apply_matplotlib_text_size(fig: plt.Figure, size: float) -> None:
         _composer_apply_axis_font_weights(axis, typography)
     if suptitle is not None and _composer_font_weight(typography, 'title'):
         suptitle.set_fontweight(_composer_font_weight(typography, 'title'))
+
+
+def _composer_scale_plotly_fonts(figure, factor):
+    """Compensate crop magnification after all panel/global text styling."""
+    def visit(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.endswith("font") and isinstance(child, dict) and child.get("size") is not None:
+                    child["size"] = max(1., float(child["size"]) * factor)
+                elif key != "meta":
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    layout = figure.layout.to_plotly_json()
+    visit(layout)
+    figure.update_layout(layout)
+    for trace in figure.data:
+        payload = trace.to_plotly_json()
+        visit(payload)
+        trace.update(payload)
+
+
+def _composer_trim_plotly_export(render, width, height, padding):
+    """Fit cropped content while keeping its original displayed text scale."""
+    from PIL import Image
+    def read(data):
+        with Image.open(BytesIO(data)) as image:
+            return image.convert("RGBA")
+    original = read(render(1.0))
+    base_scale = min(width / original.width, height / original.height)
+    image = original
+    factor = 1.0
+    # Text changes can slightly move the crop bounds. Refine from fresh source
+    # each time, rather than accumulating font multipliers.
+    for _ in range(4):
+        cropped = _composer_trim_blank_margins(image, padding)
+        fitted_scale = min(width / cropped.width, height / cropped.height)
+        desired = base_scale / fitted_scale
+        if abs(desired - factor) <= .01 * max(desired, .01):
+            break
+        factor = desired
+        image = read(render(factor))
+    cropped = _composer_trim_blank_margins(image, padding)
+    output = BytesIO()
+    cropped.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _composer_trim_blank_margins(image, padding_percent=2.0):
+    """Crop only exterior white/transparent space; retain all visible content."""
+    from PIL import Image, ImageChops
+    rgba = image.convert("RGBA")
+    white = Image.new("RGBA", rgba.size, "white")
+    flattened = Image.alpha_composite(white, rgba).convert("RGB")
+    bounds = ImageChops.difference(flattened, Image.new("RGB", rgba.size, "white")).getbbox()
+    if bounds is None:
+        return rgba
+    left, top, right, bottom = bounds
+    padding = max(0, round(max(right-left, bottom-top) * float(padding_percent) / 100.))
+    return rgba.crop((max(0, left-padding), max(0, top-padding),
+                      min(rgba.width, right+padding), min(rgba.height, bottom+padding)))
 
 
 def _composer_draw_embedded_figure(
@@ -34637,22 +35614,27 @@ def _composer_draw_embedded_figure(
                     if not _is_matplotlib_colorbar_axis(axis):
                         _composer_clip_axes_y(axis)
         if isinstance(panel_figure, go.Figure):
-            # Plotly sizes text in pixels of the panel image, which is rendered
-            # at the figure DPI: convert the point size so a "Plot text" of N
-            # prints at N pt, matching the Matplotlib panels.
-            png = _plotly_png_bytes(
+            # Use one logical viewport at every output DPI. Changing Plotly's
+            # layout width changes tick selection, 3D text, marks and margins;
+            # Kaleido's raster scale increases resolution without reflow.
+            design_dpi = 220.0
+            design_width, design_height = _composer_panel_pixel_size(target_fig, rect, design_dpi)
+            render_panel = partial(_plotly_png_bytes,
                 panel_figure,
-                width=width_px,
-                height=height_px,
-                scale=1.5,
-                text_size=(
-                    None if text_size is None
-                    else float(text_size) * float(render_dpi) / 72.0
-                    * _PLOTLY_TEXT_CALIBRATION
-                ),
-                mark_scale=float(width_px) / _PLOTLY_MARK_DESIGN_WIDTH_PX,
+                width=design_width,
+                height=design_height,
+                scale=1.5 * float(render_dpi) / design_dpi,
+                text_size=(None if text_size is None else
+                           float(text_size) * design_dpi / 72.0 * _PLOTLY_TEXT_CALIBRATION),
+                mark_scale=float(design_width) / _PLOTLY_MARK_DESIGN_WIDTH_PX,
                 composer_colorbar_side=colorbar_side,
             )
+            if typography.get("capture_trim_blank_margins"):
+                png = _composer_trim_plotly_export(
+                    lambda factor: render_panel(trim_font_scale=factor), width_px, height_px,
+                    typography.get("capture_trim_padding", 2.0))
+            else:
+                png = render_panel()
             buffer = BytesIO(png)
         else:
             if _COMPOSER_JOURNAL_STYLE.get():
@@ -34699,7 +35681,11 @@ def _composer_draw_embedded_figure(
             ax._composer_vector_figure = panel_figure
             plt.close(panel_figure)
         with Image.open(buffer) as image:
-            ax.imshow(image.convert("RGBA"))
+            rendered_image = image.convert("RGBA")
+            if typography.get("capture_trim_blank_margins") and not isinstance(panel_figure, go.Figure):
+                rendered_image = _composer_trim_blank_margins(
+                    rendered_image, typography.get("capture_trim_padding", 2.0))
+            ax.imshow(rendered_image)
         ax.set_axis_off()
     except Exception as exc:
         _composer_error_panel(ax, str(exc))
@@ -34775,6 +35761,14 @@ def _composer_draw_image_file(ax, path_text: str, image_data: str = "",
         _composer_error_panel(ax, f"Could not open image: {exc}")
 
 
+def _composer_plotly_label_axes(figure: go.Figure, dimension: str) -> list[str]:
+    """Preserve source label placement across subplots and metadata strips."""
+    names = [key for key in figure.layout.to_plotly_json()
+             if re.fullmatch(rf"{dimension}axis\d*", key)]
+    titled = [key for key in names if getattr(figure.layout[key].title, "text", None)]
+    return titled or [f"{dimension}axis"]
+
+
 def _composer_capture_format_defaults(
     capture: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -34805,13 +35799,13 @@ def _composer_capture_format_defaults(
                 getattr(source.layout.title, "text", "")
             ),
             "xlabel": _plain_plotly_text(
-                getattr(source.layout.xaxis.title, "text", "")
+                getattr(source.layout[_composer_plotly_label_axes(source, "x")[0]].title, "text", "")
             ),
             "ylabel": _plain_plotly_text(
-                getattr(source.layout.yaxis.title, "text", "")
+                getattr(source.layout[_composer_plotly_label_axes(source, "y")[0]].title, "text", "")
             ),
             "zlabel": _plain_plotly_text(
-                getattr(source.layout.scene.zaxis.title, "text", "")
+                source.layout.to_plotly_json().get("scene", {}).get("zaxis", {}).get("title", {}).get("text", "")
             ),
             "show_legend": (
                 bool(source.layout.showlegend)
@@ -34827,6 +35821,17 @@ def _composer_capture_format_defaults(
                 and source.layout.yaxis.showgrid is not False
             ),
         })
+        if _plotly_has_3d_traces(source):
+            layout = source.layout.to_plotly_json()
+            scene = next((value for key, value in layout.items()
+                          if re.fullmatch(r"scene\d*", key)), {})
+            for axis in ("x", "y", "z"):
+                defaults[f"{axis}label"] = _plain_plotly_text(
+                    scene.get(f"{axis}axis", {}).get("title", {}).get("text", "")
+                )
+            defaults["show_grid"] = all(scene.get(f"{axis}axis", {}).get("showgrid") is not False
+                                        for axis in ("x", "y", "z"))
+            defaults["xlim"] = defaults["ylim"] = None
     elif isinstance(source, plt.Figure):
         primary_axis = next(
             (
@@ -34873,6 +35878,137 @@ def _composer_valid_limits(value: Any) -> tuple[float, float] | None:
     return float(low), float(high)
 
 
+def _composer_capture_aspect_changed(index, rect):
+    """Resize this panel before the layout editor and coordinate widgets render."""
+    choice = st.session_state.get(f"bo_composer_capture_aspect_{index}", "Captured view")
+    if choice == "Match panel":
+        return  # The view follows the existing panel, not the other way around.
+    ratio = {"Square (1:1)": 1., "Landscape (4:3)": 4/3, "Portrait (3:4)": 3/4}.get(choice)
+    if choice == "Custom":
+        ratio = (float(st.session_state.get(f"bo_composer_capture_aspect_width_{index}", 1.)) /
+                 float(st.session_state.get(f"bo_composer_capture_aspect_height_{index}", 1.)))
+    elif choice == "Captured view":
+        capture_id = st.session_state.get(f"bo_composer_capture_id_{index}")
+        capture = (st.session_state.get("bo_composer_captured_plots") or {}).get(capture_id, {})
+        source = capture.get("source_figure")
+        if isinstance(source, go.Figure):
+            metadata = source.layout.meta if isinstance(source.layout.meta, Mapping) else {}
+            viewport = metadata.get("bo_captured_viewport") or {}
+            ratio = float(viewport.get("width") or source.layout.width or 1200) / float(
+                viewport.get("height") or source.layout.height or 700)
+    if ratio is None or ratio <= 0:
+        return
+    canvas_width, canvas_height = _composer_canvas_inches(st.session_state.get("bo_composer_aspect"))
+    left, bottom, width, _ = map(float, rect)
+    height = width * canvas_width / (ratio * canvas_height)
+    fit = min(1., (1. - left) / width, (1. - bottom) / height)
+    updated = (left, bottom, width * fit, height * fit)
+    pending = st.session_state.get("bo_composer_pending_panel_state")
+    layout = st.session_state.get("bo_composer_layout", "Manual")
+    if layout != "Manual":
+        count = int(st.session_state.get("bo_composer_count", 1))
+        for other_index, other_rect in enumerate(_composer_layout_rects(count, layout)):
+            for field, value in zip(("left", "bottom", "width", "height"), other_rect):
+                key = f"bo_composer_{field}_{other_index}"
+                st.session_state[key] = value
+                if isinstance(pending, dict):
+                    pending[key] = value
+    for field, value in zip(("left", "bottom", "width", "height"), updated):
+        key = f"bo_composer_{field}_{index}"
+        st.session_state[key] = value
+        if isinstance(pending, dict):
+            pending[key] = value
+    st.session_state["bo_composer_layout"] = "Manual"
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+
+
+def _render_composer_capture_camera(index, capture, spec):
+    """Edit a panel's 3D view without changing its shared captured source."""
+    capture_id = str(spec["capture_id"])
+    state_key = f"bo_composer_capture_view_{index}"
+    saved = st.session_state.get(state_key) or {}
+    if saved.get("capture_id") == capture_id:
+        spec["capture_camera"] = saved.get("camera")
+        spec["capture_viewport"] = saved.get("viewport")
+    aspect_choice = st.selectbox(
+        "3D view aspect ratio",
+        ["Captured view", "Match panel", "Square (1:1)", "Landscape (4:3)", "Portrait (3:4)", "Custom"],
+        key=f"bo_composer_capture_aspect_{index}",
+        on_change=_composer_capture_aspect_changed, args=(index, spec.get("rect", (0, 0, 1, 1))),
+        help="Updates this panel's shape in the mouse layout editor while keeping its position. "
+             "Keeps width where it fits; scales down if needed to stay inside the canvas. "
+             "Match panel instead makes the view follow the existing panel dimensions.",
+    )
+    ratio = None
+    if aspect_choice == "Match panel":
+        canvas = _composer_canvas_inches(st.session_state.get("bo_composer_aspect", "4:3"))
+        rect = spec.get("rect", (0, 0, 1, 1))
+        ratio = rect[2] * canvas[0] / max(1e-9, rect[3] * canvas[1])
+    elif aspect_choice == "Custom":
+        columns = st.columns(2)
+        aspect_width = columns[0].number_input("View width ratio", .25, 10., 1., .05,
+            key=f"bo_composer_capture_aspect_width_{index}",
+            on_change=_composer_capture_aspect_changed, args=(index, spec.get("rect", (0, 0, 1, 1))))
+        aspect_height = columns[1].number_input("View height ratio", .25, 10., 1., .05,
+            key=f"bo_composer_capture_aspect_height_{index}",
+            on_change=_composer_capture_aspect_changed, args=(index, spec.get("rect", (0, 0, 1, 1))))
+        ratio = aspect_width / aspect_height
+    else:
+        ratio = {"Square (1:1)": 1., "Landscape (4:3)": 4/3, "Portrait (3:4)": 3/4}.get(aspect_choice)
+    st.button(
+        "Apply aspect ratio to panel", key=f"bo_composer_capture_apply_aspect_{index}",
+        on_click=_composer_capture_aspect_changed, args=(index, spec.get("rect", (0, 0, 1, 1))),
+        disabled=aspect_choice == "Match panel",
+        help="Reapply the selected aspect ratio to this panel in the mouse layout editor.",
+    )
+    spec["capture_view_aspect"] = ratio
+    spec["capture_trim_blank_margins"] = st.checkbox(
+        "Trim blank margins in rendered panel", key=f"bo_composer_capture_trim_blank_margins_{index}",
+        help="Removes exterior white space from the rendered image and fits the result into this panel. "
+             "Enlarges the plot while preserving text size and camera perspective. May require additional render passes. Applies when rendering/exporting the figure.",
+    )
+    if spec["capture_trim_blank_margins"]:
+        spec["capture_trim_padding"] = st.slider(
+            "Padding around trimmed plot (%)", 0.0, 10.0, 2.0, .5,
+            key=f"bo_composer_capture_trim_padding_{index}",
+        )
+        st.caption("Click Render figure to see the trimmed panel. The interactive camera view keeps its original viewport.")
+    title_position_cols = st.columns(2)
+    source_title_x = getattr(getattr(capture.get("source_figure"), "layout", None), "title", None)
+    default_title_x = _finite_float(getattr(source_title_x, "x", None))
+    spec["capture_title_x"] = title_position_cols[0].slider(
+        "Title X (%)", 0.0, 100.0,
+        100.0 * min(1.0, max(0.0, default_title_x if default_title_x is not None else .5)), 1.0,
+        key=f"bo_composer_capture_title_x_{index}",
+        help="Horizontal position of the title's center within the complete panel image. "
+             "50 centers it; lower values move it left. Applies to preview and export.",
+    ) / 100.0
+    spec["capture_title_y"] = title_position_cols[1].slider(
+        "Title height (%)", 0.0, 100.0, 98.0, 1.0,
+        key=f"bo_composer_capture_title_y_{index}",
+        help="Vertical position of the title's top edge within the complete panel image. "
+             "100 is the top; lower values move the title down. Applies to preview and export.",
+    ) / 100.0
+    preview = _composer_formatted_capture_figure(capture, spec)
+    width, height = _preserve_captured_plotly_view(preview, preview, 520, 780)
+    camera_key = f"bo_composer_capture_camera_{index}_{capture_id}"
+    camera = _render_camera_persistent_plotly(
+        st, preview, key=camera_key, camera_storage_key=camera_key,
+        shared_camera_storage_key=f"{camera_key}_isolated",
+        height=height, export_width=width, export_height=height,
+        file_stem=f"panel_{chr(65 + index)}", apply_sync_nonce=0,
+    )
+    if camera:
+        viewport = (preview.layout.meta or {}).get("bo_captured_viewport")
+        updated = {"capture_id": capture_id, "camera": camera, "viewport": viewport}
+        if updated != saved:
+            st.session_state[state_key] = updated
+            st.session_state["bo_composer_auto_render"] = True
+        spec["capture_camera"] = camera
+        spec["capture_viewport"] = viewport
+    st.caption("Rotate or zoom, then click Cache view to save this panel's perspective for rendering and export.")
+
+
 def _composer_formatted_capture_figure(
     capture: Mapping[str, Any],
     spec: Mapping[str, Any],
@@ -34898,10 +36034,43 @@ def _composer_formatted_capture_figure(
     ylim = _composer_valid_limits(spec.get("capture_ylim"))
     if isinstance(source, go.Figure):
         figure = go.Figure(source)
+        _apply_plotly_camera(figure, spec.get("capture_camera") or capture.get("camera"))
+        metadata = dict(figure.layout.meta) if isinstance(figure.layout.meta, Mapping) else {}
+        if spec.get("capture_viewport"):
+            metadata["bo_captured_viewport"] = spec["capture_viewport"]
+        if _plotly_has_3d_traces(figure):
+            ratio = _finite_float(spec.get("capture_view_aspect"))
+            if ratio is not None and ratio > 0:
+                viewport = dict(metadata.get("bo_captured_viewport") or {})
+                view_width = float(viewport.get("width") or figure.layout.width or 1200)
+                view_height = max(1, round(view_width / ratio))
+                viewport.update(width=view_width, height=view_height)
+                viewport.setdefault("margin", figure.layout.margin.to_plotly_json())
+                metadata["bo_captured_viewport"] = viewport
+                figure.update_layout(width=round(view_width), height=view_height, autosize=False)
+            metadata["bo_composer_preserve_3d_view"] = True
+            metadata["bo_composer_title_y"] = float(spec.get("capture_title_y", .98))
+            if spec.get("capture_title_x") is not None:
+                metadata["bo_composer_title_x"] = float(spec["capture_title_x"])
+        else:
+            # Repair captures made when a vacant scene was mistaken for 3D.
+            metadata.pop("bo_composer_preserve_3d_view", None)
+        if (spec.get("colorbar_geometry_enabled") or spec.get("colorbar_label_enabled")
+                or spec.get("colorbar_label_orientation", "Keep original") != "Keep original"):
+            metadata["bo_composer_colorbar_geometry"] = {
+                key: value for key, value in spec.items() if key.startswith("colorbar_")
+            }
+        metadata["bo_composer_show_legend"] = show_legend
+        figure.update_layout(meta=metadata)
+        _composer_apply_plotly_colorbar_geometry(figure, spec)
         apply_capture_colors(figure, line_color, marker_color)
         figure.update_layout(showlegend=show_legend, title_text=title)
-        figure.update_xaxes(title_text=xlabel, showgrid=show_grid)
-        figure.update_yaxes(title_text=ylabel, showgrid=show_grid)
+        _composer_apply_plotly_title_position(figure)
+        figure.update_xaxes(showgrid=show_grid)
+        figure.update_yaxes(showgrid=show_grid)
+        for dimension, label in (("x", xlabel), ("y", ylabel)):
+            for axis_name in _composer_plotly_label_axes(source, dimension):
+                figure.layout[axis_name].title.text = label
         if xlim is not None:
             figure.update_xaxes(range=list(xlim))
         if ylim is not None:
@@ -34917,11 +36086,25 @@ def _composer_formatted_capture_figure(
         }
         if scene_updates:
             figure.update_layout(**scene_updates)
+        if spec.get("capture_starting_point_appearance"):
+            _apply_starting_point_appearance(figure, spec["capture_starting_point_appearance"])
+        _composer_apply_plotly_colormap(figure, spec)
         for trace in figure.data:
             line = getattr(trace, "line", None)
             width = _finite_float(getattr(line, "width", None))
             if line is not None and width is not None:
                 line.width = max(0.1, width * line_scale)
+            marker = getattr(trace, "marker", None)
+            if (marker is not None and hasattr(marker, "size")
+                    and _plotly_trace_role(trace) not in {
+                        "cube_edges", "highlighted_slice_outline", "static_export_line_fill",
+                    } and marker_scale != 1.0):
+                size = marker.size if marker.size is not None else 6.0
+                # In area mode the size values encode area, so square the
+                # multiplier to keep this control a diameter multiplier.
+                factor = marker_scale ** (2 if getattr(marker, "sizemode", None) == "area" else 1)
+                values = np.asarray(size, dtype=float) * factor
+                marker.size = float(values) if values.ndim == 0 else values.tolist()
         return figure
     if isinstance(source, plt.Figure):
         figure = copy.deepcopy(source)
@@ -34971,6 +36154,8 @@ def _composer_formatted_capture_figure(
                     sizes = collection.get_sizes()
                     if len(sizes):
                         collection.set_sizes(np.asarray(sizes) * marker_scale ** 2)
+        _composer_apply_matplotlib_colormap(figure.axes, spec)
+        _composer_apply_matplotlib_colorbar_geometry(figure.axes, spec)
         return figure
     return None
 
@@ -34996,7 +36181,7 @@ def _composer_draw_captured_plot(
     png_bytes = capture.get("png_bytes")
     source_figure = (
         _composer_formatted_capture_figure(capture, spec)
-        if bool(spec.get("capture_rerender_source", True))
+        if spec.get("capture_view_aspect") or spec.get("colormap_override_enabled") or spec.get("capture_camera") or spec.get("capture_starting_point_appearance") or bool(spec.get("capture_rerender_source", True)) or not isinstance(png_bytes, (bytes, bytearray))
         else None
     )
     if source_figure is not None:
@@ -35665,6 +36850,153 @@ def _composer_build_hyperparameter_plot(
         aggregate=spec.get("aggregate", "Mean"),
         draw_cube_edges=spec.get("draw_cube_edges", False),
     )
+
+
+_COMPOSER_RENDER_GLOBAL_KEYS = (
+    "bo_composer_dpi", "bo_composer_aspect", "bo_composer_canvas_width_px",
+    "bo_composer_canvas_height_px", "bo_composer_font", "bo_composer_font_size",
+    "bo_composer_label_size", "bo_composer_journal_style",
+)
+_COMPOSER_RENDER_PANEL_FIELDS = (
+    "text_size", "title_size", "axis_label_size", "tick_size", "legend_size",
+    "colorbar_title_size", "colorbar_tick_size", "individual_axis_sizes",
+    "x_axis_size", "y_axis_size", "z_axis_size",
+    "title_weight", "axis_label_weight", "tick_weight", "legend_weight",
+)
+
+
+def _composer_restore_render_settings(config):
+    """Restore only rendering sizes; retain current sources and panel geometry."""
+    saved = config.get("state") or {}
+    updates = {key: copy.deepcopy(saved[key]) for key in _COMPOSER_RENDER_GLOBAL_KEYS if key in saved}
+    panels = config.get("panels") or []
+    used = set()
+    for index in range(int(st.session_state.get("bo_composer_count", 0))):
+        capture_id = st.session_state.get(f"bo_composer_capture_id_{index}")
+        label = st.session_state.get(f"bo_composer_label_{index}", chr(65+index))
+        source = next((i for i, panel in enumerate(panels)
+                       if capture_id and panel.get("capture_id") == capture_id and i not in used), None)
+        if source is None:
+            source = next((i for i in range(int(saved.get("bo_composer_count", len(panels))))
+                           if saved.get(f"bo_composer_label_{i}", chr(65+i)) == label and i not in used), None)
+        if source is None:
+            continue
+        used.add(source)
+        for field in _COMPOSER_RENDER_PANEL_FIELDS:
+            old_key = f"bo_composer_{field}_{source}"
+            if old_key in saved:
+                updates[f"bo_composer_{field}_{index}"] = copy.deepcopy(saved[old_key])
+    updates["bo_composer_reformat_text"] = False
+    for dimension in ("width", "height"):
+        key = f"bo_composer_canvas_{dimension}_px"
+        if key in updates:
+            updates[f"bo_composer_canvas_{dimension}_input"] = updates[key]
+    st.session_state["bo_composer_render_recovery_undo"] = {
+        key: (key in st.session_state, copy.deepcopy(st.session_state.get(key))) for key in updates
+    }
+    st.session_state.update(updates)
+    pending = st.session_state.get("bo_composer_pending_panel_state")
+    if isinstance(pending, dict):
+        pending.update({key:value for key,value in updates.items() if key in pending})
+    st.session_state.pop("bo_composer_pending_canvas_resize", None)
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_undo_dpi_shrink(design_dpi, changed_dpi):
+    """Repair legacy fixed-pixel DPI shrink without touching panel formatting."""
+    width, height = _composer_canvas_inches(st.session_state.get("bo_composer_aspect"))
+    factor = float(changed_dpi) / float(design_dpi)
+    dpi = int(st.session_state.get("bo_composer_dpi", 220))
+    updates = {"bo_composer_aspect": "Custom (pixels)", "bo_composer_reformat_text": False}
+    for dimension, inches in (("width", width), ("height", height)):
+        pixels = round(inches * factor * dpi)
+        updates[f"bo_composer_canvas_{dimension}_px"] = pixels
+        updates[f"bo_composer_canvas_{dimension}_input"] = pixels
+    st.session_state["bo_composer_render_recovery_undo"] = {
+        key: (key in st.session_state, copy.deepcopy(st.session_state.get(key))) for key in updates
+    }
+    st.session_state.update(updates)
+    st.session_state.pop("bo_composer_pending_canvas_resize", None)
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_undo_render_restore():
+    for key, (existed, value) in st.session_state.pop("bo_composer_render_recovery_undo", {}).items():
+        if existed:
+            st.session_state[key] = value
+        else:
+            st.session_state.pop(key, None)
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+    st.session_state["bo_composer_repair_preview_requested"] = True
+
+
+def _composer_dpi_changed(previous_dpi):
+    """Change raster density without changing the figure's physical dimensions."""
+    dpi = float(st.session_state.get("bo_composer_dpi", 220))
+    if (st.session_state.get("bo_composer_aspect") == "Custom (pixels)"
+            and not st.session_state.get("bo_composer_reformat_text", False)):
+        for dimension, default in (("width", 1980), ("height", 2200)):
+            key = f"bo_composer_canvas_{dimension}_px"
+            pixels = round(float(st.session_state.get(key, default)) * dpi / float(previous_dpi))
+            st.session_state[key] = pixels
+            st.session_state[f"bo_composer_canvas_{dimension}_input"] = pixels
+    st.session_state["bo_composer_stack_revision"] = int(st.session_state.get("bo_composer_stack_revision", 0)) + 1
+
+
+def _composer_canvas_inches(aspect):
+    if isinstance(aspect, (tuple, list)) and len(aspect) == 2:
+        return tuple(float(value) for value in aspect)
+    if aspect == "Custom (pixels)":
+        dpi = float(st.session_state.get("bo_composer_dpi", 220))
+        return (float(st.session_state.get("bo_composer_canvas_width_px", 1980)) / dpi,
+                float(st.session_state.get("bo_composer_canvas_height_px", 2200)) / dpi)
+    return COMPOSER_CANVAS_SIZES.get(aspect, (12, 9))
+
+
+def _composer_apply_pending_canvas_resize():
+    resize = st.session_state.pop("bo_composer_pending_canvas_resize", None)
+    if not resize:
+        return
+    st.session_state.update({
+        "bo_composer_aspect": "Custom (pixels)",
+        "bo_composer_canvas_width_px": resize["width"],
+        "bo_composer_canvas_height_px": resize["height"],
+        "bo_composer_canvas_width_input": resize["width"],
+        "bo_composer_canvas_height_input": resize["height"],
+    })
+    for index, rect in enumerate(resize["rects"]):
+        for field, value in zip(("left", "bottom", "width", "height"), rect):
+            st.session_state[f"bo_composer_{field}_{index}"] = float(value)
+
+
+def _composer_apply_canvas_dimensions(previous_pixels):
+    width = int(st.session_state["bo_composer_canvas_width_input"])
+    height = int(st.session_state["bo_composer_canvas_height_input"])
+    if st.session_state.get("bo_composer_canvas_keep_panels", True):
+        count = int(st.session_state.get("bo_composer_count", 0))
+        layout = st.session_state.get("bo_composer_layout", "Manual")
+        rects = (_composer_manual_rects(count) if layout == "Manual"
+                 else _composer_layout_rects(count, layout))
+        transformed = []
+        for left, bottom, panel_width, panel_height in rects:
+            # Keep pixel size and distance from the upper-left canvas corner.
+            x = left * previous_pixels[0] / width
+            top = (1 - bottom - panel_height) * previous_pixels[1] / height
+            w = panel_width * previous_pixels[0] / width
+            h = panel_height * previous_pixels[1] / height
+            if w > 1 or h > 1:
+                st.session_state["bo_composer_canvas_error"] = "Canvas is smaller than an existing panel. Increase its dimensions or uncheck Keep panel sizes."
+                return
+            transformed.append((min(x, 1 - w), max(0., 1 - min(top, 1 - h) - h), w, h))
+        for index, rect in enumerate(transformed):
+            for field, value in zip(("left", "bottom", "width", "height"), rect):
+                st.session_state[f"bo_composer_{field}_{index}"] = value
+        st.session_state["bo_composer_layout"] = "Manual"
+    st.session_state["bo_composer_canvas_width_px"] = width
+    st.session_state["bo_composer_canvas_height_px"] = height
+    st.session_state["bo_composer_aspect"] = "Custom (pixels)"
 
 
 COMPOSER_CANVAS_SIZES = {
@@ -36383,16 +37715,18 @@ def _build_composer_figure(
     panel_border_width: float = .8,
     journal_style: bool = False,
 ) -> plt.Figure:
-    width, height = COMPOSER_CANVAS_SIZES.get(aspect, (12, 9))
+    width, height = _composer_canvas_inches(aspect)
     journal_token = _COMPOSER_JOURNAL_STYLE.set(bool(journal_style))
     typography_token = _COMPOSER_PANEL_TYPOGRAPHY.set({})
     try:
-        return _build_composer_figure_inner(
+        figure = _build_composer_figure_inner(
             session, history, observations, observation, trace_analysis,
             paired_objective, specs, (width, height), font_family, font_size,
             label_size, title, render_dpi, panel_border, panel_border_color,
             panel_border_width, bool(journal_style),
         )
+        figure._composer_full_canvas = isinstance(aspect, (tuple, list))
+        return figure
     finally:
         _COMPOSER_JOURNAL_STYLE.reset(journal_token)
         _COMPOSER_PANEL_TYPOGRAPHY.reset(typography_token)
@@ -36460,6 +37794,9 @@ def _build_composer_figure_inner(
                 spec["custom_title"] = str(spec["custom_title"]).replace(
                     "{direction}", direction.title() or "Optimization"
                 )
+            palette = _composer_panel_colormap(spec)
+            if palette:
+                spec["colorscale"] = palette
             _COMPOSER_PANEL_TYPOGRAPHY.set(spec)
             selection_history = history
             if spec.get('group_id') is not None:
@@ -36660,6 +37997,12 @@ def _build_composer_figure_inner(
                 "Global trend", "Channel trend", "Buffer/target trend",
             }:
                 _composer_clip_axes_y(ax)
+            _composer_apply_matplotlib_colorbar_geometry(
+                [axis for axis in fig.axes if axis not in panel_snapshots[-1][0]], spec, spec["rect"],
+            )
+            _composer_apply_matplotlib_colormap(
+                [axis for axis in fig.axes if axis not in panel_snapshots[-1][0]], spec,
+            )
             panel_text_size = max(4.0, float(spec.get("text_size", font_size)))
             title_text_size = max(4.0, float(spec.get("title_size", panel_text_size * 1.2)))
             axis_label_size = max(4.0, float(spec.get("axis_label_size", panel_text_size)))
@@ -36967,6 +38310,8 @@ def _composer_figure_bytes(
         "format": fmt, "bbox_inches": "tight", "pad_inches": .08,
         "facecolor": "none", "transparent": True,
     }
+    if getattr(fig, "_composer_full_canvas", False):
+        save_kwargs.update(bbox_inches=Bbox.from_bounds(0, 0, *fig.get_size_inches()), pad_inches=0)
     if fmt == "png":
         save_kwargs["dpi"] = dpi
         if metadata_json:
@@ -37042,7 +38387,9 @@ def _composer_render_panel_export(args, kwargs, captures, plot_settings, index):
     for artist in figure.artists:
         if artist not in artists:
             artist.set_visible(False)
-    # Do not refit or resize. Tight export removes unused canvas only.
+    # Do not refit or resize. A single-panel download still crops even when
+    # the full composition uses exact custom canvas dimensions.
+    figure._composer_full_canvas = False
     figure._composer_panel_groups = [group]
     return figure
 
@@ -38036,6 +39383,7 @@ def _composer_linked_example_controls(iteration_options):
 
 def _render_full_session_composer(full_session, observation, trace_analysis, paired_objective):
     """Composer owns its source scope; other tabs' sidebar filters do not."""
+    _report_bo_loading(0.92, 'Preparing Figure Composer sources...')
     if st.session_state.get('bo_channel_group_scope', 'all') != 'all':
         st.caption('Composer channel choices use the full session. The sidebar channel-group filter applies to the other BO tabs.')
     # Fragment edits retain these source objects; building the wide history
@@ -38044,7 +39392,7 @@ def _render_full_session_composer(full_session, observation, trace_analysis, pai
                   id(full_session.get('active_rescore_profile')))
     cached = st.session_state.get('_bo_runtime_composer_history')
     if cached is None or cached['key'] != source_key:
-        cached = {'key': source_key, 'history': _observation_table(full_session),
+        cached = {'key': source_key, 'history': _viewer_observation_table(full_session),
                   'source': full_session}
         st.session_state['_bo_runtime_composer_history'] = cached
     return _render_figure_composer(full_session, cached['history'],
@@ -38172,10 +39520,17 @@ def _render_figure_composer(
     trace_analysis: dict,
     paired_objective: bool,
 ) -> None:
+    _report_bo_loading(0.94, 'Preparing Figure Composer panels and preview...')
+    _composer_restore_pending_panel_state()
+    _composer_apply_pending_import()
+    _composer_pin_panel_state()
+    pending_stack = st.session_state.pop("bo_composer_pending_stack_order", None)
+    if pending_stack is not None:
+        _composer_reorder_stack(pending_stack)
+    _composer_apply_pending_canvas_resize()
     # Earlier recipes persisted this button as a setting. Discard the legacy
     # key even in a running browser session that restored it before this fix.
     st.session_state.pop('bo_composer_standardize_text', None)
-    _composer_restore_pending_panel_state()
     type2b_preview_update = _composer_upgrade_original_type2b(st.session_state)
     if type2b_preview_update:
         st.info('Updated the original Type 2B layout: Q above the chronological stack on the left, cube on the right, and no wall projections.')
@@ -38532,10 +39887,10 @@ def _render_figure_composer(
                     )
 
     st.session_state.setdefault("bo_composer_layout", "Manual")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, dpi_options = st.columns([1, 1, 1, 1, .85])
     aspect = c1.selectbox(
         "Canvas",
-        list(COMPOSER_CANVAS_SIZES),
+        [*COMPOSER_CANVAS_SIZES, "Custom (pixels)"],
         key="bo_composer_aspect",
         help=(
             "The ACS canvases are true print size (7.0 in = two columns, "
@@ -38545,7 +39900,64 @@ def _render_figure_composer(
     )
     panel_count = int(c2.number_input("Panels", min_value=0, max_value=24, value=4, step=1, key="bo_composer_count"))
     preset = c3.selectbox("Layout", ["Manual", "Grid", "Main left + stack", "Top wide + grid"], key="bo_composer_layout")
-    dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25, key="bo_composer_dpi"))
+    dpi_options.checkbox(
+        "Reformat text", value=False, key="bo_composer_reformat_text",
+        disabled=aspect != "Custom (pixels)",
+        help="Off: preserve the physical figure and text sizes; changing DPI changes export resolution only. "
+             "On: keep custom canvas pixel dimensions fixed, so changing DPI changes physical size and text proportions. "
+             "This affects future DPI changes; it does not reset your font controls.",
+    )
+    dpi = int(c4.number_input("PNG DPI", min_value=72, max_value=600, value=220, step=25,
+        key="bo_composer_dpi", on_change=_composer_dpi_changed,
+        args=(int(st.session_state.get("bo_composer_dpi", 220)),),
+        help="Changes export resolution only. Physical canvas size, panel positions and typography stay fixed."))
+    with st.expander("Restore original render settings", expanded=False):
+        st.markdown("**Undo the earlier DPI-induced enlargement**")
+        st.caption("For a figure that looked correct at 220 DPI and became oversized after switching to 600: "
+                   "restore the canvas's physical size by 600 ÷ 220. Text values, panel positions and sources stay unchanged. "
+                   "Apply once; use Undo settings restore if needed.")
+        correction_cols = st.columns(3)
+        design_dpi = correction_cols[0].number_input("Original design DPI", 72, 600, 220,
+            key="bo_composer_render_recovery_design_dpi")
+        changed_dpi = correction_cols[1].number_input("DPI that caused enlargement", 72, 600, 600,
+            key="bo_composer_render_recovery_changed_dpi")
+        correction_cols[2].button("Undo DPI-induced enlargement",
+            key="bo_composer_render_recovery_dpi_apply", on_click=_composer_undo_dpi_shrink,
+            args=(design_dpi, changed_dpi), use_container_width=True)
+        st.markdown("**Alternatively, restore settings from a preset**")
+        st.caption("Restore canvas size, DPI and text sizes from a saved preset. Current plots, "
+                   "panel positions, letters, titles, camera views and colorbar placement are kept. "
+                   "Panels match by capture ID, then letter. This restores saved settings, not an unsaved historical render.")
+        recovery_names = list(saved_presets)
+        recovery_default = st.session_state.get("bo_composer_preset_name")
+        recovery_name = st.selectbox("Restore settings from preset", recovery_names,
+            index=recovery_names.index(recovery_default) if recovery_default in recovery_names else 0,
+            key="bo_composer_render_recovery_source")
+        recovery_cols = st.columns(2)
+        recovery_cols[0].button("Restore original render settings",
+            key="bo_composer_render_recovery_apply", on_click=_composer_restore_render_settings,
+            args=(saved_presets[recovery_name].get("config") or {},), use_container_width=True)
+        recovery_cols[1].button("Undo settings restore", key="bo_composer_render_recovery_undo_button",
+            on_click=_composer_undo_render_restore,
+            disabled=not bool(st.session_state.get("bo_composer_render_recovery_undo")), use_container_width=True)
+    canvas_inches = _composer_canvas_inches(aspect)
+    canvas_pixels = tuple(round(value * dpi) for value in canvas_inches)
+    with st.expander("Canvas dimensions (workspace and export)", expanded=aspect == "Custom (pixels)"):
+        size_cols = st.columns(2)
+        size_cols[0].number_input("Canvas width (px)", min_value=100, value=canvas_pixels[0], step=100,
+                                  key="bo_composer_canvas_width_input")
+        size_cols[1].number_input("Canvas height (px)", min_value=100, value=canvas_pixels[1], step=100,
+                                  key="bo_composer_canvas_height_input")
+        st.checkbox("Keep panel sizes", value=True, key="bo_composer_canvas_keep_panels",
+                    help="Keep existing panels at the same pixel size and add space around them when the canvas grows.")
+        st.button("Apply canvas dimensions", on_click=_composer_apply_canvas_dimensions,
+                  args=(canvas_pixels,), key="bo_composer_apply_canvas_dimensions")
+        canvas_error = st.session_state.pop("bo_composer_canvas_error", None)
+        if canvas_error:
+            st.error(canvas_error)
+        st.caption(f"Canvas: {canvas_pixels[0]:,} × {canvas_pixels[1]:,} pixels at {dpi} DPI. Custom canvases export at this full size. Editor zoom only changes the on-screen view.")
+    if aspect == "Custom (pixels)":
+        aspect = canvas_inches  # Freeze physical dimensions for background exports.
     c5, c6, c7 = st.columns(3)
     font_family = c5.selectbox("Font", ["Arial", "DejaVu Sans", "Times New Roman", "Calibri"], key="bo_composer_font")
     resolved_font_family = _composer_resolved_font_family(font_family)
@@ -38746,7 +40158,7 @@ def _render_figure_composer(
                 native_rect = _composer_native_image_rect(
                     (st.session_state.get(f"bo_composer_left_{i}", .07),
                      st.session_state.get(f"bo_composer_bottom_{i}", .1), 0, 0),
-                    pixels, COMPOSER_CANVAS_SIZES[aspect], dpi,
+                    pixels, _composer_canvas_inches(aspect), dpi,
                 )
                 for field, value in zip(("left", "bottom", "width", "height"), native_rect):
                     st.session_state[f"bo_composer_{field}_{i}"] = value
@@ -38758,30 +40170,39 @@ def _render_figure_composer(
         editor_result = _figure_layout_editor(
             rects=[list(rect) for rect in manual_rects],
             locked_sizes=[bool(size) for size in native_image_sizes],
-            labels=[chr(ord("A") + index) for index in range(panel_count)],
-            aspect=aspect,
+            labels=[str(st.session_state.get(f"bo_composer_label_{index}", chr(65 + index))) for index in range(panel_count)],
+            aspect="Custom (pixels)" if isinstance(aspect, tuple) else aspect,
+            canvas_width_in=canvas_inches[0],
+            canvas_height_in=canvas_inches[1],
+            canvas_dpi=dpi,
             key="bo_composer_layout_editor",
+            panel_revision=int(st.session_state.get("bo_composer_stack_revision", 0)),
             allow_overlap=bool(st.session_state.get("bo_composer_allow_overlap", False)),
             default=None,
         )
         if _composer_apply_layout_editor_result(editor_result, panel_count):
-            if st.session_state.get("bo_composer_pending_delete_indices") or st.session_state.get("bo_composer_pending_duplicates"):
+            if (st.session_state.get("bo_composer_pending_delete_indices")
+                    or st.session_state.get("bo_composer_pending_duplicates")
+                    or st.session_state.get("bo_composer_pending_canvas_resize")):
                 st.rerun()
             manual_rects = _composer_manual_rects(panel_count)
         st.caption(
-            "Drag to move · resize from any edge or corner · Ctrl/Cmd-click to "
+            "Drag the canvas’s blue bottom-right corner to change workspace and export size · "
+            "Drag panels to move · resize selected panels together from any handle · Shift-click or Ctrl/Cmd-click to "
             "multi-select · Delete/Backspace removes selected panels · "
             "right-click for alignment · use Snap, Make square, or Copy/Paste panels · layout changes are staged automatically"
         )
         st.checkbox("Allow overlap", value=False, key="bo_composer_allow_overlap",
                     help="Permit layout rectangles to overlap deliberately. Rectangles include labels, legends and colourbars.")
-        st.caption("Boxes contain complete panels with a small margin. Export trims unused outer canvas.")
+        st.caption("Boxes contain complete panels with a small margin. " +
+                   ("Export keeps the full custom canvas." if isinstance(aspect, tuple)
+                    else "Export trims unused outer canvas."))
         rects = manual_rects
     else:
         rects = _composer_layout_rects(panel_count, preset)
     # Keep complex multi-panel presets manageable: all controls remain
     # available, but normal use focuses on one clearly named panel at a time.
-    panel_indices = list(range(panel_count))
+    panel_indices = _composer_stack_indices(panel_count)
     active_panel_key = "bo_composer_active_panel"
     if st.session_state.get(active_panel_key) not in panel_indices:
         st.session_state[active_panel_key] = None
@@ -38791,7 +40212,7 @@ def _render_figure_composer(
         panel_indices,
         index=None,
         placeholder="Choose a panel to edit",
-        format_func=lambda index: f"Panel {chr(ord('A') + index)}",
+        format_func=lambda index: f"{_composer_stack_label(index)} (stack {panel_indices.index(index) + 1})",
         key=active_panel_key,
         help=(
             "Choose the subpanel whose data and formatting you want to edit. "
@@ -38813,13 +40234,29 @@ def _render_figure_composer(
         "The layout canvas changes panel position and size. Use Edit panel to change "
         "that panel's plot type, source data, axes, colours, and display options."
     )
+    st.button("Re-letter stack", key="bo_composer_reletter_stack", on_click=_composer_reletter_stack,
+              help="Assign A, B, C… from top to bottom in the current panel stack. Keeps panel positions and plots unchanged.")
+    st.caption("Drag a row in Drag to reorder panels below. You can also drag a panel header where a ⠿ handle appears. Labels stay with their panels until you click Re-letter stack.")
+    revision = int(st.session_state.get("bo_composer_stack_revision", 0))
+    stack_event = _panel_stack_order(labels=[_composer_stack_label(i) for i in panel_indices],
+        revision=revision, key="bo_composer_stack_order_v2", default=None)
+    if (isinstance(stack_event, Mapping) and stack_event.get("revision") == revision
+            and stack_event.get("event_id") != st.session_state.get("bo_composer_stack_seen_event")):
+        order = stack_event.get("order")
+        if (isinstance(order, list) and all(type(value) is int for value in order)
+                and sorted(order) == list(range(panel_count))):
+            _composer_restore_stack_sources()
+            _composer_stage_panel_state(panel_count)
+            st.session_state["bo_composer_pending_stack_order"] = order
+            st.session_state["bo_composer_stack_seen_event"] = stack_event.get("event_id")
+            st.rerun()
     editor_tools = None
-    specs = []
+    specs = [None] * panel_count
     tick_value_errors = []
-    for index in range(panel_count):
+    for stack_position, index in enumerate(panel_indices):
         default_rect = rects[index] if rects else (.07, .10, .40, .35)
         with st.expander(
-            f"Panel {chr(ord('A') + index)}",
+            _composer_stack_label(index),
             expanded=bool(expand_all_panels or index == active_panel),
         ):
             _composer_section_cache_controls(session, f"panel_{index}", settings_cache)
@@ -38827,23 +40264,23 @@ def _render_figure_composer(
             order_cols[0].button(
                 "<- Earlier",
                 key=f"bo_composer_move_earlier_{index}",
-                disabled=index == 0,
-                on_click=_composer_swap_panels,
-                args=(index, index - 1, panel_count),
+                disabled=stack_position == 0,
+                on_click=_composer_move_stack_panel,
+                args=(index, -1),
                 use_container_width=True,
-                help="Move this panel one letter earlier.",
+                help="Move this panel earlier in the settings stack without changing its canvas position or letter.",
             )
             order_cols[1].button(
                 "Later ->",
                 key=f"bo_composer_move_later_{index}",
-                disabled=index >= panel_count - 1,
-                on_click=_composer_swap_panels,
-                args=(index, index + 1, panel_count),
+                disabled=stack_position >= panel_count - 1,
+                on_click=_composer_move_stack_panel,
+                args=(index, 1),
                 use_container_width=True,
-                help="Move this panel one letter later.",
+                help="Move this panel later in the settings stack without changing its canvas position or letter.",
             )
             order_cols[2].caption(
-                "Moving a panel reassigns its letter and preserves custom labels."
+                "Stack order changes only the settings list. Use Re-letter stack to update letters."
             )
             top_cols = st.columns([1.35, .72, .72, .72, .82, .75])
             kind = top_cols[0].selectbox("Figure", source_options, key=f"bo_composer_kind_{index}")
@@ -38896,7 +40333,7 @@ def _render_figure_composer(
             else:
                 rect = default_rect
             if native_image_sizes[index]:
-                rect = _composer_native_image_rect(rect, native_image_sizes[index], COMPOSER_CANVAS_SIZES[aspect], dpi)
+                rect = _composer_native_image_rect(rect, native_image_sizes[index], _composer_canvas_inches(aspect), dpi)
             spec = {
                 "kind": kind,
                 "label": label,
@@ -38934,7 +40371,7 @@ def _render_figure_composer(
                     st.button('Restore compact reference appearance',
                               key=f'bo_composer_preset_compact_swv_{index}',
                               on_click=restore_compact_swv_appearance,
-                              args=(st.session_state, index, COMPOSER_CANVAS_SIZES.get(aspect, (12, 9))),
+                              args=(st.session_state, index, _composer_canvas_inches(aspect)),
                               disabled=preset != 'Manual',
                               help='Optional: restore short signal-role/iteration titles, fixed title point sizes, reference text/line sizes and a 2.61 × 1.70 inch panel slot. Keeps the current position where possible, font family, data, channels and points. Requires Manual layout. Does not undo the corrected raw-sample display fix.')
                     spec['swv_title_style'] = st.selectbox(
@@ -38987,6 +40424,66 @@ def _render_figure_composer(
                     "Legend pt", 4.0, 40.0, float(max(4.0, panel_text_size * .85)), .5,
                     key=f"bo_composer_legend_size_{index}",
                 ))
+                spec["colormap_override_enabled"] = st.checkbox(
+                    "Override panel colormap", key=f"bo_composer_colormap_override_enabled_{index}",
+                    disabled=kind == "Image file" or (kind == "Captured plot" and not editable_capture),
+                    help="Changes numeric color scales in this panel. Fixed line colors and metadata strips are preserved. Raster-only images cannot be recolored.",
+                )
+                if spec["colormap_override_enabled"]:
+                    palette_cols = st.columns(2)
+                    spec["panel_colormap"] = palette_cols[0].selectbox(
+                        "Panel colormap", ["Viridis", "Plasma", "Cividis", "Turbo", "Inferno", "Magma", "Rainbow"],
+                        key=f"bo_composer_panel_colormap_{index}",
+                    )
+                    spec["panel_colormap_reverse"] = palette_cols[1].checkbox(
+                        "Reverse panel colormap", key=f"bo_composer_panel_colormap_reverse_{index}",
+                    )
+                colorbar_cols = st.columns(2)
+                spec["colorbar_title_size"] = float(colorbar_cols[0].number_input(
+                    "Colorbar title pt", 4.0, 96.0, float(panel_text_size * 1.05), .5,
+                    key=f"bo_composer_colorbar_title_size_{index}",
+                    help="Size of the colorbar label (e.g. Q run), independent of other plot text.",
+                ))
+                spec["colorbar_tick_size"] = float(colorbar_cols[1].number_input(
+                    "Colorbar tick pt", 4.0, 96.0, float(max(4.0, panel_text_size * .88)), .5,
+                    key=f"bo_composer_colorbar_tick_size_{index}",
+                    help="Size of the numbers beside the colorbar, independent of axis ticks.",
+                ))
+                spec["colorbar_label_enabled"] = st.checkbox(
+                    "Override colorbar label", key=f"bo_composer_colorbar_label_enabled_{index}",
+                    disabled=kind == "Image file" or (kind == "Captured plot" and not editable_capture),
+                )
+                if spec["colorbar_label_enabled"]:
+                    spec["colorbar_label"] = st.text_input(
+                        "Colorbar label text", key=f"bo_composer_colorbar_label_{index}",
+                        help="Replaces the selected colorbar's label. Leave blank to hide it.",
+                    )
+                spec["colorbar_label_orientation"] = st.selectbox(
+                    "Colorbar label orientation",
+                    ["Keep original", "Vertical beside bar", "Horizontal above bar"],
+                    key=f"bo_composer_colorbar_label_orientation_{index}",
+                    disabled=kind == "Image file" or (kind == "Captured plot" and not editable_capture),
+                    help="Sets the selected colorbar label's orientation in previews and exports.",
+                )
+                spec["colorbar_geometry_enabled"] = st.checkbox(
+                    "Set colorbar size and position", key=f"bo_composer_colorbar_geometry_enabled_{index}",
+                    disabled=kind == "Image file" or (kind == "Captured plot" and not editable_capture),
+                )
+                if spec["colorbar_geometry_enabled"]:
+                    st.caption("Position sets the colorbar center; X increases rightward and Y upward. Sizes are percentages of the plot area. These controls move the colorbar independently of the data plot.")
+                    geometry_cols = st.columns(5)
+                    spec["colorbar_number"] = int(geometry_cols[0].number_input(
+                        "Colorbar number", 1, 10, 1, key=f"bo_composer_colorbar_number_{index}",
+                        help="For plots with multiple colorbars, choose which one to adjust.",
+                    ))
+                    for column, name, label, low, high, default in zip(geometry_cols[1:],
+                            ("x", "y", "length", "thickness"),
+                            ("Colorbar X %", "Colorbar Y %", "Colorbar length %", "Colorbar thickness %"),
+                            (-50., -50., 1., .1), (150., 150., 100., 30.), (95., 50., 70., 3.)):
+                        spec[f"colorbar_{name}"] = float(column.number_input(
+                            label, low, high, default, .5 if name != "thickness" else .1,
+                            key=f"bo_composer_colorbar_{name}_{index}",
+                        ))
                 weight_cols = st.columns(4)
                 for column, role, label in zip(weight_cols,
                         ('title', 'axis_label', 'tick', 'legend'),
@@ -39979,10 +41476,12 @@ def _render_figure_composer(
                     spec["capture_id"] = st.selectbox(
                         "Captured plot",
                         capture_ids,
-                        format_func=lambda capture_id: str(
-                            captures[capture_id].get("label") or capture_id
+                        format_func=lambda capture_id, registry=captures: _composer_capture_choice_label(
+                            capture_id, registry
                         ),
                         key=f"bo_composer_capture_id_{index}",
+                        on_change=_composer_capture_changed,
+                        args=(index,),
                     )
                     capture = captures[spec["capture_id"]]
                     settings = capture.get("settings") or {}
@@ -40012,6 +41511,14 @@ def _render_figure_composer(
                             "the preview PNG. Available for captures made after this update."
                         ),
                     )
+                    if isinstance(source_figure, go.Figure):
+                        source_metadata = source_figure.layout.meta if isinstance(source_figure.layout.meta, Mapping) else {}
+                        source_appearance = source_metadata.get("bo_starting_point_appearance")
+                        if source_appearance is not None or "Starting-point influence" in str(source_figure.layout.title.text):
+                            spec["capture_starting_point_appearance"] = _starting_point_appearance_controls(
+                                f"bo_composer_start_map_{index}_{spec['capture_id']}", source_appearance,
+                                is_3d=_plotly_has_3d_traces(source_figure),
+                            )
                     format_defaults = _composer_capture_format_defaults(capture)
                     format_cols = st.columns(5)
                     spec["capture_show_legend"] = format_cols[0].checkbox(
@@ -40130,14 +41637,31 @@ def _render_figure_composer(
                             if limits_available and limit_enabled
                             else None
                         )
-                    st.image(
-                        capture["png_bytes"],
-                        caption=(
-                            f"Figure {chr(ord('A') + index)} preview · "
-                            f"{capture.get('label') or 'Captured plot'}"
-                        ),
-                        width=520,
+                    preview_caption = (
+                        f"Figure {chr(ord('A') + index)} preview · "
+                        f"{capture.get('label') or 'Captured plot'}"
                     )
+                    if isinstance(source_figure, go.Figure) and _plotly_has_3d_traces(source_figure):
+                        _render_composer_capture_camera(index, capture, spec)
+                        st.caption(preview_caption)
+                    elif isinstance(capture.get("png_bytes"), (bytes, bytearray)) and not spec.get("capture_starting_point_appearance") and not spec.get("colormap_override_enabled") and not spec.get("colorbar_label_enabled") and spec.get("colorbar_label_orientation", "Keep original") == "Keep original":
+                        st.image(capture["png_bytes"], caption=preview_caption, width=520)
+                    elif isinstance(source_figure, go.Figure):
+                        preview_figure = _composer_formatted_capture_figure(capture, spec)
+                        _apply_plotly_camera(preview_figure, capture.get("camera"))
+                        if _plotly_has_3d_traces(preview_figure):
+                            _preserve_captured_plotly_view(preview_figure, preview_figure, 520)
+                        st.plotly_chart(
+                            preview_figure,
+                            key=f"bo_composer_capture_preview_{index}_{spec['capture_id']}",
+                            width=520,
+                        )
+                        st.caption(preview_caption)
+                    elif isinstance(source_figure, plt.Figure):
+                        st.pyplot(_composer_formatted_capture_figure(capture, spec), clear_figure=False, width=520)
+                        st.caption(preview_caption)
+                    else:
+                        st.warning("This capture has no preview. Add the plot again from its source.")
                     if source_is_editable:
                         st.info(
                             "The thumbnail is the captured view; the composed figure "
@@ -40186,7 +41710,7 @@ def _render_figure_composer(
                                 iw, ih = image_info['pixels']
                                 st.write(f"Original pixels: {iw} × {ih}")
                                 st.write(f"Aspect ratio (width / height): {iw / ih:.4f}")
-                            st.write(f"Panel size: {rect[2] * COMPOSER_CANVAS_SIZES[aspect][0]:.3f} × {rect[3] * COMPOSER_CANVAS_SIZES[aspect][1]:.3f} inches")
+                            st.write(f"Panel size: {rect[2] * _composer_canvas_inches(aspect)[0]:.3f} × {rect[3] * _composer_canvas_inches(aspect)[1]:.3f} inches")
                             if image_info['text']:
                                 sizes = sorted({row['Size (pt)'] for row in image_info['text']})
                                 fonts = sorted({row['Font'] for row in image_info['text']})
@@ -40282,10 +41806,14 @@ def _render_figure_composer(
                         help='Choose a corner other than Automatic, then position it using axes coordinates: 0 is left/bottom; 1 is right/top.')
                     spec['legend_x'] = st.number_input('Legend X', -1., 2., 1., .05, key=f'bo_composer_legend_x_{index}')
                     spec['legend_y'] = st.number_input('Legend Y', -1., 2., 1., .05, key=f'bo_composer_legend_y_{index}')
-            specs.append(spec)
+            specs[index] = spec
             if index == active_panel:
                 editor_tools = st.container()
 
+    st.session_state["bo_composer_stack_sources"] = [
+        {"kind": spec["kind"], "capture_id": spec.get("capture_id")} for spec in specs
+    ]
+    _composer_capture_assignment_controls(specs)
     if tick_value_errors:
         st.info('Correct the tick values above to preview or export this figure.')
         return
@@ -40303,6 +41831,22 @@ def _render_figure_composer(
         f"{session.get('selected_group_id', 'all')}"
     )
     render_key = f"bo_composer_render_{render_identity}"
+    from core.composer_bounds import overlapping_rectangles
+    current_collisions = overlapping_rectangles([spec["rect"] for spec in specs])
+    if current_collisions and not st.session_state.get("bo_composer_allow_overlap", False):
+        recovery_layout = _composer_last_rendered_layout(st.session_state.get(render_key) or {}, specs)
+        with st.expander("Overlapping panel positions", expanded=True):
+            st.caption("These are the currently saved rectangles. Re-lettering does not alter them. Restore the last successful layout below, or adjust them in the mouse editor.")
+            st.dataframe([{"Panel": spec.get("label") or chr(65+i),
+                           "Left": spec["rect"][0], "Bottom": spec["rect"][1],
+                           "Width": spec["rect"][2], "Height": spec["rect"][3]}
+                          for i, spec in enumerate(specs)], hide_index=True)
+            if recovery_layout:
+                st.button("Restore last rendered layout", key="bo_composer_restore_last_layout",
+                    on_click=_composer_restore_rendered_layout, args=(recovery_layout,),
+                    help="Restore saved positions and sizes. Match unique captures first, then panel letters, then remaining saved slots. Keep current plots, letters and formatting.")
+            else:
+                st.info("No compatible non-overlapping layout is saved in the current preview. The mouse editor can adjust the rectangles; Allow overlap renders their current positions unchanged.")
     preview_dpi = min(180, dpi)
     preview_clicked = st.button(
         "Render figure (fast preview)",
@@ -40394,7 +41938,8 @@ def _render_figure_composer(
     automatic_render = type2b_preview_update or renderer_changed
     if renderer_changed:
         st.session_state[refresh_key] = COMPOSER_RENDER_VERSION
-    render_preview = bool(preview_clicked or automatic_render)
+    repair_preview = st.session_state.pop("bo_composer_repair_preview_requested", False)
+    render_preview = bool(preview_clicked or automatic_render or repair_preview)
     if render_preview:
         figure = None
         try:
@@ -40493,33 +42038,155 @@ def _render_figure_composer(
 def _load_simulated_sweep_section(session: dict, section: str) -> bool:
     """Execute only the selected BO tab, including on full-app reruns."""
     if not st.session_state.get('_bo_lazy_tabs', False):
+        _report_bo_loading(0.90, f"Preparing {section} view...")
         return True  # Compatibility with older Streamlit and standalone tests.
     aliases = {'Surrogate plots': 'Surrogate', 'Simulation tools': 'Simulation', 'GIF tools': 'GIFs'}
-    return st.session_state.get('bo_active_tab', 'History & scores') == aliases.get(section, section)
+    selected = st.session_state.get('bo_active_tab', 'History & scores') == aliases.get(section, section)
+    if selected:
+        _report_bo_loading(0.90, f"Preparing {section} view...")
+    return selected
 
 
-def _preserve_bo_widget_choices():
+def _preserve_bo_widget_choices(prefix="bo_"):
     """Keep hidden-tab widgets without copying data or retaining button events."""
     from streamlit.runtime.scriptrunner import get_script_run_ctx
     ctx = get_script_run_ctx()
     if ctx is None:
         return
+    # Already-rendered widgets are retained by Streamlit and cannot be reassigned.
     # Widget metadata identifies buttons/uploads reliably; prefix guesses do not.
     state = getattr(ctx.session_state, '_state', None)
     mapper = getattr(state, '_key_id_mapper', None)
     if mapper is None:
         return
+    run_state = getattr(ctx, "shared", ctx)
+    rendered_widgets = run_state.widget_ids_this_run
+    rendered_forms = run_state.form_ids_this_run
     for widget_id, key in list(mapper.id_key_mapping.items()):
         get_metadata = getattr(state, '_get_widget_metadata', None)
         metadata = (get_metadata(widget_id) if callable(get_metadata)
                     else state._new_widget_state.widget_metadata.get(widget_id))
-        if (str(key).startswith('bo_') and metadata is not None
+        if (str(key).startswith(prefix) and widget_id not in rendered_widgets
+                and key not in rendered_forms and metadata is not None
                 and metadata.value_type not in {None, 'trigger_value', 'string_trigger_value',
                     'chat_input_value', 'file_uploader_state_value'} and key in st.session_state):
             st.session_state[key] = st.session_state[key]
 
 
+# Composer can refresh this module during an active loading scope. Keep the
+# ContextVar itself so the existing scope can still reset its original token.
+_BO_LOADING_STATUS = globals().get("_BO_LOADING_STATUS") or contextvars.ContextVar(
+    "bo_loading_status", default=None
+)
+
+
+class _BoLoadingStatus:
+    """One status bar for the whole app run, including work after file loading."""
+
+    def __init__(self, placeholder):
+        self.placeholder = placeholder
+        self.fraction = 0.0
+        self.started = False
+        self.failed = False
+        self.started_at = time.monotonic()
+
+    def update(self, fraction, message, *, failed=False):
+        self.started = True
+        self.failed = self.failed or failed
+        self.fraction = max(self.fraction, min(float(fraction), 1.0))
+        elapsed = time.monotonic() - self.started_at
+        self.placeholder.progress(
+            self.fraction,
+            text=f"{message} · {elapsed:.0f}s elapsed",
+        )
+
+    def finish(self):
+        if self.started and not self.failed:
+            self.update(1.0, "BO session ready")
+
+
+_HP_RENDER_STATUS = globals().get("_HP_RENDER_STATUS") or contextvars.ContextVar(
+    "hp_render_status", default=None
+)
+
+
+def _report_hp_render(fraction, message):
+    state = _HP_RENDER_STATUS.get()
+    if state is None or (state["status"] is None and fraction != 0.0):
+        return
+    if state["status"] is None:
+        state["status"] = _BoLoadingStatus(st.empty())
+    state["status"].update(fraction, message)
+
+
+def _hyperparameter_render_progress(function):
+    """Start a local bar on Render, and finish it even on an early return."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        state = {"status": None}
+        token = _HP_RENDER_STATUS.set(state)
+        try:
+            result = function(*args, **kwargs)
+        except Exception:
+            if state["status"] is not None:
+                status = state["status"]
+                status.update(status.fraction, "Hyperparameter rendering failed", failed=True)
+            raise
+        else:
+            if state["status"] is not None:
+                state["status"].update(1.0, "Hyperparameter rendering finished")
+            return result
+        finally:
+            _HP_RENDER_STATUS.reset(token)
+    return wrapped
+
+
+def _bo_loading_fragment(label):
+    """Give independent fragment refreshes the same status lifecycle as startup."""
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            if _BO_LOADING_STATUS.get() is not None:
+                return function(*args, **kwargs)
+            status = _BoLoadingStatus(st.empty())
+            token = _BO_LOADING_STATUS.set(status)
+            try:
+                status.update(0.0, f"Preparing {label}...")
+                result = function(*args, **kwargs)
+            except Exception:
+                status.update(status.fraction, f"Could not prepare {label}", failed=True)
+                raise
+            else:
+                status.finish()
+                return result
+            finally:
+                _BO_LOADING_STATUS.reset(token)
+        return wrapped
+    return decorate
+
+
+def _report_bo_loading(fraction, message, *, failed=False):
+    status = _BO_LOADING_STATUS.get()
+    if status is not None:
+        status.update(fraction, message, failed=failed)
+
+
 def render_bo_session_app() -> None:
+    """Keep startup progress visible until the selected view has rendered."""
+    status = _BoLoadingStatus(st.empty())
+    token = _BO_LOADING_STATUS.set(status)
+    try:
+        _render_bo_session_app()
+    except Exception:
+        status.update(status.fraction, "BO session loading failed", failed=True)
+        raise
+    else:
+        status.finish()
+    finally:
+        _BO_LOADING_STATUS.reset(token)
+
+
+def _render_bo_session_app() -> None:
     """Render the complete BO viewer. Called after Analysis mode is set to BO."""
     _preserve_bo_widget_choices()
     _render_app_scrollbar_style()
@@ -40554,18 +42221,22 @@ def render_bo_session_app() -> None:
     if not folder:
         st.info("Enter a BO experiment or session folder in the sidebar to load its results.")
         return
+    _report_bo_loading(0.01, "Finding BO sessions...")
     try:
         session_folders = discover_bo_session_folders(folder)
     except Exception as exc:
+        _report_bo_loading(0.0, f"Loading stopped: {exc}", failed=True)
         st.error(str(exc))
         return
     if not session_folders:
+        _report_bo_loading(0.0, "No BO sessions found", failed=True)
         st.error(
             "No BO sessions found. Choose a folder containing bo_state.json or "
             "an experiment folder with BO session subfolders."
         )
         return
 
+    _report_bo_loading(0.04, "Preparing session selection...")
     search_root = Path(folder).expanduser().resolve()
     selected_session_folder = session_folders[0]
     with st.sidebar:
@@ -40638,14 +42309,58 @@ def render_bo_session_app() -> None:
             selected_session_folder = Path(st.session_state[selected_session_key])
         else:
             st.caption(
-                f"Loaded BO session: "
+                f"Selected BO session: "
                 f"{_bo_session_choice_label(selected_session_folder, search_root)}"
             )
+    channel_scope_token = hashlib.sha1(str(selected_session_folder).encode()).hexdigest()[:12]
+    channel_choice_key = f"bo_load_channel_choices_{channel_scope_token}"
+    applied_channel_key = f"bo_load_channels_applied_{channel_scope_token}"
+    option_versions = tuple(
+        (name, (selected_session_folder / name).stat().st_mtime_ns)
+        for name in ("bo_state.json", "bo_config_snapshot.json", "history.csv")
+        if (selected_session_folder / name).is_file()
+    )
+    option_key = (str(selected_session_folder), option_versions)
+    options_cache = st.session_state.get("_bo_runtime_channel_options")
+    if options_cache is None or options_cache["key"] != option_key:
+        _report_bo_loading(0.04, "Finding available channels...")
+        options_cache = {"key": option_key, "channels": _bo_load_channel_options(selected_session_folder)}
+        st.session_state["_bo_runtime_channel_options"] = options_cache
+    available_channels = options_cache["channels"]
+    with st.sidebar:
+        with st.form(f"bo_load_channels_form_{channel_scope_token}"):
+            channel_choices = st.multiselect(
+                "Channels to load", ["All channels", *available_channels],
+                default=["All channels"], key=channel_choice_key,
+                help="Remove All channels and select one or more channels to load a smaller session. All channels overrides individual selections.",
+            )
+            load_requested = st.form_submit_button("Load BO session", type="primary")
+        if load_requested:
+            if not channel_choices:
+                st.warning("Choose at least one channel to load.")
+            else:
+                st.session_state[applied_channel_key] = (
+                    None if "All channels" in channel_choices else tuple(channel_choices)
+                )
+        if applied_channel_key not in st.session_state:
+            _report_bo_loading(0.04, "Choose channels in the sidebar, then click Load BO session", failed=True)
+            return
+        load_channels = st.session_state[applied_channel_key]
+        st.caption("Loaded scope: " + ("all channels" if load_channels is None else ", ".join(f"Ch {channel}" for channel in load_channels)))
+    _report_bo_loading(0.05, "Loading BO session data...")
     try:
-        session = load_bo_session(selected_session_folder)
+        session = _viewer_loaded_session(
+            selected_session_folder,
+            selected_channels=load_channels,
+            progress_callback=lambda fraction, message: _report_bo_loading(
+                0.05 + 0.35 * fraction, message,
+            ),
+        )
     except Exception as exc:
+        _report_bo_loading(0.0, f"Loading stopped: {exc}", failed=True)
         st.error(str(exc))
         return
+    _report_bo_loading(0.40, "Loading scoring profiles and controls...")
     source_session = session
     if (session.get("local_snapshot") or {}).get("raw_traces_available") is False:
         original = (session.get('local_snapshot') or {}).get('original')
@@ -40721,6 +42436,7 @@ def render_bo_session_app() -> None:
         ),
     )
     active_rescore_profile = rescore_profiles.get(active_rescore_id)
+    _report_bo_loading(0.43, "Preparing the selected scoring view...")
     session = _viewer_scored_session(source_session, active_rescore_profile)
     simulation_rescore_token = _simulation_rescore_token(
         active_rescore_id,
@@ -40731,7 +42447,9 @@ def render_bo_session_app() -> None:
     )
 
     full_session = session
+    _report_bo_loading(0.46, "Preparing channel groups...")
     groups = _session_channel_groups(session)
+    _report_bo_loading(0.50, "Preparing analysis controls...")
     with st.sidebar:
         st.divider()
         st.caption(
@@ -41302,7 +43020,9 @@ def render_bo_session_app() -> None:
         )
 
     observations = session["observations"]
-    history = _observation_table(session)
+    _report_bo_loading(0.55, "Preparing analysis table...")
+    history = _viewer_observation_table(session)
+    _report_bo_loading(0.76, "Computing session summaries and best observations...")
     if not observations:
         st.warning("This channel group has no completed observations.")
         return
@@ -41364,6 +43084,7 @@ def render_bo_session_app() -> None:
             "session-wide count is used only as a final fallback."
         ),
     )
+    _report_bo_loading(0.80, "Preparing simulation ground-truth summaries...")
     simulation_channel_optima = _simulation_channel_optima_frame(full_session)
     if not simulation_channel_optima.empty:
         st.markdown("#### Simulation ground-truth optima")
@@ -41383,6 +43104,7 @@ def render_bo_session_app() -> None:
     observation_group_ids = sorted({
         int(obs.get("group_id", 1)) for obs in observations
     })
+    _report_bo_loading(0.83, "Preparing run metadata and observation selectors...")
     observation_group_metadata = _channel_group_optimization_metadata(
         full_session,
         groups,
@@ -41836,12 +43558,27 @@ def render_bo_session_app() -> None:
                 "parameter range."
             )
 
+    show_history_heatmap = False
     with overview:
+        if _load_simulated_sweep_section(full_session, "History & scores"):
+            st.radio(
+                "History view",
+                ["History & scores", "Channel x iteration heatmap"],
+                key="bo_history_view",
+                horizontal=True,
+            )
+            show_history_heatmap = (
+                st.session_state.get("bo_history_view") == "Channel x iteration heatmap"
+                and not st.session_state.get("bo_composer_source_route")
+            )
         @st.fragment
+        @_bo_loading_fragment('History & scores')
         def _render_history_scores_tab() -> None:
             if not _load_simulated_sweep_section(full_session, 'History & scores'):
                 return
             if st.session_state.get('bo_composer_source_route') and _render_composer_source_route('History & scores', session, history, observations, observation, trace_analysis, paired_objective):
+                return
+            if st.session_state.get('bo_history_view') == 'Channel x iteration heatmap':
                 return
             # A selection callback runs before this fragment. Refresh the app
             # so the SWV fragment receives a fresh scope and render request.
@@ -42988,6 +44725,8 @@ def render_bo_session_app() -> None:
                 if trend_q_kind:
                     _render_q_equation(session["config"], trend_q_kind)
 
+            @_bo_loading_fragment('Hyperparameter response')
+            @_hyperparameter_render_progress
             def _render_hyperparameter_response_fragment() -> None:
                 nonlocal trend_history
                 trend_history = _add_ground_truth_channel_run_axis(
@@ -43672,6 +45411,8 @@ def render_bo_session_app() -> None:
                         type="primary",
                         key="bo_hp_response_render_button",
                     ) or bool(st.session_state.pop(hp_force_render_key, False))
+                    if hp_apply_response_settings:
+                        _report_hp_render(0.0, "Preparing hyperparameter response...")
                     if hp_apply_response_settings and hp_view == "3D heatmap":
                         st.session_state[render_settings_key] = {
                             "face_opacity": draft_face_opacity,
@@ -43751,6 +45492,8 @@ def render_bo_session_app() -> None:
                             "for the current controls."
                         )
                     else:
+                        _report_bo_loading(0.95, "Computing hyperparameter responses...")
+                        _report_hp_render(0.10, "Summarizing simulation runs...")
                         response_frame = _hyperparameter_response_frame(
                             hp_response_history,
                             hp_metric_key,
@@ -43760,6 +45503,7 @@ def render_bo_session_app() -> None:
                             include_misses=hp_include_misses,
                             at_best_q_parameter=hp_at_best_q_parameter,
                         )
+                        _report_hp_render(0.35, "Applying channel, crop, and slice settings...")
                         if response_frame.empty:
                             st.info(
                                 "No run-level hyperparameter response values are available "
@@ -43778,7 +45522,12 @@ def render_bo_session_app() -> None:
                                     else hp_metric_label
                                 )
                                 rendered_any_channel = False
-                                for hp_channel in hp_selected_ground_truth_channels:
+                                for hp_channel_index, hp_channel in enumerate(hp_selected_ground_truth_channels):
+                                    _report_hp_render(
+                                        0.40 + 0.55 * hp_channel_index / len(hp_selected_ground_truth_channels),
+                                        f"Building and displaying channel {hp_channel} "
+                                        f"({hp_channel_index + 1}/{len(hp_selected_ground_truth_channels)})...",
+                                    )
                                     channel_response_frame = response_frame[
                                         response_frame["ground_truth_channel"]
                                         .astype(str)
@@ -44031,6 +45780,7 @@ def render_bo_session_app() -> None:
                                     "crop or 2D slice filters."
                                 )
                             else:
+                                _report_hp_render(0.45, f"Building {hp_view.lower()} geometry and colors...")
                                 hp_render_signature = (
                                     trend_scope_key,
                                     iteration_start,
@@ -44183,6 +45933,7 @@ def render_bo_session_app() -> None:
                                         "gif_key": rendered_gif_key,
                                         "allow_gif": hp_summary != "Iterations to Q target",
                                     }
+                                _report_hp_render(0.75, "Sending hyperparameter figure to the display...")
                                 hp_plot_column = _sized_plot_container(
                                     st,
                                     plot_width_percent,
@@ -44203,6 +45954,8 @@ def render_bo_session_app() -> None:
                                     if hp_click_pick_enabled
                                     else f"{hp_plot_key}_rotate"
                                 )
+                                hp_capture_figure = hp_figure
+                                hp_capture_camera = None
                                 if hp_click_pick_enabled and plotly_events is not None:
                                     _apply_plotly_colorbar_height(hp_figure)
                                     with hp_plot_column:
@@ -44249,16 +46002,19 @@ def render_bo_session_app() -> None:
                                         show_download=False,
                                     )
                                     hp_download_camera = (
-                                        hp_cached_camera
-                                        if hp_cached_camera is not None
-                                        else hp_rendered_camera
+                                        hp_rendered_camera
+                                        if hp_rendered_camera is not None
+                                        else hp_cached_camera
                                     )
                                     hp_download_figure = go.Figure(hp_figure)
                                     _apply_plotly_camera(
                                         hp_download_figure,
                                         hp_download_camera,
                                     )
+                                    hp_capture_figure = hp_download_figure
+                                    hp_capture_camera = hp_download_camera
                                     try:
+                                        _report_hp_render(0.85, "Generating downloadable PNG (this may take longer for 3D)...")
                                         hp_png_bytes = _plotly_png_bytes(
                                             hp_download_figure,
                                             width=1200,
@@ -44302,6 +46058,15 @@ def render_bo_session_app() -> None:
                                         ),
                                         selection_mode="points",
                                     )
+                                _render_add_to_composer_button(
+                                    hp_plot_column,
+                                    None,
+                                    key=f"{hp_plot_key}_composer",
+                                    file_stem=f"hyperparameter_response_{hp_metric_label}_{hp_x}_{hp_y}_{hp_z or 'none'}",
+                                    figure=hp_capture_figure,
+                                    camera=hp_capture_camera,
+                                )
+                                _report_hp_render(0.95, "Preparing response table and figure controls...")
                                 if hp_click_pick_enabled and plotly_events is None:
                                     st.caption(
                                         "Mouse click slice picking requires "
@@ -45491,6 +47256,7 @@ def render_bo_session_app() -> None:
         _render_history_scores_tab()
     with traces:
         @st.fragment
+        @_bo_loading_fragment('SWV traces')
         def _render_swv_traces_tab() -> None:
             if st.session_state.get('bo_composer_source_route') and _render_composer_source_route('SWV traces', session, history, observations, observation, trace_analysis, paired_objective):
                 return
@@ -47160,12 +48926,16 @@ def render_bo_session_app() -> None:
         _render_swv_traces_tab()
     with real_data:
         @st.fragment
-        def _render_real_data_landscapes_tab() -> None:
-            if st.session_state.get('bo_composer_source_route') and _render_composer_source_route('Real data landscapes', session, history, observations, observation, trace_analysis, paired_objective):
+        @_bo_loading_fragment('History heatmap' if show_history_heatmap else 'Real data landscapes')
+        def _render_real_data_landscapes_tab(history_heatmap: bool = False) -> None:
+            if not history_heatmap and st.session_state.get('bo_composer_source_route') and _render_composer_source_route('Real data landscapes', session, history, observations, observation, trace_analysis, paired_objective):
                 return
-            if not _load_simulated_sweep_section(full_session, "Real data landscapes"):
+            section = "History & scores" if history_heatmap else "Real data landscapes"
+            if not _load_simulated_sweep_section(full_session, section):
                 return
             st.caption(
+                "Rows show channels or simulation conditions; columns show iterations."
+                if history_heatmap else
                 "These plots use completed experimental observations only; no surrogate predictions are shown."
             )
             show_real_observation_group_filter = (
@@ -47178,9 +48948,24 @@ def render_bo_session_app() -> None:
             )
             real_selected_observation_group_ids = set(selected_observation_group_ids)
             real_scope_key = str(selected_observation_group_scope)
-            real_control_scope_key = "real_data_landscapes"
+            real_control_scope_key = "real_data_landscapes"  # Preserve saved heatmap controls after relocation.
             real_settings_form = st.container()
+            if history_heatmap:
+                real_view = "Channel x iteration heatmap"
+            else:
+                plot_type_options = [
+                    "1D slice", "2D map", "3D tensor",
+                    "Channel x iteration heatmap", "Parallel coordinates",
+                ]
+                _preserve_valid_widget_value("bo_real_view", plot_type_options, "1D slice")
+                real_view = real_settings_form.radio(
+                    "Real-data view", plot_type_options, horizontal=True,
+                    key="bo_real_view",
+                    help="Choose a plot type, then select a metric and channels containing recorded values.",
+                )
             real_settings_form.caption(
+                "Adjust heatmap settings here, then click Update history heatmap to redraw."
+                if history_heatmap else
                 "Adjust Real Data Landscapes settings here, then click "
                 "Update real-data plots to redraw."
             )
@@ -47207,14 +48992,14 @@ def render_bo_session_app() -> None:
                     )
                 )
                 selected_real_group_filters = real_settings_form.multiselect(
-                    "Real-data observation groups",
+                    "History observation groups" if history_heatmap else "Real-data observation groups",
                     real_group_filter_options,
                     default=real_group_filter_display,
                     format_func=observation_group_scope_label,
                     key=real_group_filter_key,
                     help=(
-                        "Filters the observation groups used only in this Real Data "
-                        "Landscapes tab. This is useful for multi-parameter "
+                        "Filters the observation groups used in this view. "
+                        "This is useful for multi-parameter "
                         "simulation sweeps with many saved simulation runs."
                     ),
                 )
@@ -47251,7 +49036,7 @@ def render_bo_session_app() -> None:
                         ).hexdigest()[:12]
                     )
                 if not real_selected_observation_group_ids:
-                    st.info("Select at least one observation group for Real Data Landscapes.")
+                    st.info("Select at least one observation group.")
             all_real_observations = [
                 obs for obs in observations
                 if int(obs.get("group_id", 1)) in real_selected_observation_group_ids
@@ -47299,11 +49084,14 @@ def render_bo_session_app() -> None:
                 metric
                 for metric in REAL_DATA_METRICS
                 if paired_objective or not _real_metric_phase_independent(metric)
-            ] + ["Count"]
-            _preserve_valid_widget_value(
-                "bo_real_metric",
-                real_metric_options,
+            ] + ([] if history_heatmap else ["Count"])
+            recorded_metric = str((full_session.get("state", {}).get("simulation_metadata") or {}).get("value_label", ""))
+            default_metric = next(
+                (name for name in ("Paired Q", "Classic Q") if name in recorded_metric and name in real_metric_options),
                 real_metric_options[0],
+            )
+            _preserve_valid_widget_value(
+                "bo_real_metric", real_metric_options, default_metric,
             )
             real_metric = real_settings_form.selectbox(
                 "Measured metric",
@@ -47844,7 +49632,7 @@ def render_bo_session_app() -> None:
                 or real_plotted_simulation_count > 10
             )
             real_settings_submitted = real_settings_form.button(
-                "Update real-data plots",
+                "Update history heatmap" if history_heatmap else "Update real-data plots",
                 use_container_width=True,
                 key="bo_real_update_plots",
             )
@@ -47924,178 +49712,179 @@ def render_bo_session_app() -> None:
             display_real_metric = real_metric
             active_comparison_payload = None
             comparison_overview_points = pd.DataFrame()
-            st.markdown("#### Session comparison")
-            st.caption(
-                "Cache the current real-data metric table, load another BO session, "
-                "then load the cached values to plot current minus cached values."
-            )
-            paired_classic_comparison_available = (
-                paired_objective
-                and real_metric == "Classic Q"
-                and not count_mode
-            )
-            if paired_classic_comparison_available:
+            if not history_heatmap:
+                st.markdown("#### Session comparison")
                 st.caption(
-                    "For paired BO sessions, you can also compare target Classic Q "
-                    "against buffer Classic Q within this loaded session."
+                    "Cache the current real-data metric table, load another BO session, "
+                    "then load the cached values to plot current minus cached values."
                 )
-            comparison_action_form = st.form(
-                f"bo_real_comparison_actions_form_{real_scope_key}_{real_metric}_{real_phase}",
-                clear_on_submit=False,
-            )
-            comparison_controls = comparison_action_form.columns([1, 1, 1])
-            if comparison_controls[0].form_submit_button(
-                "Cache comparison values",
-                disabled=combined_real_points.empty,
-                use_container_width=True,
-            ):
-                st.session_state["bo_real_comparison_cached"] = _real_comparison_payload(
-                    combined_real_points,
-                    metric=real_metric,
-                    phase=real_phase,
-                    channel_mode=real_channel_mode,
-                    session_path=selected_session_folder,
+                paired_classic_comparison_available = (
+                    paired_objective
+                    and real_metric == "Classic Q"
+                    and not count_mode
                 )
-                st.session_state.pop("bo_real_comparison_active", None)
-                st.success(
-                    f"Cached {len(combined_real_points):,} {real_metric} row(s) "
-                    "for comparison."
-                )
-            cached_comparison_payload = st.session_state.get(
-                "bo_real_comparison_cached"
-            )
-            if comparison_controls[1].form_submit_button(
-                "Load comparison values",
-                disabled=not cached_comparison_payload or combined_real_points.empty,
-                use_container_width=True,
-            ):
-                st.session_state["bo_real_comparison_active"] = cached_comparison_payload
-            if comparison_controls[2].form_submit_button(
-                "Clear comparison",
-                disabled=not st.session_state.get("bo_real_comparison_active"),
-                use_container_width=True,
-            ):
-                st.session_state.pop("bo_real_comparison_active", None)
-                st.rerun()
-            if paired_classic_comparison_available:
-                if real_channel_mode == "Plot channel groups":
-                    local_buffer_points = _real_group_metric_points(
-                        real_observations,
-                        "Classic Q",
-                        "buffer",
-                        selected_real_groups,
+                if paired_classic_comparison_available:
+                    st.caption(
+                        "For paired BO sessions, you can also compare target Classic Q "
+                        "against buffer Classic Q within this loaded session."
                     )
-                    local_target_points = _real_group_metric_points(
-                        real_observations,
-                        "Classic Q",
-                        "target",
-                        selected_real_groups,
-                    )
-                else:
-                    local_buffer_points = _real_metric_points(
-                        real_observations,
-                        "Classic Q",
-                        "buffer",
-                        selected_real_channels,
-                        average_channels=(
-                            real_channel_mode == "Average selected channels"
-                        ),
-                    )
-                    local_target_points = _real_metric_points(
-                        real_observations,
-                        "Classic Q",
-                        "target",
-                        selected_real_channels,
-                        average_channels=(
-                            real_channel_mode == "Average selected channels"
-                        ),
-                    )
-                local_pair_form = st.form(
-                    f"bo_real_local_pair_comparison_form_{real_scope_key}_{real_metric}_{real_phase}",
+                comparison_action_form = st.form(
+                    f"bo_real_comparison_actions_form_{real_scope_key}_{real_metric}_{real_phase}",
                     clear_on_submit=False,
                 )
-                local_pair_columns = local_pair_form.columns([1, 2])
-                if local_pair_columns[0].form_submit_button(
-                    "Compare target vs buffer Classic Q",
-                    disabled=local_buffer_points.empty or local_target_points.empty,
+                comparison_controls = comparison_action_form.columns([1, 1, 1])
+                if comparison_controls[0].form_submit_button(
+                    "Cache comparison values",
+                    disabled=combined_real_points.empty,
                     use_container_width=True,
-                    help=(
-                        "Uses buffer Classic Q as the cached/reference table and "
-                        "target Classic Q as the current table."
-                    ),
                 ):
-                    st.session_state["bo_real_comparison_active"] = (
-                        _real_comparison_payload(
-                            local_buffer_points,
-                            metric="Classic Q",
-                            phase="target_minus_buffer",
-                            channel_mode=real_channel_mode,
-                            session_path=selected_session_folder,
-                            current_points=local_target_points,
-                            label="Target Classic Q - buffer Classic Q",
-                        )
+                    st.session_state["bo_real_comparison_cached"] = _real_comparison_payload(
+                        combined_real_points,
+                        metric=real_metric,
+                        phase=real_phase,
+                        channel_mode=real_channel_mode,
+                        session_path=selected_session_folder,
                     )
-                    st.session_state["bo_real_comparison_cached"] = (
-                        st.session_state["bo_real_comparison_active"]
-                    )
+                    st.session_state.pop("bo_real_comparison_active", None)
                     st.success(
-                        "Prepared local paired comparison: target Classic Q minus "
-                        f"buffer Classic Q ({len(local_target_points):,} target row(s), "
-                        f"{len(local_buffer_points):,} buffer row(s))."
+                        f"Cached {len(combined_real_points):,} {real_metric} row(s) "
+                        "for comparison."
                     )
-                if local_buffer_points.empty or local_target_points.empty:
-                    local_pair_columns[1].caption(
-                        "Local paired comparison is available after the current "
-                        "channel/group selection produces both buffer and target "
-                        "Classic Q rows."
-                    )
-            if combined_real_points.empty:
-                st.caption(
-                    "Cache comparison values is disabled until the current metric, "
-                    "phase, and channel selection produces rows."
+                cached_comparison_payload = st.session_state.get(
+                    "bo_real_comparison_cached"
                 )
-            if cached_comparison_payload:
-                comparison_controls[0].caption(
-                    f"Cached {cached_comparison_payload.get('row_count', 0):,} "
-                    f"{cached_comparison_payload.get('metric', 'metric')} row(s)."
-                )
-            active_comparison_payload = st.session_state.get(
-                "bo_real_comparison_active"
-            )
-            active_comparison_current_points = (
-                active_comparison_payload.get("current_points")
-                if isinstance(active_comparison_payload, dict)
-                else None
-            )
-            if active_comparison_current_points is None:
-                active_comparison_current_points = combined_real_points
-            if (
-                active_comparison_payload
-                and isinstance(active_comparison_current_points, pd.DataFrame)
-                and not active_comparison_current_points.empty
-            ):
-                cached_metric = active_comparison_payload.get("metric")
-                if cached_metric != real_metric:
-                    st.warning(
-                        "Cached comparison metric is "
-                        f"{cached_metric}; select {cached_metric} to compare values."
-                    )
-                else:
-                    comparison_points, comparison_error = _real_comparison_delta_points(
-                        active_comparison_current_points,
-                        active_comparison_payload["points"],
-                    )
-                    if comparison_error:
-                        st.warning(comparison_error)
-                    if not comparison_points.empty:
-                        comparison_overview_points = comparison_points
-                        comparison_label = active_comparison_payload.get("label")
-                        st.success(
-                            f"Loaded comparison values: {len(comparison_points):,} "
-                            "cached coordinate(s) evaluated with current-session RBF interpolation."
+                if comparison_controls[1].form_submit_button(
+                    "Load comparison values",
+                    disabled=not cached_comparison_payload or combined_real_points.empty,
+                    use_container_width=True,
+                ):
+                    st.session_state["bo_real_comparison_active"] = cached_comparison_payload
+                if comparison_controls[2].form_submit_button(
+                    "Clear comparison",
+                    disabled=not st.session_state.get("bo_real_comparison_active"),
+                    use_container_width=True,
+                ):
+                    st.session_state.pop("bo_real_comparison_active", None)
+                    st.rerun()
+                if paired_classic_comparison_available:
+                    if real_channel_mode == "Plot channel groups":
+                        local_buffer_points = _real_group_metric_points(
+                            real_observations,
+                            "Classic Q",
+                            "buffer",
+                            selected_real_groups,
                         )
-                        if comparison_label:
-                            st.caption(str(comparison_label))
+                        local_target_points = _real_group_metric_points(
+                            real_observations,
+                            "Classic Q",
+                            "target",
+                            selected_real_groups,
+                        )
+                    else:
+                        local_buffer_points = _real_metric_points(
+                            real_observations,
+                            "Classic Q",
+                            "buffer",
+                            selected_real_channels,
+                            average_channels=(
+                                real_channel_mode == "Average selected channels"
+                            ),
+                        )
+                        local_target_points = _real_metric_points(
+                            real_observations,
+                            "Classic Q",
+                            "target",
+                            selected_real_channels,
+                            average_channels=(
+                                real_channel_mode == "Average selected channels"
+                            ),
+                        )
+                    local_pair_form = st.form(
+                        f"bo_real_local_pair_comparison_form_{real_scope_key}_{real_metric}_{real_phase}",
+                        clear_on_submit=False,
+                    )
+                    local_pair_columns = local_pair_form.columns([1, 2])
+                    if local_pair_columns[0].form_submit_button(
+                        "Compare target vs buffer Classic Q",
+                        disabled=local_buffer_points.empty or local_target_points.empty,
+                        use_container_width=True,
+                        help=(
+                            "Uses buffer Classic Q as the cached/reference table and "
+                            "target Classic Q as the current table."
+                        ),
+                    ):
+                        st.session_state["bo_real_comparison_active"] = (
+                            _real_comparison_payload(
+                                local_buffer_points,
+                                metric="Classic Q",
+                                phase="target_minus_buffer",
+                                channel_mode=real_channel_mode,
+                                session_path=selected_session_folder,
+                                current_points=local_target_points,
+                                label="Target Classic Q - buffer Classic Q",
+                            )
+                        )
+                        st.session_state["bo_real_comparison_cached"] = (
+                            st.session_state["bo_real_comparison_active"]
+                        )
+                        st.success(
+                            "Prepared local paired comparison: target Classic Q minus "
+                            f"buffer Classic Q ({len(local_target_points):,} target row(s), "
+                            f"{len(local_buffer_points):,} buffer row(s))."
+                        )
+                    if local_buffer_points.empty or local_target_points.empty:
+                        local_pair_columns[1].caption(
+                            "Local paired comparison is available after the current "
+                            "channel/group selection produces both buffer and target "
+                            "Classic Q rows."
+                        )
+                if combined_real_points.empty:
+                    st.caption(
+                        "Cache comparison values is disabled until the current metric, "
+                        "phase, and channel selection produces rows."
+                    )
+                if cached_comparison_payload:
+                    comparison_controls[0].caption(
+                        f"Cached {cached_comparison_payload.get('row_count', 0):,} "
+                        f"{cached_comparison_payload.get('metric', 'metric')} row(s)."
+                    )
+                active_comparison_payload = st.session_state.get(
+                    "bo_real_comparison_active"
+                )
+                active_comparison_current_points = (
+                    active_comparison_payload.get("current_points")
+                    if isinstance(active_comparison_payload, dict)
+                    else None
+                )
+                if active_comparison_current_points is None:
+                    active_comparison_current_points = combined_real_points
+                if (
+                    active_comparison_payload
+                    and isinstance(active_comparison_current_points, pd.DataFrame)
+                    and not active_comparison_current_points.empty
+                ):
+                    cached_metric = active_comparison_payload.get("metric")
+                    if cached_metric != real_metric:
+                        st.warning(
+                            "Cached comparison metric is "
+                            f"{cached_metric}; select {cached_metric} to compare values."
+                        )
+                    else:
+                        comparison_points, comparison_error = _real_comparison_delta_points(
+                            active_comparison_current_points,
+                            active_comparison_payload["points"],
+                        )
+                        if comparison_error:
+                            st.warning(comparison_error)
+                        if not comparison_points.empty:
+                            comparison_overview_points = comparison_points
+                            comparison_label = active_comparison_payload.get("label")
+                            st.success(
+                                f"Loaded comparison values: {len(comparison_points):,} "
+                                "cached coordinate(s) evaluated with current-session RBF interpolation."
+                            )
+                            if comparison_label:
+                                st.caption(str(comparison_label))
             real_value_colorscale = "Viridis"
             unsliced_real_points_by_phase = {
                 phase: points.copy()
@@ -48107,6 +49896,12 @@ def render_bo_session_app() -> None:
                     "No recorded values are available for this metric, phase, "
                     "and channel or group selection."
                 )
+                if (full_session.get("state", {}).get("simulation_metadata") or {}).get("compact_export"):
+                    st.info(
+                        "This compact simulation export contains recorded Q scores, "
+                        "but may not contain peak-height or raw-trace metrics. "
+                        "Choose Paired Q or Classic Q under Measured metric."
+                    )
             else:
                 real_dimensions = [
                     parameter
@@ -48122,6 +49917,8 @@ def render_bo_session_app() -> None:
                         )
                     )
                 ]
+                if real_view == "Channel x iteration heatmap" and not real_dimensions:
+                    real_dimensions = ["iteration"]
                 if not real_dimensions:
                     st.info("No experimental parameter varied in the recorded observations.")
                 else:
@@ -48858,32 +50655,33 @@ def render_bo_session_app() -> None:
                             real_parallel_parameters.append(parameter)
                     if real_parallel_parameters and not count_mode:
                         real_view_options.append("Parallel coordinates")
+                    if history_heatmap:
+                        real_view_options = ["Channel x iteration heatmap"]
                     real_view_form = real_settings_form
-                    _preserve_valid_widget_value(
-                        "bo_real_view",
-                        real_view_options,
-                        "1D slice",
-                    )
-                    real_view = real_view_form.radio(
-                        "Real-data view",
-                        real_view_options,
-                        horizontal=True,
-                        key="bo_real_view",
-                    )
-                    _preserve_valid_widget_value(
-                        "bo_real_x",
-                        real_dimensions,
-                        real_dimensions[0],
-                    )
-                    real_x = real_view_form.selectbox(
-                        "Real-data X",
-                        real_dimensions,
-                        key="bo_real_x",
-                        disabled=real_view in {
-                            "Parallel coordinates",
-                            "Channel x iteration heatmap",
-                        },
-                    )
+                    if history_heatmap:
+                        real_view = "Channel x iteration heatmap"
+                        real_x = real_dimensions[0]
+                    else:
+                        if real_view not in real_view_options:
+                            st.info(
+                                f"{real_view} is unavailable for these values. "
+                                "Choose another plot type or change the metric/channel selection."
+                            )
+                            return
+                        _preserve_valid_widget_value(
+                            "bo_real_x",
+                            real_dimensions,
+                            real_dimensions[0],
+                        )
+                        real_x = real_view_form.selectbox(
+                            "Real-data X",
+                            real_dimensions,
+                            key="bo_real_x",
+                            disabled=real_view in {
+                                "Parallel coordinates",
+                                "Channel x iteration heatmap",
+                            },
+                        )
                     real_y_options = [name for name in real_dimensions if name != real_x]
                     if real_view in {"2D map", "3D tensor"}:
                         _preserve_valid_widget_value(
@@ -49632,41 +51430,43 @@ def render_bo_session_app() -> None:
                                     "The selected metadata values exclude all "
                                     "channel × iteration heatmap rows."
                                 )
-                    real_log_frequency_key = "bo_real_log_frequency"
-                    real_log_frequency_preference_key = (
-                        f"{real_log_frequency_key}__preferred"
-                    )
-                    _initialize_preference(
-                        real_log_frequency_preference_key,
-                        real_log_frequency_key,
-                        default=False,
-                    )
-                    _capture_widget_preference(
-                        real_log_frequency_key,
-                        real_log_frequency_preference_key,
-                    )
-                    st.session_state[real_log_frequency_key] = bool(
-                        st.session_state.get(real_log_frequency_preference_key, False)
-                    )
-                    real_log_frequency = real_view_form.checkbox(
-                        "Log-scale frequency axis",
-                        value=False,
-                        disabled=(
-                            real_view == "Channel x iteration heatmap"
-                            or (
-                                "frequency" not in (
-                                    real_parallel_parameters
-                                    if real_view == "Parallel coordinates"
-                                    else (real_x, real_y, real_z)
+                    real_log_frequency = False
+                    if not history_heatmap:
+                        real_log_frequency_key = "bo_real_log_frequency"
+                        real_log_frequency_preference_key = (
+                            f"{real_log_frequency_key}__preferred"
+                        )
+                        _initialize_preference(
+                            real_log_frequency_preference_key,
+                            real_log_frequency_key,
+                            default=False,
+                        )
+                        _capture_widget_preference(
+                            real_log_frequency_key,
+                            real_log_frequency_preference_key,
+                        )
+                        st.session_state[real_log_frequency_key] = bool(
+                            st.session_state.get(real_log_frequency_preference_key, False)
+                        )
+                        real_log_frequency = real_view_form.checkbox(
+                            "Log-scale frequency axis",
+                            value=False,
+                            disabled=(
+                                real_view == "Channel x iteration heatmap"
+                                or (
+                                    "frequency" not in (
+                                        real_parallel_parameters
+                                        if real_view == "Parallel coordinates"
+                                        else (real_x, real_y, real_z)
+                                    )
                                 )
-                            )
-                        ),
-                        help="Uses a logarithmic axis whenever frequency is a displayed dimension.",
-                        key=real_log_frequency_key,
-                    )
-                    st.session_state[real_log_frequency_preference_key] = (
-                        real_log_frequency
-                    )
+                            ),
+                            help="Uses a logarithmic axis whenever frequency is a displayed dimension.",
+                            key=real_log_frequency_key,
+                        )
+                        st.session_state[real_log_frequency_preference_key] = (
+                            real_log_frequency
+                        )
                     real_draw_full_cube_edges = False
                     if real_view == "3D tensor":
                         real_cube_edges_key = (
@@ -49703,31 +51503,33 @@ def render_bo_session_app() -> None:
                         st.session_state[real_cube_edges_preference_key] = (
                             real_draw_full_cube_edges
                         )
-                    real_iteration_path_key = "bo_real_show_iteration_path"
-                    real_iteration_path_preference_key = (
-                        f"{real_iteration_path_key}__preferred"
-                    )
-                    _initialize_preference(
-                        real_iteration_path_preference_key,
-                        real_iteration_path_key,
-                        default=True,
-                    )
-                    _capture_widget_preference(
-                        real_iteration_path_key,
-                        real_iteration_path_preference_key,
-                    )
-                    st.session_state[real_iteration_path_key] = bool(
-                        st.session_state.get(real_iteration_path_preference_key, True)
-                    )
-                    real_show_iteration_path = real_view_form.checkbox(
-                        "Show iteration path",
-                        value=True,
-                        key=real_iteration_path_key,
-                        help="Shows the chronological red-to-black path and iteration colorbar.",
-                    )
-                    st.session_state[real_iteration_path_preference_key] = (
-                        real_show_iteration_path
-                    )
+                    real_show_iteration_path = False
+                    if not history_heatmap:
+                        real_iteration_path_key = "bo_real_show_iteration_path"
+                        real_iteration_path_preference_key = (
+                            f"{real_iteration_path_key}__preferred"
+                        )
+                        _initialize_preference(
+                            real_iteration_path_preference_key,
+                            real_iteration_path_key,
+                            default=True,
+                        )
+                        _capture_widget_preference(
+                            real_iteration_path_key,
+                            real_iteration_path_preference_key,
+                        )
+                        st.session_state[real_iteration_path_key] = bool(
+                            st.session_state.get(real_iteration_path_preference_key, True)
+                        )
+                        real_show_iteration_path = real_view_form.checkbox(
+                            "Show iteration path",
+                            value=True,
+                            key=real_iteration_path_key,
+                            help="Shows the chronological red-to-black path and iteration colorbar.",
+                        )
+                        st.session_state[real_iteration_path_preference_key] = (
+                            real_show_iteration_path
+                        )
                     real_parallel_line_width = 2.0
                     real_parallel_axis_line_width = 1.0
                     real_parallel_line_opacity = 0.76
@@ -50679,6 +52481,8 @@ def render_bo_session_app() -> None:
                             else ""
                         )
                         st.info(
+                            f"Click Update history heatmap to render this selection{selection_note}."
+                            if history_heatmap else
                             "Click Update real-data plots to render the Real Data "
                             f"Landscapes plot for this selection{selection_note}."
                         )
@@ -50882,7 +52686,7 @@ def render_bo_session_app() -> None:
                                         else _plot_height_px("2d")
                                     )
                                     try:
-                                        with plot_container:
+                                        with plot_container.container():
                                             with st.spinner(
                                                 "Generating complete full-height PNG..."
                                                 if requested_export_mode == "complete"
@@ -52811,9 +54615,14 @@ def render_bo_session_app() -> None:
                     st.dataframe(combined_real_points, use_container_width=True, hide_index=True)
 
 
-        _render_real_data_landscapes_tab()
+        if not show_history_heatmap:
+            _render_real_data_landscapes_tab()
+    if show_history_heatmap:
+        with overview:
+            _render_real_data_landscapes_tab(history_heatmap=True)
     with surrogate:
         @st.fragment
+        @_bo_loading_fragment('Surrogate')
         def _render_surrogate_tab() -> None:
             if not _load_simulated_sweep_section(full_session, "Surrogate plots"):
                 return
@@ -55023,6 +56832,7 @@ def render_bo_session_app() -> None:
         _render_surrogate_tab()
     with simulation:
         @st.fragment
+        @_bo_loading_fragment('Simulation')
         def _render_simulation_tab() -> None:
             if not _load_simulated_sweep_section(full_session, "Simulation tools"):
                 return
@@ -59922,6 +61732,7 @@ def render_bo_session_app() -> None:
         # local while still receiving fresh session data whenever an outside
         # group/iteration selector changes.
         @st.fragment
+        @_bo_loading_fragment('Figure Composer')
         def _render_figure_composer_fragment() -> None:
             # Widget clicks normally rerun only this fragment. If renderer
             # source changed, refresh bindings via a full rerun in this session.

@@ -139,8 +139,12 @@ def test_selected_subpanel_png_uses_source_figure_and_embeds_panel_metadata():
     composite._paper_panel_roles = ['manual_swv', 'response']
     api['_paper_figure_downloads'](composite, 'example', {'recipe': {'kind': 'test'}})
     panel = downloads['example_panel_B.png']()
+    expected = BytesIO()
+    second.savefig(expected, format='png', dpi=600, bbox_inches='tight', transparent=True)
+    with Image.open(BytesIO(expected.getvalue())) as reference:
+        expected_size = reference.size
     with Image.open(BytesIO(panel)) as image:
-        assert image.width >= 1700
+        assert image.size == expected_size
         assert image.info['dpi'][0] == pytest.approx(600, abs=1)
         embedded = json.loads(image.info['SWV Figure Metadata'])
         assert embedded['panel_index'] == 1

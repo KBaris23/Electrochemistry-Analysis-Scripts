@@ -724,7 +724,8 @@ def test_matplotlib_panel_text_sizes_are_absolute_and_equal_across_panels():
         assert axis.texts[0].get_fontsize() == pytest.approx(8.5)
 
 
-def test_plotly_panel_text_is_converted_from_points_to_pixels(monkeypatch):
+@pytest.mark.parametrize('render_dpi', [110, 600])
+def test_plotly_panel_text_is_converted_from_points_to_pixels(monkeypatch, render_dpi):
     import plotly.graph_objects as go
     from matplotlib.figure import Figure
 
@@ -736,6 +737,7 @@ def test_plotly_panel_text_is_converted_from_points_to_pixels(monkeypatch):
     ):
         seen["text_size"] = text_size
         seen["mark_scale"] = mark_scale
+        seen["scale"] = scale
         # 1x1 transparent PNG
         return (
             b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -748,14 +750,15 @@ def test_plotly_panel_text_is_converted_from_points_to_pixels(monkeypatch):
     axis = target.subplots()
     viewer._composer_draw_embedded_figure(
         target, axis, go.Figure(go.Scatter(x=[0, 1], y=[0, 1])),
-        (0.1, 0.1, 0.5, 0.5), 600, 8,
+        (0.1, 0.1, 0.5, 0.5), render_dpi, 8,
     )
-    # 8 pt at 600 DPI is 8 * 600 / 72 pixels, times the measured Plotly calibration.
+    # A fixed logical viewport keeps physical typography identical at preview
+    # and export DPI; only the raster scale changes with export resolution.
     assert seen["text_size"] == pytest.approx(
-        8 * 600 / 72 * viewer._PLOTLY_TEXT_CALIBRATION
+        8 * 220 / 72 * viewer._PLOTLY_TEXT_CALIBRATION
     )
-    # Marks scale with the panel width (7 in * 600 DPI * 0.5 = 2100 px wide).
-    assert seen["mark_scale"] == pytest.approx(2100 / viewer._PLOTLY_MARK_DESIGN_WIDTH_PX)
+    assert seen["mark_scale"] == pytest.approx(770 / viewer._PLOTLY_MARK_DESIGN_WIDTH_PX)
+    assert seen["scale"] == pytest.approx(1.5 * render_dpi / 220)
 
 
 def test_plotly_marker_sizes_and_line_widths_scale_with_panel_width():

@@ -20,7 +20,7 @@ function node() {
     classList:{toggle(){}, add(){}, remove(){}, contains(){return false;}},
     querySelector(){return node();}, querySelectorAll(){return [];},
     addEventListener(){}, removeEventListener(){}, appendChild(){}, replaceChildren(){},
-    setPointerCapture(){}, contains(){return false;}};
+    setAttribute(){}, setPointerCapture(){}, contains(){return false;}};
 }
 const document = {activeElement:null, getElementById(id){
   if (!nodes.has(id)) nodes.set(id,node()); return nodes.get(id);

@@ -188,7 +188,7 @@ SOURCE_TABS = {
     'Measured 2D map': 'Real data landscapes',
     'Measured 3D tensor': 'Real data landscapes',
     'Measured parallel coordinates': 'Real data landscapes',
-    'Channel x iteration heatmap': 'Real data landscapes',
+    'Channel x iteration heatmap': 'History & scores',
 }
 
 

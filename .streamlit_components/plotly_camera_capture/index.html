@@ -430,8 +430,8 @@
 
     function cacheCurrentView() {
       const camera = (
-        lastCamera ||
         renderedCamera() ||
+        lastCamera ||
         loadCamera(latestArgs && latestArgs.storage_key)
       );
       if (!latestArgs || !camera || !camera.eye) {
@@ -443,6 +443,12 @@
       setComponentValue({
         type: "cache_view",
         camera: camera,
+        viewport: {
+          width: graph._fullLayout.width,
+          height: graph._fullLayout.height,
+          margin: {l: graph._fullLayout._size.l, r: graph._fullLayout._size.r,
+                   t: graph._fullLayout._size.t, b: graph._fullLayout._size.b},
+        },
         storage_key: latestArgs.storage_key,
         shared_storage_key: latestArgs.shared_storage_key || SHARED_CAMERA_KEY,
       });
@@ -477,7 +483,9 @@
       controls.style.display = showControls ? "flex" : "none";
       downloadButton.style.display = showDownload ? "inline-flex" : "none";
       cacheViewButton.style.display = showCacheView ? "inline-flex" : "none";
-      setFrameHeight(height + (showControls ? 52 : 0));
+      // Include the actual wrapped control row, its top margin, and a small
+      // bottom allowance so Cache view remains fully inside the iframe.
+      setFrameHeight(height + (showControls ? controls.offsetHeight + 12 : 0));
       window.clearTimeout(sendTimer);
 
       if (!plotVisible && !exportInProgress) return;
