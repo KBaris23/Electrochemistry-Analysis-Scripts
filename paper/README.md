@@ -125,6 +125,45 @@ chosen external results folder, not inside this repository.
 - Preserve raw inputs and final metadata so every table entry and plot can be
   traced back to its session/folder.
 
+## Titration templates and saved formatting
+
+In **Saved Sessions**, select a session and click **Open**, then go to **Paper
+Figures**. Choose a template and click **Generate preview**:
+
+- **Type 3E - Titration and Langmuir** keeps the physical response/fit panel sizes
+  derived from Type 3D.
+- **Type 3F - SWVs only** shows the control and optimized SWV overlays.
+- **Type 3G - Titration, Langmuir and accuracy** combines titration response,
+  Langmuir fit, and a larger predicted-versus-known panel.
+- **Type 4B - Concentration prediction and accuracy** shows concentration by
+  measurement and predicted versus known.
+
+Each session retains its separate template layouts. Use **Save settings to
+saved session** after editing; reopening the session restores these settings
+without changing its cached analysis. Titles, legend labels, font sizes,
+panel positions, and aspect ratios remain editable. Method colors apply to
+response/fitting curves; SWV measurement colormaps are configured separately.
+
+Under **Panel layout, axes, and curve style**, **Use plain Arial throughout**
+applies regular Arial to panel text. **Preserve panel canvas and vector PDF/SVG**
+keeps physical font sizes and exports source curves and text as vectors.
+Colorbar gradients and raster source panels remain images. Download the complete
+PNG/PDF/SVG/ZIP figure or choose an individual plot for PNG/PDF/SVG export.
+
+Type 3G's **Equal spacing between plotting areas** matches gaps between visible
+plot edges, including in PDF/SVG exports. Disable it to place panels manually.
+Concentration labels default to 5.5 pt and stay centered within their dose
+intervals. Overlapping text can move vertically within an interval; it never
+expands axis limits. Buffer shading, one-time units, and top-row-only labels are
+optional. Prediction panels reuse the calibration data and therefore show
+concentration reconstruction, not independent validation.
+
+Dataset-specific batch scripts, figure packages, and research notes remain
+local and Git-ignored. Shared plotting helpers are available through
+`core.paper_replay.app_functions()` for reproducible batch rendering without
+starting Streamlit. Keep saved sessions and source data separately when moving
+the workflow to another machine.
+
 ## What is deliberately not here
 
 The following stay local and are covered by `.gitignore`:

@@ -100,6 +100,12 @@ from core.composer_editing import (SOURCE_FIELDS, SOURCE_TABS, apply_source_edit
     set_linked_trace_iteration, compact_example_iterations, compact_example_roles,
     preset_with_current_selections, reset_swv_sizes, restore_compact_swv_appearance)
 from core.composer_exports import FigureExports, RENDER_LOCK
+from core.composer_settings_cache import (
+    cache_path as _composer_settings_cache_path,
+    load_cache as _composer_read_settings_cache,
+    save_cache as _composer_write_settings_cache,
+    section_state as _composer_section_state,
+)
 from bo_headless import (
     _apply_result_constraints as apply_bo_result_constraints,
     run_request as run_bo_analysis_request,
@@ -138,6 +144,8 @@ COMPOSER_METADATA_SCHEMA = "swv.figure-composer/1"
 COMPOSER_PNG_METADATA_KEY = "SWVFigureComposer"
 COMPOSER_PRESET_STORE = Path(__file__).with_name("figure_composer_presets.json")
 LEGACY_COMPOSER_PRESET_STORE = Path(__file__).with_name(".figure_composer_presets.json")
+COMPOSER_SETTINGS_CACHE_DIR = Path(__file__).with_name(".figure_composer_settings")
+COMPOSER_RENDER_VERSION = 'best-parameters-heading-v12'
 OBSERVED_PATH_COLORS = ("#e31a1c", "#000000")
 SWV_PHASE_COLORS = {
     "buffer": "#1f77b4",
@@ -1034,7 +1042,7 @@ def load_bo_session(folder: str | Path) -> dict:
     config_path = root / "bo_config_snapshot.json"
     config = _read_json(config_path) if config_path.is_file() else {}
     metadata = state.get("simulation_metadata") or {}
-    records = config.get("records") if isinstance(config, dict) else {}
+    records = (config.get("records") or {}) if isinstance(config, dict) else {}
     if (
         not history.empty
         and (
@@ -1066,6 +1074,10 @@ def load_bo_session(folder: str | Path) -> dict:
         "observations": observations,
         "history": history,
         "simulation_ground_truth": simulation_ground_truth,
+        "local_snapshot": (
+            _read_json(root / "local_snapshot.json")
+            if (root / "local_snapshot.json").is_file() else None
+        ),
     }
 
 
@@ -17542,6 +17554,18 @@ def _resolve_recorded_path_cached(
     name = PureWindowsPath(raw_text).name
     if not name:
         return None
+    experiment_root = root.parent.parent if root.parent.name == 'bo_sessions' else root.parent
+    # A moved experiment usually retains its session/experiment folder names.
+    # Rebase the recorded suffix before indexing thousands of files on a USB.
+    parts = PureWindowsPath(raw_text).parts
+    snapshot = (root / 'local_snapshot.json').is_file()
+    for base in ((root,) if snapshot else (root, experiment_root)):
+        for index in reversed(range(len(parts) - 1)):
+            if parts[index].casefold() != base.name.casefold():
+                continue
+            candidate = base.joinpath(*parts[index + 1:])
+            if candidate.resolve().is_relative_to(base.resolve()) and candidate.is_file():
+                return str(candidate)
 
     def find_recorded_file(search_root: Path) -> Path | None:
         match = _recorded_file_index(str(search_root)).get(name)
@@ -17550,6 +17574,10 @@ def _resolve_recorded_path_cached(
     match = find_recorded_file(root)
     if match is not None:
         return str(match)
+    if snapshot:
+        # Other snapshots are separate experiments, not a source of raw files.
+        # The wrapper follows only this snapshot's explicitly recorded source.
+        return None
     # Archived measurements commonly sit beside bo_sessions in the experiment
     # folder. Search that one experiment root, not every sibling session and
     # progressively broader parents such as Documents or the user's home folder.
@@ -17602,11 +17630,34 @@ def _recorded_file_index(root_text: str) -> dict[str, str]:
     return files
 
 
+@lru_cache(maxsize=32)
+def _snapshot_original_path(root_text: str, manifest_stamp: int) -> str | None:
+    try:
+        manifest = _read_json(Path(root_text) / 'local_snapshot.json')
+        source = manifest.get('offline_source') or manifest.get('original')
+        return str(source) if source else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def _resolve_recorded_path(root: Path, raw: Any) -> Path | None:
     if not raw:
         return None
     resolved = _resolve_recorded_path_cached(str(root), str(raw))
-    return Path(resolved) if resolved is not None else None
+    if resolved is not None and Path(resolved).is_file():
+        return Path(resolved)
+    # Do not cache USB availability: a snapshot may have been opened before
+    # the drive was attached, leaving negative entries in the local-path cache.
+    try:
+        stamp = (root / 'local_snapshot.json').stat().st_mtime_ns
+        original = _snapshot_original_path(str(root), stamp)
+        if original and Path(original).is_dir():
+            resolved = _resolve_recorded_path_cached(original, str(raw))
+            if resolved is not None and Path(resolved).is_file():
+                return Path(resolved)
+    except OSError:
+        pass
+    return None
 
 
 def _channel_from_path(path: Path) -> str:
@@ -20948,6 +20999,8 @@ def _plot_chronological_swv_stack(
     crop_to_minima: bool = False,
     current_axis_top: float | None = None,
     stack_legend_location: str = "upper right",
+    stack_legend_columns: int = 1,
+    stack_legend_y: float | None = None,
     stack_axis_gap: float = .08,
     stack_depth_spacing: float = 1.18,
     voltage_display_range: str | None = None,
@@ -20989,6 +21042,7 @@ def _plot_chronological_swv_stack(
                               show_ticks=show_axis_ticks, current_scale=current_axis_scale * trace_height_scale,
                               current_top=current_axis_top, normalized=normalize_to_peak,
                               legend_location=stack_legend_location,
+                              legend_columns=stack_legend_columns, legend_y=stack_legend_y,
                               axis_gap=stack_axis_gap, depth_spacing=stack_depth_spacing)
         return fig, errors
 
@@ -29003,6 +29057,18 @@ def _render_add_to_composer_button(
             "flash_key": flash_key,
         },
     )
+    selected = st.session_state.get("bo_composer_active_panel")
+    count = int(st.session_state.get("bo_composer_count", 0))
+    if isinstance(selected, int) and 0 <= selected < count:
+        container.button(
+            f"Replace selected Composer panel {chr(65 + selected)}",
+            key=f"{key}_replace_composer",
+            help="Replaces the panel content while keeping its size and position. A linked sweep becomes a custom composition.",
+            on_click=_add_plot_to_composer_callback,
+            kwargs=dict(png_bytes=png_bytes, label=resolved_label, file_stem=file_stem,
+                        figure=figure, settings=settings, camera=camera,
+                        flash_key=flash_key, replace_index=selected),
+        )
 
 
 def _add_plot_to_composer_callback(
@@ -31526,7 +31592,12 @@ def _render_app_scrollbar_style() -> None:
 
 
 _COMPOSER_STATE_EXCLUSIONS = (
+    "bo_composer_standardize_text",
+    "bo_composer_settings_cache_",
+    "bo_composer_pending_duplicates",
+    "bo_composer_add_panel",
     "bo_composer_image_upload_",
+    "bo_composer_image_clear_",
     "bo_composer_editor_",
     "bo_composer_pending_source_edit",
     "bo_composer_source_draft",
@@ -31590,6 +31661,116 @@ def _composer_widget_state(panel_count: int) -> dict[str, Any]:
             continue
         captured[key] = value
     return captured
+
+
+def _composer_settings_cache_action(session, section, restore=False):
+    """Run before widgets so saves include current edits and restores are legal."""
+    flash_key = "bo_composer_settings_cache_flash"
+    label = ("All settings" if section == "all" else "Figure-wide settings"
+             if section == "global" else f"Panel {chr(65 + int(section[6:]))} settings")
+    try:
+        path = _composer_settings_cache_path(COMPOSER_SETTINGS_CACHE_DIR, session)
+        count = int(st.session_state.get("bo_composer_count", 4))
+        current = _composer_widget_state(count)
+        if restore:
+            entry = _composer_read_settings_cache(path).get(section)
+            if entry is None:
+                raise ValueError("No saved settings for this section yet.")
+            saved = _composer_section_state(entry["state"], section)
+            if section == "all":
+                config = {"state": saved, "rescore_profile": entry.get("rescore_profile")}
+                _composer_apply_config(config)
+            else:
+                replaced = _composer_section_state(current, section)
+                for key in replaced:
+                    del st.session_state[key]
+                for key, value in saved.items():
+                    if key.startswith("bo_composer_") and not any(
+                        key.startswith(prefix) for prefix in _COMPOSER_STATE_EXCLUSIONS
+                    ):
+                        st.session_state[key] = copy.deepcopy(value)
+                for key in list(st.session_state):
+                    if str(key).startswith("bo_composer_editor_"):
+                        del st.session_state[key]
+                st.session_state["bo_composer_active_panel"] = None
+                if section == "global":
+                    st.session_state["bo_saved_figure_scoring"] = copy.deepcopy(entry.get("rescore_profile"))
+            # Pending editor checkpoints must not undo the restored settings.
+            st.session_state.pop("bo_composer_pending_panel_state", None)
+            st.session_state.pop("bo_composer_pending_source_edit", None)
+            if section in {"all", "global"}:
+                for key in list(st.session_state):
+                    if str(key).startswith(("bo_plot_", "bo_colorbar_")):
+                        del st.session_state[key]
+                for key, value in entry.get("plot_settings", {}).items():
+                    if key.startswith(("bo_plot_", "bo_colorbar_")):
+                        st.session_state[key] = copy.deepcopy(value)
+            message = f"{label} restored. Render the figure to refresh its preview."
+        else:
+            stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+            sections = [section] if section != "all" else [
+                "all", "global", *(f"panel_{index}" for index in range(count))]
+            entries = {}
+            for name in sections:
+                entry = {"state": _composer_section_state(current, name), "saved_at": stamp}
+                if name in {"all", "global"}:
+                    entry["rescore_profile"] = copy.deepcopy(session.get("active_rescore_profile"))
+                    entry["plot_settings"] = {
+                        key: value for key, value in st.session_state.items()
+                        if str(key).startswith(("bo_plot_", "bo_colorbar_"))
+                        and isinstance(value, (str, int, float, bool, list, dict, tuple, type(None)))
+                    }
+                entries[name] = entry
+            _composer_write_settings_cache(path, entries)
+            message = f"{label} saved locally. Templates are unchanged."
+        st.session_state[flash_key] = ("success", message)
+    except (OSError, ValueError, TypeError) as exc:
+        st.session_state[flash_key] = ("error", f"Could not {'restore' if restore else 'save'} settings: {exc}")
+
+
+def _composer_section_cache_controls(session, section, cached):
+    """Each section has its own latest snapshot; saving requires no preset name."""
+    columns = st.columns(2)
+    suffix = "all settings" if section == "all" else "settings"
+    columns[0].button(
+        f"Save {suffix}", key=f"bo_composer_settings_cache_save_{section}",
+        on_click=_composer_settings_cache_action, args=(session, section),
+        help="Remember every setting in this section locally, separately from templates.",
+        use_container_width=True,
+    )
+    columns[1].button(
+        f"Restore {suffix}", key=f"bo_composer_settings_cache_restore_{section}",
+        on_click=_composer_settings_cache_action, args=(session, section, True),
+        disabled=section not in cached, use_container_width=True,
+        help="Replace current edits with this section's last saved settings.",
+    )
+    if section in cached:
+        st.caption(f"Last saved: {cached[section].get('saved_at', 'unknown')}")
+
+
+def _composer_settings_cache_controls(session):
+    flash = st.session_state.pop("bo_composer_settings_cache_flash", None)
+    if flash:
+        getattr(st, flash[0])(flash[1])
+    try:
+        cached = _composer_read_settings_cache(
+            _composer_settings_cache_path(COMPOSER_SETTINGS_CACHE_DIR, session))
+    except (OSError, ValueError) as exc:
+        st.warning(f"Could not read saved settings: {exc}")
+        cached = {}
+    with st.expander("Local settings cache", expanded=False):
+        st.caption(
+            "Save all settings, or save each panel separately inside its section. "
+            "Settings persist across app restarts for this experiment and group. "
+            "Restore all returns to the last Save all snapshot; individual saves update only that section. "
+            "Templates are unchanged. Reopen source data or recapture plots when needed; "
+            "this cache stores settings, not captured plot data."
+        )
+        _composer_section_cache_controls(session, "all", cached)
+        st.markdown("**Figure-wide settings**")
+        st.caption("Canvas, fonts, layout mode, borders, shared source controls and scoring. Panel count and individual panel settings are preserved.")
+        _composer_section_cache_controls(session, "global", cached)
+    return cached
 
 
 def _composer_clean_panel_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
@@ -32080,7 +32261,7 @@ def _composer_preset_save_controls(
 ) -> str:
     """Submit the name with Save; the same name updates an existing preset."""
     st.markdown("**Reusable preset**")
-    st.caption("Every preset is editable, including Types 1 / 1A / 1B / 2 / 2A. Same name = update; new name = save a copy. Apply pending panel/layout edits first. No rendering or Enter key required.")
+    st.caption("Every preset is editable, including Types 1 / 1A / 1B / 2 / 2A / 2B. Same name = update; new name = save a copy. Apply pending panel/layout edits first. No rendering or Enter key required.")
     # A form batches the still-focused text input with the click. Separate
     # widgets could submit Save before the browser committed the typed name.
     with st.form('bo_composer_preset_save_form', border=False):
@@ -32757,20 +32938,88 @@ def _paper_bo_validation_focused_preset() -> dict[str, Any]:
         layout="Manual",
         kinds=(),
     )
-    selected = st.session_state.get("bo_composer_active_panel")
-    count = int(st.session_state.get("bo_composer_count", 0))
-    if isinstance(selected, int) and 0 <= selected < count:
-        container.button(
-            f"Replace selected Composer panel {chr(65 + selected)}",
-            key=f"{key}_replace_composer",
-            help="Replaces the panel content while keeping its size and position. A linked sweep becomes a custom composition.",
-            on_click=_add_plot_to_composer_callback,
-            kwargs=dict(png_bytes=png_bytes, label=resolved_label, file_stem=file_stem,
-                        figure=figure, settings=settings, camera=camera,
-                        flash_key=flash_key, replace_index=selected),
-        )
 
 
+def _paper_bo_validation_best_path_preset() -> dict[str, Any]:
+    """Q history above the chronological stack left, full-height cube right."""
+    reference = _paper_bo_validation_focused_preset()["config"]["state"]
+    reference_width, reference_height = COMPOSER_CANVAS_SIZES[reference["bo_composer_aspect"]]
+    canvas_width, canvas_height = COMPOSER_CANVAS_SIZES["16:9"]
+    # Reuse Type 2A's Q size and typography; the cube spans the right column.
+    rects = []
+    typography = {}
+    for index, source, bottom in ((0, 1, .755), (1, 0, .04)):
+        width = reference[f"bo_composer_width_{source}"] * reference_width / canvas_width
+        height = reference[f"bo_composer_height_{source}"] * reference_height / canvas_height
+        rects.append(((.5 - width) / 2, bottom, width, height))
+        for field in ("text_size", "title_size", "axis_label_size", "tick_size", "legend_size"):
+            key = f"bo_composer_{field}_{source}"
+            if key in reference:
+                typography[f"bo_composer_{field}_{index}"] = reference[key]
+        typography.setdefault(f"bo_composer_text_size_{index}", reference["bo_composer_font_size"])
+    rects = [(.03, .70, rects[0][2], rects[0][3]),
+             (.48, .05, .50, .90), (.02, .05, .43, .60)]
+    # Reuse the validation stack's appearance/processing, not its saved channel
+    # or excluded iterations. The linked validation selector supplies the data.
+    stack_reference = _paper_bo_validation_preset()["config"]["state"]
+    stack_style = {}
+    for key, value in stack_reference.items():
+        if not key.endswith('_3'):
+            continue
+        field = key[len('bo_composer_'):-2]
+        if (field.startswith('stack_') and field not in {'stack_channels', 'stack_phases'}) or field in {
+            'text_size', 'title_size', 'axis_label_size', 'tick_size', 'legend_size',
+            'hide_title', 'iteration_label_padding', 'correct_baseline_jumps',
+            'jump_minimum_uA', 'jump_sensitivity',
+        }:
+            stack_style[f'bo_composer_{field}_2'] = copy.deepcopy(value)
+    return _composer_builtin_preset(
+        "Type 2B - Q history and best-point path",
+        layout="Manual",
+        kinds=("Global trend", "Measured 3D tensor", "Chronological SWV stack"),
+        rects=rects,
+        aspect="16:9",
+        extra_state={
+            **typography,
+            **stack_style,
+            "bo_composer_type2b_layout_version": 3,
+            "bo_composer_type2b_colorbar_version": 1,
+            "bo_composer_type2b_path_style_version": 1,
+            "bo_composer_font": reference["bo_composer_font"],
+            "bo_composer_font_size": reference["bo_composer_font_size"],
+            "bo_composer_validation_linked": True,
+            "bo_composer_global_metric_0": "Q_run",
+            "bo_composer_global_running_mean_0": 0,
+            "bo_composer_show_best_0": True,
+            "bo_composer_show_best_1": True,
+            "bo_composer_measured_metric_1": "Paired Q",
+            "bo_composer_measured_x_1": "amplitude",
+            "bo_composer_measured_y_1": "step_potential",
+            "bo_composer_measured_z_1": "frequency",
+            "bo_composer_camera_x_1": reference.get("bo_composer_camera_x_0", 1.65),
+            "bo_composer_camera_y_1": reference.get("bo_composer_camera_y_0", 1.15),
+            "bo_composer_camera_z_1": reference.get("bo_composer_camera_z_0", 1.10),
+            "bo_composer_camera_zoom_1": reference.get("bo_composer_camera_zoom_0", 1.0),
+            "bo_composer_type2b_cube_style_version": 1,
+            "bo_composer_measured_iteration_path_1": True,
+            "bo_composer_measured_stop_at_best_1": True,
+            "bo_composer_measured_path_projection_1": False,
+            "bo_composer_path_endpoints_1": False,
+            "bo_composer_fade_path_1": False,
+            "bo_composer_path_width_1": 2.0,
+            "bo_composer_show_highlight_labels_1": True,
+            "bo_composer_best_dx_1": -36,
+            "bo_composer_best_dy_1": -10,
+            "bo_composer_start_dx_1": -12,
+            "bo_composer_start_dy_1": -16,
+            "bo_composer_measured_dot_size_1": reference.get("bo_composer_measured_dot_size_0", 10),
+            "bo_composer_measured_colorbar_side_1": "right",
+            "bo_composer_show_label_0": False,
+            "bo_composer_show_label_1": False,
+            "bo_composer_show_label_2": False,
+            "bo_composer_show_best_2": False,
+        },
+    )
 def _composer_channel_options_by_kind(
     real_channels: Sequence[str],
     trace_channels: Sequence[str],
@@ -33118,7 +33367,10 @@ def _composer_draw_global(
     history = history.sort_values('iteration') if 'iteration' in history else history
     x, y = _composer_metric_series(history, metric)
     line_color = _plot_line_color_override() or "#1f77b4"
-    ax.plot(x, y, marker="o", markersize=3, linewidth=1.5, color=line_color, label=metric)
+    label = 'Q score' if metric == 'Q_run' else metric
+    if metric == 'Q_run' and not spec.get('show_q_score_legend', True):
+        label = '_nolegend_'
+    ax.plot(x, y, marker="o", markersize=3, linewidth=1.5, color=line_color, label=label)
     if int(running_mean_window or 0) > 1 and len(y):
         mean = y.rolling(int(running_mean_window), min_periods=1).mean()
         ax.plot(
@@ -33135,7 +33387,7 @@ def _composer_draw_global(
                 color=spec.get('best_color', '#c2188b'), lw=1.4, label='Best so far')
     if len(ax.lines) > 1:
         ax.legend(fontsize=max(6, font_size - 2))
-    ax.set(xlabel="Iteration Number", ylabel=_metric_label(metric),
+    ax.set(xlabel="Iteration Number", ylabel='Q score' if metric == 'Q_run' else _metric_label(metric),
            title="Iteration Quality Score" if metric == "Q_run" else _metric_label(metric))
     ax.grid(alpha=.25)
 
@@ -33916,6 +34168,22 @@ def _composer_axis_label_size(spec, name, default=None):
     return shared
 
 
+def _composer_standardize_text_sizes():
+    """Apply the chosen canvas point size to every editable panel's text roles."""
+    state = st.session_state
+    size = float(state.get('bo_composer_font_size', 9))
+    for index in range(int(state.get('bo_composer_count', 0))):
+        state[f'bo_composer_text_size_{index}'] = int(size)
+        for field in ('title_size', 'axis_label_size', 'tick_size',
+                      'legend_size', 'x_axis_size', 'y_axis_size', 'z_axis_size'):
+            state[f'bo_composer_{field}_{index}'] = size
+        state[f'bo_composer_individual_axis_sizes_{index}'] = False
+        state[f'bo_composer_auto_fit_title_{index}'] = False
+    for key in list(state):
+        if str(key).startswith(('bo_composer_editor_', 'bo_composer_render_', 'bo_composer_exports_')):
+            del state[key]
+
+
 def _composer_tick_values(value):
     """Parse explicit numeric tick positions without silently dropping bad input."""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -34257,7 +34525,7 @@ def _composer_axis_overrides(axis, spec):
                 if size is not None:
                     artist.set_fontsize(float(size))
                 if name == 'z':
-                    pad = float(spec.get('iteration_label_padding', 34.))
+                    pad = float(spec.get('iteration_label_padding', 50.))
                     if hasattr(artist, '_axis_padding'):
                         artist._axis_padding = pad
                     else:
@@ -34889,6 +35157,12 @@ def _composer_zero_q_grid(spec, heatmap):
 def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.Figure:
     points = _composer_real_points(spec, observations)
     view = COMPOSER_MEASURED_LANDSCAPE_VIEWS[spec["kind"]]
+    if (view == "3D tensor" and spec.get("stop_at_best")
+            and spec.get("best_iteration") is not None and "iteration" in points):
+        visible = points[pd.to_numeric(points["iteration"], errors="coerce")
+                         <= int(spec["best_iteration"])]
+        if not visible.empty:
+            points = visible
     if points.empty:
         return _composer_plotly_message("No measured points are available.")
     if not spec.get("x"):
@@ -34933,6 +35207,13 @@ def _composer_build_real_landscape(spec: dict, observations: list[dict]) -> go.F
         show_2d_contours=spec.get("show_contours", False),
     )
     if view == "2D map":
+        if not spec.get("show_q_colorbar", True):
+            for trace in figure.data:
+                if hasattr(trace, "showscale"):
+                    trace.showscale = False
+                marker = getattr(trace, "marker", None)
+                if marker is not None and hasattr(marker, "showscale"):
+                    marker.showscale = False
         heatmap = next((trace for trace in figure.data if trace.type == "heatmap"), None)
         zero_grid = _composer_zero_q_grid(spec, heatmap)
         if zero_grid is not None:
@@ -35303,6 +35584,8 @@ def _composer_build_chronological_swv(
         voltage_max=spec.get("voltage_max"),
         current_axis_top=spec.get("current_axis_top") or None,
         stack_legend_location=spec.get("stack_legend_location", "upper right"),
+        stack_legend_columns=spec.get("stack_legend_columns", 1),
+        stack_legend_y=spec.get("stack_legend_y"),
         stack_axis_gap=spec.get('stack_axis_gap', .08),
         stack_depth_spacing=spec.get('stack_depth_spacing', 1.18),
     )
@@ -35387,6 +35670,8 @@ def _composer_build_hyperparameter_plot(
 COMPOSER_CANVAS_SIZES = {
     "Sweep workspace (9 x 10 in)": (9.0, 10.0),
     "Sweep wide workspace (14 x 10 in)": (14.0, 10.0),
+    "BO path workspace (6.4 x 9 in)": (6.4, 9.0),
+    "BO path and stack workspace (12.8 x 9 in)": (12.8, 9.0),
     # Presentation canvases (large; text is scaled down when placed in a paper).
     "4:3": (12, 9),
     "16:9": (12.8, 7.2),
@@ -35645,13 +35930,115 @@ def _composer_draw_slice(fig, ax, spec, observations):
         ax.xaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
     if spec["y"] == "frequency":
         ax.set_yticks([t for t in (100,200,300,400,500) if y.min() <= t <= y.max()+2])
-    bar_ax = ax.inset_axes([1.045, 0, .04, 1])
-    bar = fig.colorbar(mesh, cax=bar_ax)
-    text_size = float(spec.get("text_size", 10))
-    bar.ax.set_title("Q" if spec["metric"] == "Paired Q" else spec["metric"], fontsize=text_size)
-    bar.ax.tick_params(labelsize=text_size*.85, length=2, pad=2)
-    bar.outline.set_linewidth(.5)
+    if spec.get("show_q_colorbar", True):
+        bar_ax = ax.inset_axes([1.045, 0, .04, 1])
+        bar = fig.colorbar(mesh, cax=bar_ax)
+        text_size = float(spec.get("text_size", 10))
+        bar.ax.set_title("Q" if spec["metric"] == "Paired Q" else spec["metric"], fontsize=spec.get('axis_label_size', text_size))
+        bar.ax.tick_params(labelsize=spec.get('tick_size', text_size*.85), length=2, pad=2)
+        bar.outline.set_linewidth(.5)
     ax._composer_slice_title = _composer_landscape_header(spec)
+
+
+def _composer_best_parameter_text(spec, points):
+    if (not spec.get('show_best_parameters') or spec.get('best_iteration') is None
+            or points.empty or 'iteration' not in points):
+        return ''
+    rows = points[points['iteration'] == spec['best_iteration']]
+    if rows.empty:
+        return ''
+    row = rows.iloc[0]
+    values = []
+    for key, label, factor, unit in (
+        ('frequency', 'Frequency', 1., 'Hz'),
+        ('amplitude', 'Amplitude', 1., 'V'),
+        ('step_potential', 'Step size', 1000., 'mV'),
+    ):
+        value = _finite_float(row.get(key))
+        if value is not None:
+            values.append(f'{label}: {value*factor:.4g} {unit}')
+    if not values:
+        return ''
+    return 'Best:\n' + '\n'.join(values)
+
+
+def _composer_place_best_parameters(ax):
+    """Find open space inside the projected cube, avoiding points and callouts."""
+    from mpl_toolkits.mplot3d import proj3d
+    from matplotlib.path import Path as PlotPath
+    from scipy.spatial import ConvexHull
+    fig, note = ax.figure, ax._composer_parameter_note
+    renderer = fig.canvas.get_renderer()
+    gap = renderer.points_to_pixels(8.)
+    bounds = ax.get_tightbbox(renderer)
+    # The fallback is measured after the Best/Start/Final callouts and axis
+    # labels exist, so changing their offsets cannot collide with this note.
+    below = fig.transFigure.inverted().transform([
+        ax.bbox.x0 + ax.bbox.width/2, bounds.y0-gap])
+    note.set(ha='center', va='top', position=below)
+    if ax._composer_parameter_placement == 'Below cube' or ax.name != '3d':
+        return
+    vertices = np.array(list(itertools.product(ax.get_xlim(), ax.get_ylim(), ax.get_zlim())))
+    px, py, _ = proj3d.proj_transform(*vertices.T, ax.get_proj())
+    projected = ax.transData.transform(np.column_stack([px, py]))
+    hull = projected[ConvexHull(projected).vertices]
+    silhouette = PlotPath(np.vstack([hull, hull[0]]))
+    cube_box = Bbox.from_extents(*projected.min(axis=0), *projected.max(axis=0))
+    obstacles = []
+    for other in fig.axes:
+        if other is not ax:
+            obstacles.append(other.get_tightbbox(renderer))
+    for text in [*ax.texts, ax.xaxis.label, ax.yaxis.label, ax.zaxis.label,
+                 *ax.get_xticklabels(), *ax.get_yticklabels(), *ax.get_zticklabels(), *fig.texts]:
+        if text is not note and text.get_visible() and text.get_text():
+            obstacles.append(text.get_window_extent(renderer))
+    # Project the actual cube edges and trajectory, not their enclosing box:
+    # most of that box is precisely the whitespace where the note belongs.
+    strokes = []
+    for line in ax.lines:
+        if line.get_visible() and hasattr(line, 'get_data_3d'):
+            lx, ly, _ = proj3d.proj_transform(*line.get_data_3d(), ax.get_proj())
+            strokes.append(PlotPath(ax.transData.transform(np.column_stack([lx, ly]))))
+    markers = []
+    for collection in ax.collections:
+        if collection.get_visible() and hasattr(collection, '_offsets3d'):
+            mx, my, _ = proj3d.proj_transform(*collection._offsets3d, ax.get_proj())
+            locations = ax.transData.transform(np.column_stack([mx, my]))
+            sizes = collection.get_sizes()
+            radius = renderer.points_to_pixels(np.sqrt(max(sizes, default=36.)) / 2) + gap/4
+            markers.extend(Bbox.from_bounds(x-radius, y-radius, 2*radius, 2*radius)
+                           for x, y in locations)
+    extent = note.get_window_extent(renderer)
+    half = np.array([extent.width, extent.height])/2 + gap/2
+    best_choice = None
+    for x in np.linspace(cube_box.x0+half[0], cube_box.x1-half[0], 27):
+        for y in np.linspace(cube_box.y0+half[1], cube_box.y1-half[1], 27):
+            box = Bbox.from_extents(x-half[0], y-half[1], x+half[0], y+half[1])
+            corners = np.array(list(itertools.product((box.x0, box.x1), (box.y0, box.y1))))
+            if not silhouette.contains_points(corners).all():
+                continue
+            # Prefer a completely clear rectangle, then maximize clearance
+            # around it. Text callouts take precedence over path segments.
+            text_hits = sum(box.overlaps(b) for b in obstacles if b is not None)
+            point_hits = sum(box.overlaps(b) for b in markers)
+            line_hits = sum(path.intersects_bbox(box, filled=False) for path in strokes)
+            clearance = 0
+            if not (text_hits or point_hits or line_hits):
+                for margin in (gap/2, gap, gap*2, gap*3):
+                    larger = box.padded(margin)
+                    outer = np.array(list(itertools.product((larger.x0, larger.x1), (larger.y0, larger.y1))))
+                    if (not silhouette.contains_points(outer).all()
+                            or any(larger.overlaps(b) for b in [*obstacles, *markers] if b is not None)
+                            or any(path.intersects_bbox(larger, filled=False) for path in strokes)):
+                        break
+                    clearance = margin
+            score = (text_hits, point_hits, line_hits, -clearance,
+                     abs(y-(cube_box.y0+.35*cube_box.height)), abs(x-cube_box.x0-cube_box.width/2))
+            if best_choice is None or score < best_choice[0]:
+                best_choice = (score, (x, y))
+    if best_choice is not None:
+        note.set(ha='center', va='center', multialignment='left',
+                 position=fig.transFigure.inverted().transform(best_choice[1]))
 
 
 def _composer_draw_cube(fig, slot, spec, observations):
@@ -35659,14 +36046,38 @@ def _composer_draw_cube(fig, slot, spec, observations):
     scene viewport clipping axis labels or separate helper colorbars."""
     if not spec.get("show_example_markers", True):
         spec = {**spec, "highlight_iterations": []}
+    points = _composer_real_points(spec, observations)
+    parameter_text = _composer_best_parameter_text(spec, points)
+    if parameter_text:
+        note_size = float(spec.get('legend_size', spec.get('text_size', 10)*.85))
+        # Wrap values rather than shrinking their requested point size.
+        font_properties = font_manager.FontProperties(size=note_size)
+        renderer = fig.canvas.get_renderer()
+        available = spec['rect'][2] * fig.bbox.width * .85
+        parameter_text = '\n'.join(
+            line.replace(' · ', '\n') if renderer.get_text_width_height_descent(
+                line, font_properties, False)[0] > available else line
+            for line in parameter_text.split('\n'))
+        note_height = (note_size * 1.2 * len(parameter_text.splitlines()) + 12.) / (72. * fig.get_figheight())
     if spec.get("log_frequency"):
         # Preserve the existing logarithmic projection for advanced panels.
+        rect = list(spec['rect'])
+        if parameter_text:
+            rect[1] += note_height
+            rect[3] = max(.15*spec['rect'][3], rect[3]-note_height)
+            slot.set_position(rect)
         _composer_draw_embedded_figure(
             fig, slot, _composer_build_real_landscape(spec, observations),
-            spec["rect"], 180, spec.get("text_size", 10), spec.get("colorbar_side"),
+            rect, 180, spec.get("text_size", 10), spec.get("colorbar_side"),
         )
+        if parameter_text:
+            note = fig.text(rect[0]+rect[2]/2, spec['rect'][1], parameter_text,
+                            fontsize=note_size, ha='center', va='bottom')
+            note._composer_fixed_fontsize = note_size
+            slot._composer_parameter_note = note
+            slot._composer_parameter_placement = 'Below cube'
+            slot._composer_parameter_rect = spec['rect']
         return slot
-    points = _composer_real_points(spec, observations)
     axes = [spec.get(k) for k in ("x", "y", "z")]
     if points.empty or any(k not in points for k in axes):
         _composer_error_panel(slot, "No measured cube data.")
@@ -35685,13 +36096,33 @@ def _composer_draw_cube(fig, slot, spec, observations):
         cube_rect = [left+.20*width, bottom+.08*height, .77*width, .84*height]
     else:
         cube_rect = [left+.03*width, bottom+.08*height, .77*width, .84*height]
+    if parameter_text and spec.get('best_parameters_placement') == 'Below cube':
+        # Reserve physical space for a readable fallback below the cube,
+        # including its axis titles. The panel fitter preserves point sizes.
+        cube_rect[1] += note_height
+        cube_rect[3] = max(.15*height, cube_rect[3] - note_height)
     ax = fig.add_axes(cube_rect, projection="3d", computed_zorder=False)
     ax.set_facecolor("none")
+    if parameter_text:
+        note = fig.text(left + width*.45, bottom + height*.02, parameter_text,
+                        fontsize=note_size, ha='center', va='bottom',
+                        bbox=dict(facecolor='white', edgecolor='none', pad=3), zorder=70)
+        note._composer_fixed_fontsize = note_size
+        ax._composer_parameter_note = note
+        ax._composer_parameter_placement = spec.get('best_parameters_placement', 'Automatic')
+        ax._composer_parameter_rect = spec['rect']
     font = float(spec.get("text_size", 10))
+    all_points = points
+    best = spec.get('best_iteration')
+    if spec.get('stop_at_best') and best is not None and 'iteration' in points:
+        visible = points[pd.to_numeric(points['iteration'], errors='coerce') <= int(best)]
+        if not visible.empty:
+            points = visible
     transforms = [1000.0 if k == "step_potential" else 1.0 for k in axes]
     coords = [points[k].to_numpy(float)*factor for k, factor in zip(axes, transforms)]
     values = points["value"].to_numpy(float)
-    limits = [(float(np.nanmin(a)), float(np.nanmax(a))) for a in coords]
+    full_coords = [all_points[k].to_numpy(float)*factor for k, factor in zip(axes, transforms)]
+    limits = [(float(np.nanmin(a)), float(np.nanmax(a))) for a in full_coords]
     limits = [(lo, hi if hi > lo else lo + 1) for lo, hi in limits]
     cmap = plt.get_cmap(str(spec.get("colorscale", "Viridis")).lower())
     color_limits = (
@@ -35759,8 +36190,7 @@ def _composer_draw_cube(fig, slot, spec, observations):
                    c=selected_colors, marker=marker, edgecolors="white", linewidths=1.3, depthshade=False, zorder=50)
         for position, color in zip(zip(*[a[mask] for a in coords]), selected_colors):
             highlighted_positions.append((position, int(iteration), color, marker))
-    best = spec.get('best_iteration')
-    if best is not None:
+    if best is not None and spec.get('show_best', True):
         mask = points['iteration'].to_numpy() == best
         color = spec.get('best_color', '#c2188b')
         ax.scatter(*[a[mask] for a in coords], s=(float(spec.get('dot_size', 6))+3)**2,
@@ -35775,20 +36205,34 @@ def _composer_draw_cube(fig, slot, spec, observations):
     if spec.get("show_iteration_path", False):
         from matplotlib.colors import LinearSegmentedColormap
         path = _composer_iteration_path_frame(points)
-        path_cmap = LinearSegmentedColormap.from_list("bo_iteration", ["#ee2222", "#111111"])
+        path_cmap = LinearSegmentedColormap.from_list("bo_iteration", ["#e8a0aa", "#c34b78", "#55105c"])
         if path is not None and len(path) > 1:
             path_norm = Normalize(float(path.iteration.min()), float(path.iteration.max()))
             for _, group in path.groupby("group_id"):
                 group = group.sort_values("iteration")
+                if spec.get('show_path_projection'):
+                    projected = [group[k].to_numpy(float)*factor for k, factor in zip(axes,transforms)]
+                    ax.plot(projected[0], projected[1], np.full(len(group), limits[2][0]),
+                            color='#79858a', linewidth=.65, alpha=.36, linestyle='--')
+                    ax.plot(projected[0], np.full(len(group), limits[1][1]), projected[2],
+                            color='#79858a', linewidth=.65, alpha=.26, linestyle='--')
                 for position in range(1, len(group)):
                     pair = group.iloc[position-1:position+1]
                     age = float(path_norm(pair.iteration.iloc[-1]))
-                    ax.plot(*[pair[k].to_numpy()*factor for k,factor in zip(axes,transforms)],
-                            linewidth=spec.get('path_line_width', .8),
-                            alpha=(.15+.85*age) if spec.get('fade_path') else 1.,
+                    line, = ax.plot(*[pair[k].to_numpy()*factor for k,factor in zip(axes,transforms)],
+                            linewidth=spec.get('path_line_width', 2.0),
+                            alpha=(.55+.45*age) if spec.get('fade_path') else 1.,
                             color=path_cmap(age))
-                if spec.get('show_path_endpoints'):
-                    for row, symbol, label in ((group.iloc[0], 's', 'Start'), (group.iloc[-1], '^', 'Final')):
+                    line._composer_fixed_linewidth = spec.get('path_line_width', 2.0)
+                    line._composer_iteration_path = True
+                legacy_endpoints = bool(spec.get('show_path_endpoints', False))
+                endpoints = []
+                if spec.get('show_path_start', legacy_endpoints):
+                    endpoints.append((group.iloc[0], 's', 'Start'))
+                if spec.get('show_path_final', legacy_endpoints) and not spec.get('stop_at_best'):
+                    endpoints.append((group.iloc[-1], '^', 'Final'))
+                if endpoints:
+                    for row, symbol, label in endpoints:
                         location = [float(row[k])*factor for k,factor in zip(axes,transforms)]
                         color = '#007a78' if label == 'Start' else '#202020'
                         ax.scatter(*location, marker=symbol, s=120, color=color, edgecolors='white', linewidths=1.2, depthshade=False, zorder=55)
@@ -35797,10 +36241,10 @@ def _composer_draw_cube(fig, slot, spec, observations):
                                   spec.get(prefix+'_label_dy', -20 if prefix == 'start' else 10))
                         ax._composer_endpoint_labels.append((location, f'{label} · iter {int(row.iteration)}', color, offset))
             # Keep both scales adjacent to the cube, with independent labels.
-            iteration_ax = fig.add_axes([left+1.02*width, bottom+.24*height, .018*width, .55*height])
+            iteration_ax = fig.add_axes([left+1.02*width, bottom+.24*height, .030*width, .55*height])
             iteration_bar = fig.colorbar(plt.cm.ScalarMappable(norm=path_norm, cmap=path_cmap), cax=iteration_ax)
-            iteration_bar.ax.set_title("Iteration", fontsize=font*.8, pad=7)
-            iteration_bar.ax.tick_params(labelsize=font*.75, length=2, pad=1)
+            iteration_bar.ax.set_title("Iteration", fontsize=spec.get('axis_label_size', font), pad=7)
+            iteration_bar.ax.tick_params(labelsize=spec.get('tick_size', font*.85), length=2, pad=1)
             iteration_bar.outline.set_linewidth(.5)
     eye = (spec.get("camera") or {}).get("eye") or {"x":1.45,"y":1.45,"z":1.15}
     x,y,z = (float(eye.get(k,1)) for k in ("x","y","z"))
@@ -35814,13 +36258,15 @@ def _composer_draw_cube(fig, slot, spec, observations):
     bar_inset = float(spec.get("q_colorbar_inset", 0.0)) / 100.0
     bar_x += width * bar_inset * (1 if colorbar_side == "left" and not path_view else -1)
     bar_ax = fig.add_axes([bar_x, bottom+height*.24, width*.018, height*.55])
+    if path_view:
+        bar_ax._composer_cube_axis = ax
     if iteration_ax is not None:
         # Follow the Q bar's final, inset-adjusted position instead of retaining
         # a separate absolute lane. Keep only a compact readable gap.
         q_position = bar_ax.get_position()
         iteration_position = [
             q_position.x1 + width*.035, q_position.y0,
-            width*.018, q_position.height,
+            width*.030, q_position.height,
         ]
         # Colorbar installs an axes locator that otherwise restores its old
         # fixed lane on draw, undoing set_position().
@@ -35828,8 +36274,8 @@ def _composer_draw_cube(fig, slot, spec, observations):
         iteration_ax.set_position(iteration_position, which="both")
         iteration_ax._composer_follow_q_axis = bar_ax
     bar = fig.colorbar(plt.cm.ScalarMappable(norm=norm,cmap=cmap), cax=bar_ax)
-    bar.ax.set_title("Q" if spec["metric"] == "Paired Q" else spec["metric"], fontsize=font, pad=4)
-    bar.ax.tick_params(labelsize=font*.85, length=2, pad=2)
+    bar.ax.set_title("Q" if spec["metric"] == "Paired Q" else spec["metric"], fontsize=spec.get('axis_label_size', font), pad=4)
+    bar.ax.tick_params(labelsize=spec.get('tick_size', font*.85), length=2, pad=2)
     bar.outline.set_linewidth(.5)
     return ax
 
@@ -35887,10 +36333,13 @@ def _composer_draw_parallel(ax, spec, observations, selected_iteration=None):
 def _composer_cube_annotations(ax, text_size):
     """Place the title and point IDs using the projected cube, not its slot."""
     from mpl_toolkits.mplot3d import proj3d
+    typography = getattr(ax, '_composer_typography', {})
+    title_size = typography.get('title_size', text_size)
+    note_size = typography.get('legend_size', text_size*.85)
     for position, label, color, offset in getattr(ax, '_composer_endpoint_labels', []):
         x, y, _ = proj3d.proj_transform(*position, ax.get_proj())
         ax.annotate(label, xy=(x, y), xytext=offset, textcoords='offset points',
-                    fontsize=text_size*.85, color=color, zorder=60,
+                    fontsize=note_size, color=color, zorder=60,
                     bbox=dict(facecolor='white', edgecolor=color, boxstyle='round,pad=.25', alpha=.96),
                     arrowprops=dict(arrowstyle='-', color=color, lw=1.1))
     bounds = [ax.get_xlim(), ax.get_ylim(), ax.get_zlim()]
@@ -35901,15 +36350,15 @@ def _composer_cube_annotations(ax, text_size):
         float((projected[:,0].min()+projected[:,0].max())/2),
         float(projected[:,1].max()+.025),
         getattr(ax, "_composer_cube_title", ""),
-        transform=ax.transAxes, ha="center", va="bottom", fontsize=text_size,
+        transform=ax.transAxes, ha="center", va="bottom", fontsize=title_size,
     )
     if not getattr(ax, "_composer_show_highlight_labels", True):
         return
     for n, (position, iteration, color, marker) in enumerate(getattr(ax, "_composer_highlight_positions", [])):
         x,y,_ = proj3d.proj_transform(*position, ax.get_proj())
         ax.annotate(
-            f"{'Best' if iteration == getattr(ax, '_composer_best_iteration', None) else 'Iter'} {iteration}", xy=(x,y), xytext=(getattr(ax, '_composer_best_label_offset', (-65,-15)) if iteration == getattr(ax, '_composer_best_iteration', None) else (14, 18 if n % 2 == 0 else -22)),
-            textcoords="offset points", ha="left", color=color, fontsize=text_size*.85,
+            f"{'Best · iter' if iteration == getattr(ax, '_composer_best_iteration', None) else 'Iter'} {iteration}", xy=(x,y), xytext=(getattr(ax, '_composer_best_label_offset', (-65,-15)) if iteration == getattr(ax, '_composer_best_iteration', None) else (14, 18 if n % 2 == 0 else -22)),
+            textcoords="offset points", ha="left", color=color, fontsize=note_size,
             bbox=dict(facecolor="white", edgecolor=color, boxstyle="round,pad=.18", alpha=.95),
             arrowprops=dict(arrowstyle="-",color=color,lw=.8), zorder=60,
         )
@@ -35995,8 +36444,12 @@ def _build_composer_figure_inner(
             if _history_metric_impacts_q(metric, session["config"], paired_objective)
         }
         panel_snapshots = []
+        all_observations, all_history = observations, history
         for index, spec in enumerate(specs):
             spec = dict(spec)
+            observations, history = _composer_panel_scope(spec, all_observations, all_history)
+            if 'optimization_direction' in history and history['optimization_direction'].nunique() == 1:
+                spec['optimization_direction'] = str(history['optimization_direction'].iloc[0])
             if spec.get("image_native_pixels"):
                 spec["rect"] = _composer_native_image_rect(
                     spec["rect"], spec["image_native_pixels"], canvas_size,
@@ -36011,7 +36464,7 @@ def _build_composer_figure_inner(
             selection_history = history
             if spec.get('group_id') is not None:
                 _, selection_history = _composer_group_scope(observations, history, spec['group_id'])
-            spec['best_iteration'] = _composer_best_iteration(selection_history) if spec.get('show_best') else None
+            spec['best_iteration'] = _composer_best_iteration(selection_history) if (spec.get('show_best') or spec.get('stop_at_best') or spec.get('show_best_parameters')) else None
             panel_snapshots.append((set(fig.axes), set(fig.texts), set(fig.artists)))
             ax = fig.add_axes(spec["rect"])
             kind = spec["kind"]
@@ -36023,6 +36476,8 @@ def _build_composer_figure_inner(
                     _, trend_history = _composer_group_scope(observations, history, spec['group_id'])
                 elif 'group_id' in history and history['group_id'].nunique() > 1:
                     raise ValueError('Select one optimizer group for the Q / global trend panel; all-group concatenation is not a single BO trajectory.')
+                if 'optimization_direction' in trend_history and trend_history['optimization_direction'].nunique() > 1:
+                    raise ValueError('Select maximize or minimize for this Q panel; they are separate optimizer runs.')
                 _composer_draw_global(
                     ax,
                     trend_history,
@@ -36069,6 +36524,7 @@ def _build_composer_figure_inner(
                     ax.set_title("")
             elif kind == "Measured 3D tensor":
                 ax = _composer_draw_cube(fig, ax, spec, observations)
+                ax._composer_typography = spec
                 if hasattr(ax, "get_proj"):
                     ax._composer_cube_title = panel_header or _composer_landscape_header(spec).replace("Ch ", "Channel ")
                     panel_header = ""
@@ -36212,6 +36668,8 @@ def _build_composer_figure_inner(
             ax.title.set_fontsize(title_text_size)
             ax.xaxis.label.set_fontsize(axis_label_size)
             ax.yaxis.label.set_fontsize(axis_label_size)
+            if hasattr(ax, 'zaxis'):
+                ax.zaxis.label.set_fontsize(axis_label_size)
             ax.tick_params(labelsize=tick_text_size)
             _composer_axis_overrides(ax, spec)
             legend = ax.get_legend()
@@ -36252,9 +36710,19 @@ def _build_composer_figure_inner(
                     spine.set_linewidth(.8)
                 # Recreating the legend must retain the independently edited
                 # size, not silently replace it with Plot text minus one.
-                ax.legend(loc="upper left", frameon=True, fontsize=legend_text_size)
+                handles, labels = ax.get_legend_handles_labels()
+                if handles:
+                    ax.legend(handles, labels, loc="upper left", frameon=True, fontsize=legend_text_size)
+                elif ax.get_legend() is not None:
+                    ax.get_legend().remove()
             if kind == "Measured 2D map":
-                ax.set_title(getattr(ax, "_composer_slice_title", ""), fontsize=panel_text_size, pad=4)
+                # Keep custom and automatic titles attached to the map as its
+                # bounds change (for example when the Q colorbar is hidden).
+                ax.set_title(
+                    panel_header or getattr(ax, "_composer_slice_title", ""),
+                    fontsize=title_text_size, pad=4, loc="center",
+                )
+                panel_header = ""
                 for spine in ax.spines.values():
                     spine.set_visible(True)
                     spine.set_color(spec.get("border_color") or "#000000")
@@ -36417,6 +36885,10 @@ def _build_composer_figure_inner(
     for cube in fig.axes:
         if hasattr(cube, "_composer_cube_title"):
             _composer_cube_annotations(cube, cube.xaxis.label.get_fontsize())
+    fig.canvas.draw()
+    for cube in fig.axes:
+        if hasattr(cube, '_composer_parameter_note'):
+            _composer_place_best_parameters(cube)
     from core.composer_bounds import fit_panel_bounds
     fit_panel_bounds(fig, [group for group, spec in zip(panel_groups, specs)
                            if not spec.get("image_native_pixels")], preserve_font_sizes=True)
@@ -36425,22 +36897,55 @@ def _build_composer_figure_inner(
         if refresh is not None:
             refresh()
     # Bounds fitting can rescale a cube panel. Re-anchor paired scales only
-    # after that final geometry pass so Q and Iteration retain a fixed small
-    # screen-space gap at every Q-bar inward offset.
+    # after that final geometry pass. Reserve only the actual tick/title width
+    # plus four physical points, rather than an oversized fixed pixel gap.
     fig.canvas.draw()
-    pair_gap = 46.0 / max(float(fig.bbox.width), 1.0)
+    renderer = fig.canvas.get_renderer()
+    padding = renderer.points_to_pixels(4.)
+    # The cube's square axes slot can be much wider than its projected artwork.
+    # Anchor the Q scale to the visible cube instead of leaving an empty lane.
+    from mpl_toolkits.mplot3d import proj3d
+    for q_axis in fig.axes:
+        cube = getattr(q_axis, '_composer_cube_axis', None)
+        if cube is None:
+            continue
+        vertices = np.array(list(itertools.product(cube.get_xlim(), cube.get_ylim(), cube.get_zlim())))
+        px, py, _ = proj3d.proj_transform(*vertices.T, cube.get_proj())
+        right_edge = cube.transData.transform(np.column_stack([px, py]))[:, 0].max()
+        position = q_axis.get_position()
+        # Retain an explicitly larger inward offset if one was requested.
+        left = min(position.x0, (right_edge + renderer.points_to_pixels(12.)) / fig.bbox.width)
+        q_axis.set_axes_locator(None)
+        q_axis.set_position([left, position.y0, position.width, position.height], which='both')
+    fig.canvas.draw()
     for colorbar_axis in fig.axes:
         q_axis = getattr(colorbar_axis, '_composer_follow_q_axis', None)
         if q_axis is None:
             continue
         q_position = q_axis.get_position()
+        q_right = q_axis.bbox.x1
+        for label in q_axis.get_yticklabels():
+            if label.get_visible() and label.get_text():
+                q_right = max(q_right, label.get_window_extent(renderer).x1)
+        next_left = q_right + padding
+        # The scale titles share a row and must also remain separate.
+        if q_axis.title.get_text() and colorbar_axis.title.get_text():
+            title_overhang = colorbar_axis.bbox.x0 - colorbar_axis.title.get_window_extent(renderer).x0
+            next_left = max(next_left, q_axis.title.get_window_extent(renderer).x1 + padding + title_overhang)
         colorbar_axis.set_axes_locator(None)
         colorbar_axis.set_position([
-            q_position.x1 + pair_gap,
+            next_left / fig.bbox.width,
             q_position.y0,
             colorbar_axis.get_position().width,
             q_position.height,
         ], which='both')
+    fig.canvas.draw()
+    # Re-evaluate interior whitespace after fitting and colorbar placement;
+    # physical font sizes stay fixed while the projected cube can change size.
+    for cube in fig.axes:
+        if (hasattr(cube, '_composer_parameter_note') and cube.name == '3d'
+                and cube._composer_parameter_placement != 'Below cube'):
+            _composer_place_best_parameters(cube)
     fig.canvas.draw()
     fig._composer_panel_groups = panel_groups
     _COMPOSER_CLIP_EXTREMES.set(False)
@@ -36704,6 +37209,43 @@ def _composer_group_scope(observations, history, group_id):
     return kept, scoped
 
 
+def _composer_panel_scope(spec, observations, history):
+    """Resolve each panel's group/direction before drawing or finding its best Q."""
+    channels = list(map(str, spec.get('channels') or []))
+    suffixes = {channel.rsplit('_', 1)[-1] for channel in channels}
+    direction = spec.get('optimization_direction')
+    if suffixes == {'max'}:
+        direction = 'maximize'
+    elif suffixes == {'min'}:
+        direction = 'minimize'
+    if direction in ('maximize', 'minimize'):
+        observations = [o for o in observations if o.get('optimization_direction', direction) == direction]
+        if 'optimization_direction' in history:
+            history = history.loc[history.optimization_direction == direction].copy()
+    if spec.get('group_id') is not None:
+        observations, history = _composer_group_scope(observations, history, spec['group_id'])
+    if channels:
+        selected = []
+        for observation in observations:
+            names = set(map(str, observation.get('analysis_channels') or observation.get('channels') or []))
+            suffix = {'maximize': 'max', 'minimize': 'min'}.get(observation.get('optimization_direction'))
+            if suffix:
+                names |= {f'{name}_{suffix}' for name in names if not name.endswith(('_max', '_min'))}
+            if names.intersection(channels):
+                selected.append(observation)
+        if selected:
+            observations = selected
+            if 'group_id' in history:
+                def identity(value):
+                    try:
+                        return str(float(value))
+                    except (ValueError, TypeError):
+                        return str(value)
+                groups = {identity(o.get('group_id', 1)) for o in selected}
+                history = history.loc[history.group_id.map(identity).isin(groups)].copy()
+    return observations, history
+
+
 def _robust_upper_outliers(values: np.ndarray, *, z: float, floor: float) -> np.ndarray:
     """Conservative one-sided robust outlier mask for trace-quality features."""
     values = np.asarray(values, dtype=float)
@@ -36713,7 +37255,7 @@ def _robust_upper_outliers(values: np.ndarray, *, z: float, floor: float) -> np.
     return values > max(float(floor), median + float(z) * scale)
 
 
-def _anomalous_swv_iterations(rows: Sequence[Mapping[str, Any]]) -> dict[int, list[str]]:
+def _anomalous_swv_iterations(rows: Sequence[Mapping[str, Any]], *, strength: str = 'Conservative') -> dict[int, list[str]]:
     """Flag only strong waveform anomalies, separately within each SWV phase."""
     reasons: dict[int, list[str]] = {}
     by_phase: dict[str, list[tuple[Mapping[str, Any], np.ndarray, float, float, float, float]]] = {}
@@ -36764,11 +37306,12 @@ def _anomalous_swv_iterations(rows: Sequence[Mapping[str, Any]]) -> dict[int, li
         roughness = np.asarray([item[3] for item in phase_rows])
         jump_contrast = np.asarray([item[4] for item in phase_rows])
         voltage_gaps = np.asarray([item[5] for item in phase_rows])
+        stronger = strength == 'Stronger'
         masks = (
-            (_robust_upper_outliers(mismatch, z=4.5, floor=.22), 'shape outlier'),
-            (_robust_upper_outliers(jumps, z=4.5, floor=.20), 'abrupt jump/spike'),
-            (_robust_upper_outliers(roughness, z=5.0, floor=.055), 'extreme roughness'),
-            (_robust_upper_outliers(jump_contrast, z=4.0, floor=10.0),
+            (_robust_upper_outliers(mismatch, z=3.0 if stronger else 4.5, floor=.12 if stronger else .22), 'shape outlier'),
+            (_robust_upper_outliers(jumps, z=3.0 if stronger else 4.5, floor=.15 if stronger else .20), 'abrupt jump/spike'),
+            (_robust_upper_outliers(roughness, z=3.0 if stronger else 5.0, floor=.04 if stronger else .055), 'extreme roughness'),
+            (_robust_upper_outliers(jump_contrast, z=3.0 if stronger else 4.0, floor=8.0 if stronger else 10.0),
              'isolated straight-line jump'),
             (_robust_upper_outliers(voltage_gaps, z=4.0, floor=4.0),
              'missing voltage segment / straight connector'),
@@ -36826,7 +37369,19 @@ def _composer_type2_swv_anomalies(session, observations, state) -> dict[int, lis
         voltage_min=state.get(f'bo_composer_stack_voltage_min_{stack_index}') if display_range == 'Custom voltage range' else None,
         voltage_max=state.get(f'bo_composer_stack_voltage_max_{stack_index}') if display_range == 'Custom voltage range' else None,
     )
-    return _anomalous_swv_iterations(loaded)
+    report = _anomalous_swv_iterations(
+        loaded, strength=state.get('bo_composer_polish_strength', 'Conservative'))
+    # A partially failed paired iteration used to survive with only one phase.
+    # Only require phases the user selected, and only flag displayed iterations.
+    expected = set(phases)
+    present = {}
+    for row in loaded:
+        present.setdefault(int(row['iteration']), set()).add(str(row.get('phase', '')).lower())
+    for iteration, available in present.items():
+        missing = expected - available
+        if missing:
+            report.setdefault(iteration, []).append('no accepted ' + '/'.join(sorted(missing)) + ' traces')
+    return report
 
 
 def _composer_excluded_iteration_set(values: Sequence[Any]) -> set[int]:
@@ -36869,6 +37424,37 @@ def _composer_filter_excluded_history(
         return history
     numeric_iteration = pd.to_numeric(history["iteration"], errors="coerce")
     return history.loc[~numeric_iteration.isin(excluded_set)].copy()
+
+
+def _composer_polish_controls(session, observations, state, stack_index):
+    st.selectbox('Auto-polish sensitivity', ['Conservative', 'Stronger'],
+                 key='bo_composer_polish_strength',
+                 help='Stronger flags more waveform deviations. Changing this does not run polishing; click Auto-polish to apply. This excludes iterations, not smooths traces.')
+    cleanup_cols = st.columns([1.7, 1.0])
+    if cleanup_cols[0].button(
+        'Auto-polish Type 2 SWVs', key='bo_composer_validation_auto_polish_button',
+        disabled=stack_index is None,
+        help='Check the current stack for spikes, jumps and waveform outliers, then select their iterations for exclusion. Runs only when clicked.',
+    ):
+        with st.spinner('Checking displayed Type 2 SWVs...'):
+            report = _composer_type2_swv_anomalies(session, observations, state)
+        existing = _composer_excluded_iteration_set(state.get('bo_composer_validation_excluded_iterations', []))
+        state['bo_composer_validation_excluded_iterations'] = sorted(existing | set(report))
+        state[f'bo_composer_stack_depth_spacing_{stack_index}'] = 1.28
+        state['bo_composer_validation_cleanup_report'] = report
+    if cleanup_cols[1].button(
+        'Clear exclusions', key='bo_composer_validation_clear_exclusions_button',
+        help='Restore the excluded iterations. Auto-polish will not run again unless you click it.',
+    ):
+        state['bo_composer_validation_excluded_iterations'] = []
+        state['bo_composer_validation_cleanup_report'] = {}
+    report = state.get('bo_composer_validation_cleanup_report')
+    if report:
+        st.caption('Auto-polish selected: ' + ', '.join(
+            f"{iteration} ({'/'.join(dict.fromkeys(reasons))})"
+            for iteration, reasons in sorted(report.items(), key=lambda pair: int(pair[0]))))
+    elif report == {}:
+        st.caption('No auto-polish exclusions selected.')
 
 
 def _composer_validation_scope(session, observations, history):
@@ -36925,42 +37511,7 @@ def _composer_validation_scope(session, observations, history):
         index for index in range(int(state.get('bo_composer_count', 0)))
         if state.get(f'bo_composer_kind_{index}') == 'Chronological SWV stack'
     ), None)
-    cleanup_cols = st.columns([1.7, 1.0])
-    if cleanup_cols[0].button(
-        'Auto-polish Type 2 SWVs',
-        key='bo_composer_validation_auto_polish_button',
-        help=(
-            'Conservatively selects iterations with strong spikes, jumps, roughness, '
-            'or phase-specific shape anomalies. Source files and Q values are unchanged.'
-        ),
-    ):
-        with st.spinner('Checking displayed Type 2 SWVs...'):
-            anomaly_reasons = _composer_type2_swv_anomalies(session, observations, state)
-        existing = {
-            int(value) for value in state.get('bo_composer_validation_excluded_iterations', [])
-            if _finite_float(value) is not None
-        }
-        state['bo_composer_validation_excluded_iterations'] = sorted(existing | set(anomaly_reasons))
-        if stack_index is not None:
-            state[f'bo_composer_stack_depth_spacing_{stack_index}'] = 1.28
-        state['bo_composer_validation_cleanup_report'] = anomaly_reasons
-    if cleanup_cols[1].button(
-        'Clear exclusions',
-        key='bo_composer_validation_clear_exclusions_button',
-        help='Restores all Type 2 iterations; source data are never deleted.',
-    ):
-        state['bo_composer_validation_excluded_iterations'] = []
-        state['bo_composer_validation_cleanup_report'] = {}
-    cleanup_report = state.get('bo_composer_validation_cleanup_report') or {}
-    if cleanup_report:
-        st.caption(
-            'Auto-polish selected: ' + ', '.join(
-                f"{iteration} ({'/'.join(dict.fromkeys(reasons))})"
-                for iteration, reasons in sorted(cleanup_report.items())
-            )
-        )
-    elif state.get('bo_composer_validation_cleanup_report') == {}:
-        st.caption('Auto-polish found no strong SWV morphology outliers.')
+    _composer_polish_controls(session, observations, state, stack_index)
     saved_exclusions = []
     for value in state.get("bo_composer_validation_excluded_iterations", []):
         try:
@@ -37125,6 +37676,21 @@ def _composer_source_controls(index, source_spec, session, history, observations
         phases = ["buffer","target"] if paired else ["measurement"]
         draft["phase"] = st.selectbox("Phase", phases, index=phases.index(draft["phase"]) if draft["phase"] in phases else 0)
         if kind == "Measured 3D tensor":
+            legacy_endpoints = bool(draft.get('show_path_endpoints', False))
+            draft['show_path_start'] = st.checkbox(
+                'Mark start point', value=bool(draft.get('show_path_start', legacy_endpoints)))
+            draft['show_path_final'] = st.checkbox(
+                'Mark final point', value=bool(draft.get('show_path_final', legacy_endpoints)),
+                disabled=bool(draft.get('stop_at_best')),
+                help='Marks the final iteration of the full path. Hidden when the path stops at the best iteration.')
+            draft['show_best_parameters'] = st.checkbox(
+                'Show best-point parameters', value=bool(draft.get('show_best_parameters', False)))
+            if draft['show_best_parameters']:
+                placements = ['Automatic', 'Below cube']
+                placement = draft.get('best_parameters_placement', placements[0])
+                draft['best_parameters_placement'] = st.selectbox(
+                    'Best-parameter placement', placements,
+                    index=placements.index(placement) if placement in placements else 0)
             draft["show_highlight_labels"] = st.checkbox(
                 "Show highlighted iteration labels", value=bool(draft.get("show_highlight_labels", True)),
                 help="Show selected/best iteration callouts. Turning this off keeps the highlighted markers.",
@@ -37133,6 +37699,11 @@ def _composer_source_controls(index, source_spec, session, history, observations
             dimensions = _composer_parameter_dimensions_from_observations(observations)
             draft["parameters"] = st.multiselect("Parameter axes", dimensions,
                 default=[p for p in draft.get("parameters", []) if p in dimensions])
+        if kind == "Measured 2D map":
+            draft["show_q_colorbar"] = st.checkbox(
+                "Show Q colorbar", value=bool(draft.get("show_q_colorbar", True)),
+                help="Show this landscape's color scale. Hide it to use the cube's shared Q scale.",
+            )
         if kind == "Measured 2D map" and draft.get("slice_axis"):
             points = _composer_real_points(draft, observations)
             values = _numeric_slice_values(points, draft["slice_axis"])
@@ -37140,8 +37711,20 @@ def _composer_source_controls(index, source_spec, session, history, observations
                 old = draft.get("slice_value")
                 draft["slice_value"] = st.selectbox("Slice plane (V)", values, index=values.index(old) if old in values else 0)
     elif kind == "Global trend":
+        if not st.session_state.get('bo_composer_validation_linked'):
+            groups = sorted(history['group_id'].dropna().unique().tolist(), key=str) if 'group_id' in history else []
+            if groups:
+                draft['group_id'] = st.selectbox('Q / trend optimizer group', groups,
+                    index=groups.index(draft['group_id']) if draft.get('group_id') in groups else 0)
+            _, scoped = _composer_group_scope(observations, history, draft.get('group_id')) if groups else (observations, history)
+            directions = sorted(scoped.optimization_direction.dropna().unique()) if 'optimization_direction' in scoped else []
+            if directions:
+                draft['optimization_direction'] = st.selectbox('Q optimizer direction', directions,
+                    index=directions.index(draft['optimization_direction']) if draft.get('optimization_direction') in directions else 0)
         columns = _numeric_columns(history)
         draft["metric"] = st.selectbox("Metric", columns, index=columns.index(draft["metric"]) if draft["metric"] in columns else 0)
+        draft['show_q_score_legend'] = st.checkbox(
+            'Show Q score in legend', value=bool(draft.get('show_q_score_legend', True)))
         draft["running_mean_window"] = st.number_input(
             "Running mean window (0 disables)",
             0,
@@ -37230,6 +37813,18 @@ def _composer_source_controls(index, source_spec, session, history, observations
         )
         draft["normalize_to_peak"] = st.checkbox("Normalize to peak", value=bool(draft.get("normalize_to_peak", False)))
         draft["offset_to_baseline"] = st.checkbox("Offset baseline", value=bool(draft.get("offset_to_baseline", True)))
+        corners = ['upper right', 'upper left', 'lower right', 'lower left']
+        corner = draft.get('stack_legend_location', corners[0])
+        draft['stack_legend_location'] = st.selectbox(
+            'Stack legend corner', corners,
+            index=corners.index(corner) if corner in corners else 0, format_func=str.title)
+        draft['stack_legend_columns'] = st.selectbox(
+            'Stack legend columns', [1, 2], index=1 if draft.get('stack_legend_columns') == 2 else 0)
+        default_height = .72 if 'upper' in draft['stack_legend_location'] else .10
+        draft['stack_legend_y'] = st.slider(
+            'Stack legend height (%)', 0, 100,
+            int(round(float(draft.get('stack_legend_y', default_height)) * 100)),
+            help='Lower values move the Buffer/Target legend down.') / 100.
     if kind in ('SWV trace overlay', 'Chronological SWV stack'):
         _composer_jump_controls(draft)
     if embedded and kind == 'Measured 3D tensor':
@@ -37392,6 +37987,37 @@ def _composer_slice_planes_changed(index: int, key: str) -> None:
         state.pop("bo_composer_editor_checkpoint", None)
 
 
+def _composer_choose_slice_plane(index: int, key: str, slot: int, widget_key: str) -> None:
+    values = list(st.session_state[key])
+    values[slot] = st.session_state[widget_key]
+    st.session_state[key] = values
+    _composer_slice_planes_changed(index, key)
+
+
+def _composer_linked_slice_controls(container, options, index: int, key: str, count: int):
+    """Choose each linked map's plane directly, without a capped chip list."""
+    if not options:
+        return []
+    values = list(st.session_state.get(key) or [])
+    if not values:
+        values = [options[i] for i in np.linspace(0, len(options) - 1, count).round().astype(int)]
+    values = (values + [values[-1]] * count)[:count]
+    values = [value if value in options else options[0] for value in values]
+    st.session_state[key] = values
+    for slot, value in enumerate(values):
+        widget_key = f"bo_composer_editor_slice_{key}_{slot}"
+        st.session_state[widget_key] = value
+        container.selectbox(
+            f"Slice {slot + 1} step size", options,
+            format_func=lambda step: f"{step * 1000:g} mV",
+            key=widget_key,
+            on_change=_composer_choose_slice_plane,
+            args=(index, key, slot, widget_key),
+            help="Changes this landscape and its matching cube plane. Other slices keep their selections.",
+        )
+    return values
+
+
 def _composer_linked_example_controls(iteration_options):
     """Role-specific choices avoid chip deletion reordering the linked traces."""
     st.caption('Linked SWV examples: changing either iteration updates its trace and cube marker. Use Show SWV example markers to hide markers without changing the traces.')
@@ -37440,6 +38066,104 @@ def render_captured_figure_composer() -> None:
     _render_figure_composer(session, pd.DataFrame(), [], {}, {}, False)
 
 
+def _composer_upgrade_original_type2b(state) -> bool:
+    """Upgrade the shipped two-panel layout already loaded in a live session."""
+    if (state.get('bo_composer_count') != 2
+            or state.get('bo_composer_kind_0') != 'Global trend'
+            or state.get('bo_composer_kind_1') != 'Measured 3D tensor'
+            or not state.get('bo_composer_validation_linked')
+            or not state.get('bo_composer_measured_stop_at_best_1')):
+        return False
+    aspect = state.get('bo_composer_aspect')
+    if aspect == 'ACS 1-col tall (3.3 x 7.0 in)':
+        old_rects = ((.10, .61, .82, .29), (.06, .08, .88, .47))
+    elif aspect == 'BO path workspace (6.4 x 9 in)':
+        old_rects = ((.11, .755, .78, .2), (.06, .04, .88, .624))
+    else:
+        return False
+    # A manually rearranged figure remains the user's layout.
+    for index, rect in enumerate(old_rects):
+        for field, value in zip(('left', 'bottom', 'width', 'height'), rect):
+            if not np.isclose(float(state.get(f'bo_composer_{field}_{index}', -1)), value, atol=.0005):
+                return False
+    updated = _paper_bo_validation_best_path_preset()['config']['state']
+    if updated.get('bo_composer_count') != 3:
+        return False  # Respect an explicitly overwritten preset.
+    for key, value in updated.items():
+        if (key.endswith('_2') or key in {
+                'bo_composer_aspect', 'bo_composer_count', 'bo_composer_font_size',
+                'bo_composer_measured_path_projection_1',
+                'bo_composer_type2b_layout_version',
+            } or re.fullmatch(
+                r'bo_composer_(left|bottom|width|height|text_size|title_size|axis_label_size|tick_size|legend_size)_[01]', key)):
+            state[key] = copy.deepcopy(value)
+    for key in list(state):
+        if str(key).startswith(('bo_composer_editor_', 'bo_composer_render_', 'bo_composer_exports_', 'bo_composer_layout_editor')):
+            del state[key]
+    state['bo_composer_auto_render'] = True
+    return True
+
+
+def _composer_upgrade_type2b_cube(state) -> bool:
+    """Update the previous Type 2B cube orientation once, including live sessions."""
+    if (state.get('bo_composer_type2b_cube_style_version', 0) >= 1
+            or state.get('bo_composer_aspect') not in ('BO path and stack workspace (12.8 x 9 in)', '16:9')
+            or state.get('bo_composer_count') != 3
+            or [state.get(f'bo_composer_kind_{i}') for i in range(3)] != [
+                'Global trend', 'Measured 3D tensor', 'Chronological SWV stack']
+            or state.get('bo_composer_measured_y_1') != 'frequency'
+            or state.get('bo_composer_measured_z_1') != 'step_potential'):
+        return False
+    defaults = _paper_bo_validation_best_path_preset()['config']['state']
+    fields = ('measured_y', 'measured_z', 'camera_x', 'camera_y', 'camera_z',
+              'camera_zoom', 'path_endpoints', 'fade_path', 'path_width', 'measured_dot_size')
+    for field in fields:
+        key = f'bo_composer_{field}_1'
+        state[key] = defaults[key]
+    state.pop('bo_composer_source_camera_1', None)
+    state.pop('bo_composer_source_camera_controls_1', None)
+    state['bo_composer_type2b_cube_style_version'] = 1
+    for key in list(state):
+        if str(key).startswith(('bo_composer_editor_', 'bo_composer_render_', 'bo_composer_exports_')):
+            del state[key]
+    state['bo_composer_auto_render'] = True
+    return True
+
+
+def _composer_upgrade_type2b_layout(state) -> bool:
+    if (state.get('bo_composer_aspect') not in ('BO path and stack workspace (12.8 x 9 in)', '16:9')
+            or state.get('bo_composer_count') != 3
+            or [state.get(f'bo_composer_kind_{i}') for i in range(3)] != [
+                'Global trend', 'Measured 3D tensor', 'Chronological SWV stack']):
+        return False
+    # Old saved/cached geometry can be restored alongside a newer version flag.
+    # A cube left of a stack on the right is still the old column arrangement.
+    old_columns = (float(state.get('bo_composer_left_1', 1.)) < .45
+                   and float(state.get('bo_composer_left_2', 0.)) >= .45
+                   and state.get('bo_composer_type2b_colorbar_version', 0) < 1)
+    needs_layout = state.get('bo_composer_type2b_layout_version', 0) < 3 or old_columns
+    if (not needs_layout and state.get('bo_composer_type2b_path_style_version', 0) >= 1
+            and state.get('bo_composer_type2b_colorbar_version', 0) >= 1):
+        return False
+    defaults = _paper_bo_validation_best_path_preset()['config']['state']
+    if needs_layout:
+        for index in range(3):
+            for field in ('left', 'bottom', 'width', 'height'):
+                key = f'bo_composer_{field}_{index}'
+                state[key] = defaults[key]
+    state['bo_composer_aspect'] = defaults['bo_composer_aspect']
+    state['bo_composer_type2b_layout_version'] = 3
+    state['bo_composer_type2b_colorbar_version'] = 1
+    if state.get('bo_composer_type2b_path_style_version', 0) < 1:
+        state['bo_composer_path_width_1'] = 2.0
+        state['bo_composer_fade_path_1'] = False
+        state['bo_composer_type2b_path_style_version'] = 1
+    for key in list(state):
+        if str(key).startswith(('bo_composer_editor_', 'bo_composer_render_', 'bo_composer_exports_', 'bo_composer_layout_editor')):
+            del state[key]
+    return True
+
+
 def _render_figure_composer(
     session: dict,
     history: pd.DataFrame,
@@ -37448,7 +38172,19 @@ def _render_figure_composer(
     trace_analysis: dict,
     paired_objective: bool,
 ) -> None:
+    # Earlier recipes persisted this button as a setting. Discard the legacy
+    # key even in a running browser session that restored it before this fix.
+    st.session_state.pop('bo_composer_standardize_text', None)
     _composer_restore_pending_panel_state()
+    type2b_preview_update = _composer_upgrade_original_type2b(st.session_state)
+    if type2b_preview_update:
+        st.info('Updated the original Type 2B layout: Q above the chronological stack on the left, cube on the right, and no wall projections.')
+    if _composer_upgrade_type2b_cube(st.session_state):
+        type2b_preview_update = True
+        st.info('Updated the Type 2B cube to the Type 2A view: frequency vertical, step size and amplitude along the base.')
+    if _composer_upgrade_type2b_layout(st.session_state):
+        type2b_preview_update = True
+        st.info('Updated Type 2B: Q above the chronological stack on the left, cube on the right, with colorbars closer to the cube. Refreshing preview.')
     editor_root = str(session.get('root', ''))
     if st.session_state.get('bo_composer_editor_root') != editor_root:
         for key in list(st.session_state):
@@ -37540,6 +38276,7 @@ def _render_figure_composer(
     )
     active_scoring = session.get('active_rescore_profile') or {}
     st.caption("Landscape Q source: " + str(active_scoring.get('label') or 'Original recorded Q'))
+    settings_cache = _composer_settings_cache_controls(session)
     if added_captures:
         added_labels = ", ".join(
             f"Figure {chr(ord('A') + index)}"
@@ -37664,14 +38401,17 @@ def _render_figure_composer(
         saved_presets["Type 2A - BO validation (focused)"] = (
             _paper_bo_validation_focused_preset()
         )
+        saved_presets["Type 2B - Q history and best-point path"] = (
+            _paper_bo_validation_best_path_preset()
+        )
     saved_presets.update(_composer_load_presets())
     with st.expander("Load a preset or saved figure", expanded=False):
         st.info(
             "Survey session: Types 1 / 1A / 1B / 1C show the parameter landscape. "
-            "For BO validation (Types 2 / 2A), open the optimization session, not parameter_sweep. "
+            "For BO validation (Types 2 / 2A / 2B), open the optimization session, not parameter_sweep. "
             "Titration Types 3 / 3B / 4 are in SWV mode → Paper figures."
             if is_survey_session else
-            "Optimization session: Types 2 / 2A show BO validation. "
+            "Optimization session: Types 2 / 2A / 2B show BO validation. "
             "For Types 1 / 1A / 1B / 1C, open a parameter-sweep (survey) session. "
             "Titration Types 3 / 3B / 4 are in SWV mode → Paper figures."
         )
@@ -37816,6 +38556,9 @@ def _render_figure_composer(
         )
     font_size = int(c6.slider("Plot font", 5, 18, 9, key="bo_composer_font_size"))
     label_size = int(c7.slider("Panel label", 8, 30, 16, key="bo_composer_label_size"))
+    st.button('Apply Plot font to all panel text',
+              key='bo_composer_standardize_text_button', on_click=_composer_standardize_text_sizes,
+              help='Sets titles, axis labels, ticks, legends and annotations to Plot font in physical canvas points. Disables separate axis sizes and title auto-fit. Images and raster-only captures retain their original text. Click Render figure afterward.')
     journal_style = st.checkbox(
         "Journal style (open axes, thin lines, no panel titles, frameless legends, "
         "panel letters outside the axes)",
@@ -37864,12 +38607,9 @@ def _render_figure_composer(
             max_selections=2,
             key="bo_composer_type1_iterations",
         ) if iteration_options else []
-        linked_slices = link_cols[2].multiselect(
-            "Step-size planes",
-            step_options,
-            max_selections=4,
-            key="bo_composer_type1_slice_values",
-        ) if step_options else []
+        linked_slices = _composer_linked_slice_controls(
+            link_cols[2], step_options, 3, "bo_composer_type1_slice_values", 4,
+        )
         if not linked_iterations and iteration_options:
             linked_iterations = iteration_options[:1]
         if not linked_slices and step_options:
@@ -37968,10 +38708,10 @@ def _render_figure_composer(
         st.session_state["bo_composer_type1_compact_signal_off_iteration"] = off_iteration
         link_cols[1].metric(on_role, f"Iteration {on_iteration}" if on_iteration is not None else "Unavailable")
         link_cols[2].metric("Signal-off example", f"Iteration {off_iteration}" if off_iteration is not None else "Unavailable")
-        linked_slices = link_cols[3].multiselect(
-            "Step-size planes", step_options, max_selections=2,
-            key="bo_composer_type1_compact_slice_values",
-        ) if step_options else []
+        linked_slices = _composer_linked_slice_controls(
+            link_cols[3], step_options, slice_cube_index,
+            "bo_composer_type1_compact_slice_values", 2,
+        )
         if not linked_slices and step_options:
             linked_slices = [step_options[0], step_options[-1]]
         map_slices = (list(linked_slices) + [linked_slices[-1]] * 2)[:2] if linked_slices else []
@@ -38082,6 +38822,7 @@ def _render_figure_composer(
             f"Panel {chr(ord('A') + index)}",
             expanded=bool(expand_all_panels or index == active_panel),
         ):
+            _composer_section_cache_controls(session, f"panel_{index}", settings_cache)
             order_cols = st.columns([1, 1, 4])
             order_cols[0].button(
                 "<- Earlier",
@@ -38195,7 +38936,7 @@ def _render_figure_composer(
                               on_click=restore_compact_swv_appearance,
                               args=(st.session_state, index, COMPOSER_CANVAS_SIZES.get(aspect, (12, 9))),
                               disabled=preset != 'Manual',
-                              help='Optional: restore short signal-role/iteration titles, automatic title fitting, reference text/line sizes and a 2.61 × 1.70 inch panel slot. Keeps the current position where possible, font family, data, channels and points. Requires Manual layout. Does not undo the corrected raw-sample display fix.')
+                              help='Optional: restore short signal-role/iteration titles, fixed title point sizes, reference text/line sizes and a 2.61 × 1.70 inch panel slot. Keeps the current position where possible, font family, data, channels and points. Requires Manual layout. Does not undo the corrected raw-sample display fix.')
                     spec['swv_title_style'] = st.selectbox(
                         'SWV title style', ['Full parameters', 'Compact signal role'],
                         key=f'bo_composer_swv_title_style_{index}',
@@ -38289,7 +39030,7 @@ def _render_figure_composer(
                     ))
                 if kind == 'Chronological SWV stack':
                     spec['iteration_label_padding'] = st.slider('Iteration title offset (pt)',
-                        16., 80., 34., 1., key=f'bo_composer_iteration_label_padding_{index}',
+                        16., 80., 50., 1., key=f'bo_composer_iteration_label_padding_{index}',
                         help='Moves the title away from tick numbers without changing iteration positions.')
             if kind in {'Global trend', 'Channel trend', 'Buffer/target trend', 'Measured 3D tensor', 'Measured parallel coordinates', 'Chronological SWV stack'}:
                 with st.container():
@@ -38307,9 +39048,32 @@ def _render_figure_composer(
                         spec['best_color'] = st.color_picker('Best-iteration color', '#c2188b', key=f'bo_composer_best_color_{index}')
                     if kind == 'Global trend':
                         spec['show_best_so_far'] = st.checkbox('Show best-so-far Q', value=linked_validation, key=f'bo_composer_best_so_far_{index}')
+                        spec['show_q_score_legend'] = st.checkbox(
+                            'Show Q score in legend', value=True,
+                            key=f'bo_composer_show_q_score_legend_{index}',
+                            help='Hide only the Q-score entry; keep the curve, axis label, and other legend entries.')
                     if kind == 'Buffer/target trend':
                         spec['show_repeat_sd'] = st.checkbox('Show repeat SD (peak height, single channel)', value=linked_validation, key=f'bo_composer_repeat_sd_{index}')
                     if kind == 'Measured 3D tensor':
+                        spec['show_best_parameters'] = st.checkbox(
+                            'Show best-point parameters', value=False,
+                            key=f'bo_composer_show_best_parameters_{index}',
+                            help='Show the step size, amplitude and frequency at the best recorded Q for this panel\'s optimizer group and direction.')
+                        if spec['show_best_parameters']:
+                            spec['best_parameters_placement'] = st.selectbox(
+                                'Best-parameter placement', ['Automatic', 'Below cube'],
+                                key=f'bo_composer_best_parameters_placement_{index}',
+                                help='Automatic places Frequency, Amplitude and Step size in open space inside the cube, avoiding point callouts and the path.')
+                        spec['stop_at_best'] = st.checkbox(
+                            'Stop cube path at best iteration', value=False,
+                            key=f'bo_composer_measured_stop_at_best_{index}',
+                            help='Keep the full cube bounds but show only observations and path segments through the best recorded Q. Other panels retain their full history.',
+                        )
+                        spec['show_path_projection'] = st.checkbox(
+                            'Project path onto cube faces', value=False,
+                            key=f'bo_composer_measured_path_projection_{index}',
+                            help='Add faint floor and rear-wall shadows to clarify the 3D walk.',
+                        )
                         spec['show_highlight_labels'] = st.checkbox(
                             'Show highlighted iteration labels', value=True,
                             key=f'bo_composer_show_highlight_labels_{index}',
@@ -38318,13 +39082,18 @@ def _render_figure_composer(
                         spec['best_label_dx'] = st.number_input('Best label horizontal offset (pt)', -150, 150, -65, key=f'bo_composer_best_dx_{index}')
                         spec['best_label_dy'] = st.number_input('Best label vertical offset (pt)', -150, 150, -15, key=f'bo_composer_best_dy_{index}')
                         spec['fade_path'] = st.checkbox('Fade early path segments', value=linked_validation, key=f'bo_composer_fade_path_{index}')
-                        spec['show_path_endpoints'] = st.checkbox('Mark start and final points', value=linked_validation, key=f'bo_composer_path_endpoints_{index}')
-                        if spec['show_path_endpoints']:
-                            for endpoint, dx, dy in [('Start', -50, -20), ('Final', 32, 10)]:
+                        legacy_endpoints = bool(st.session_state.get(f'bo_composer_path_endpoints_{index}', linked_validation))
+                        spec['show_path_start'] = st.checkbox('Mark start point', value=legacy_endpoints,
+                            key=f'bo_composer_path_start_{index}')
+                        spec['show_path_final'] = st.checkbox('Mark final point', value=legacy_endpoints,
+                            key=f'bo_composer_path_final_{index}', disabled=bool(spec['stop_at_best']),
+                            help='Marks the final iteration of the full path. Hidden when the path stops at the best iteration.')
+                        for endpoint, dx, dy in [('Start', -50, -20), ('Final', 32, 10)]:
+                            if spec['show_path_' + endpoint.lower()]:
                                 prefix = endpoint.lower()
                                 spec[prefix+'_label_dx'] = st.number_input(f'{endpoint} label horizontal offset (pt)', -150, 150, dx, key=f'bo_composer_{prefix}_dx_{index}')
                                 spec[prefix+'_label_dy'] = st.number_input(f'{endpoint} label vertical offset (pt)', -150, 150, dy, key=f'bo_composer_{prefix}_dy_{index}')
-                        spec['path_line_width'] = st.slider('BO path line width', .2, 4., 1.2, .1, key=f'bo_composer_path_width_{index}')
+                        spec['path_line_width'] = st.slider('BO path line width', .2, 4., 2.0, .1, key=f'bo_composer_path_width_{index}')
                     if kind == 'Chronological SWV stack':
                         spec['stack_line_width'] = st.slider('Stack line width', .3, 4., 1.5, .1, key=f'bo_composer_stack_width_{index}')
                         spec['stack_fade_floor'] = st.slider('Rear trace opacity', .05, 1., .18, .01, key=f'bo_composer_stack_fade_{index}')
@@ -38332,6 +39101,14 @@ def _render_figure_composer(
                             'Stack legend corner', ['upper right', 'upper left', 'lower right', 'lower left'],
                             key=f'bo_composer_stack_legend_location_{index}', format_func=str.title,
                         )
+                        spec['stack_legend_columns'] = st.selectbox(
+                            'Stack legend columns', [1, 2],
+                            key=f'bo_composer_stack_legend_columns_{index}')
+                        spec['stack_legend_y'] = st.slider(
+                            'Stack legend height (%)', 0, 100,
+                            72 if 'upper' in spec['stack_legend_location'] else 10,
+                            key=f'bo_composer_stack_legend_y_{index}',
+                            help='Lower values move the Buffer/Target legend down.') / 100.
                         spec['coordinate_frame_style'] = st.selectbox(
                             'Coordinate frame',
                             ['Shared-Origin Three-Axis Frame', 'Legacy Separated Guides'],
@@ -38400,6 +39177,13 @@ def _render_figure_composer(
                     spec['group_id'] = st.selectbox('Q / trend optimizer group', groups,
                         key=f'bo_composer_global_group_{index}',
                         disabled=bool(st.session_state.get('bo_composer_validation_linked')))
+                if not st.session_state.get('bo_composer_validation_linked'):
+                    _, scoped = _composer_group_scope(observations, history, spec.get('group_id')) if groups else (observations, history)
+                    directions = sorted(scoped.optimization_direction.dropna().unique()) if 'optimization_direction' in scoped else []
+                    if directions:
+                        key = f'bo_composer_global_direction_{index}'
+                        _preserve_valid_widget_value(key, directions, directions[0])
+                        spec['optimization_direction'] = st.selectbox('Q optimizer direction', directions, key=key)
                 chosen = st.session_state.get(f"bo_composer_global_metric_{index}")
                 if chosen in _numeric_columns(history) and chosen not in options:
                     options = [*options, chosen]
@@ -38514,6 +39298,11 @@ def _render_figure_composer(
                     "Q scale side",
                     ["right", "left"],
                     key=f"bo_composer_real_colorbar_side_{index}",
+                )
+                spec["show_q_colorbar"] = st.checkbox(
+                    "Show Q colorbar", value=True,
+                    key=f"bo_composer_real_show_q_colorbar_{index}",
+                    help="Show this landscape's color scale. Hide it to use the cube's shared Q scale.",
                 )
                 spec["compact_square_map"] = bool(st.session_state.get(
                     f"bo_composer_real_compact_square_map_{index}", False,
@@ -38749,19 +39538,32 @@ def _render_figure_composer(
                             ) else 4
                         )
                         slice_values_key = f"bo_composer_real_slice_values_{index}"
-                        spec["slice_sweep_values"] = st.multiselect(
-                            "Step-size slice planes",
-                            step_slice_values,
-                            max_selections=compact_slice_limit,
-                            key=slice_values_key,
-                            on_change=_composer_slice_planes_changed,
-                            args=(index, slice_values_key),
-                            help=(
-                                "Draws "
-                                f"up to {compact_slice_limit} constant-step plane"
-                                f"{'s' if compact_slice_limit != 1 else ''} through the cube."
-                            ),
-                        ) if step_slice_values else []
+                        linked_planes = (
+                            st.session_state.get("bo_composer_type1_compact_linked_controls")
+                            and ((panel_count == 5 and index == 0) or (panel_count == 6 and index == 3))
+                        ) or (
+                            st.session_state.get("bo_composer_type1_linked_controls")
+                            and panel_count == 8 and index == 3
+                        )
+                        if linked_planes:
+                            spec["slice_sweep_values"] = _composer_linked_slice_controls(
+                                st, step_slice_values, index, slice_values_key, compact_slice_limit,
+                            )
+                        else:
+                            spec["slice_sweep_values"] = st.multiselect(
+                                "Step-size slice planes",
+                                step_slice_values,
+                                format_func=lambda step: f"{step * 1000:g} mV",
+                                max_selections=compact_slice_limit,
+                                key=slice_values_key,
+                                on_change=_composer_slice_planes_changed,
+                                args=(index, slice_values_key),
+                                help=(
+                                    "Draws "
+                                    f"up to {compact_slice_limit} constant-step plane"
+                                    f"{'s' if compact_slice_limit != 1 else ''} through the cube."
+                                ),
+                            ) if step_slice_values else []
                 if kind in COMPOSER_MEASURED_LANDSCAPE_VIEWS or kind in {
                     "Measured parallel coordinates",
                     "Channel x iteration heatmap",
@@ -39492,7 +40294,7 @@ def _render_figure_composer(
             _composer_unified_panel_actions(active_panel, specs, session, history, observations,
                 observation, trace_analysis, paired_objective, font_family, font_size, label_size)
     config = _composer_config(specs, panel_count)
-    config_signature = _composer_config_signature({'rendering': 'vector-panels-v1', **config})
+    config_signature = _composer_config_signature({'rendering': COMPOSER_RENDER_VERSION, **config})
 
     preset_name = _composer_preset_save_controls(session, config, selected_preset_name, saved_presets)
 
@@ -39580,8 +40382,18 @@ def _render_figure_composer(
             _composer_export_controls(panel_request['exporter'],
                                       key_prefix='bo_composer_exports_single_panel',
                                       panel_label=chr(65 + panel_index))
-    # Editing stages settings; only Preview and export explicitly render.
-    automatic_render = False
+    # Keep ordinary edits staged, but never retain a previous renderer's PNG
+    # across an app rerun. Record the attempt separately so a failed update
+    # does not retry expensive rendering on every unrelated widget change.
+    rendered_before = st.session_state.get(render_key) or {}
+    refresh_key = f'{render_key}_refresh_attempt'
+    renderer_changed = bool(
+        rendered_before
+        and rendered_before.get('renderer_version') != COMPOSER_RENDER_VERSION
+        and st.session_state.get(refresh_key) != COMPOSER_RENDER_VERSION)
+    automatic_render = type2b_preview_update or renderer_changed
+    if renderer_changed:
+        st.session_state[refresh_key] = COMPOSER_RENDER_VERSION
     render_preview = bool(preview_clicked or automatic_render)
     if render_preview:
         figure = None
@@ -39636,6 +40448,7 @@ def _render_figure_composer(
                 )
                 rendered_payload = {
                     "signature": config_signature,
+                    "renderer_version": COMPOSER_RENDER_VERSION,
                     "metadata": metadata_bytes,
                     "png": png_bytes,
                     "stem": stem,
@@ -39661,7 +40474,7 @@ def _render_figure_composer(
             if figure is not None:
                 plt.close(figure)
 
-    if automatic_render:
+    if automatic_render and (st.session_state.get(render_key) or {}).get('signature') == config_signature:
         st.caption("Composer preview refreshed automatically. Final exports are generated only on demand.")
 
     rendered = st.session_state.get(render_key) or {}
@@ -39834,6 +40647,15 @@ def render_bo_session_app() -> None:
         st.error(str(exc))
         return
     source_session = session
+    if (session.get("local_snapshot") or {}).get("raw_traces_available") is False:
+        original = (session.get('local_snapshot') or {}).get('original')
+        connected = bool(original and Path(original).is_dir())
+        st.info("Opened a local BO snapshot. Q scores, parameter landscapes, and history "
+                "are available without the USB. " + (
+                    "The original source is connected; raw SWV traces are read from it."
+                    if connected else
+                    "Raw SWV traces were not included in this snapshot. Connect the original "
+                    "source drive to use trace panels and raw-data reanalysis."))
     rescore_page_marker = "bo_rescore_cache_initialized_for_page"
     # Older viewer versions used bo_rescore_cache.json for disposable profiles.
     # Remove only that legacy artifact; explicitly permanent comparisons now
@@ -59101,6 +59923,11 @@ def render_bo_session_app() -> None:
         # group/iteration selector changes.
         @st.fragment
         def _render_figure_composer_fragment() -> None:
+            # Widget clicks normally rerun only this fragment. If renderer
+            # source changed, refresh bindings via a full rerun in this session.
+            from core.live_modules import refresh_modules
+            if refresh_modules(('core.chronological_stack', 'core.composer_editing', 'bo_session_viewer')):
+                st.rerun(scope='app')
             if not _load_simulated_sweep_section(full_session, 'Figure Composer'):
                 return
             _render_full_session_composer(

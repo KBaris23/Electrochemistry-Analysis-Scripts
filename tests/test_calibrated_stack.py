@@ -30,7 +30,11 @@ def test_depth_follows_buffer_iterations_and_rear_fades():
     assert [t.get_text() for t in ax.get_legend().get_texts()] == ['Buffer', 'Target']
     assert ax.get_legend()._loc == 1  # retained user-selected corner
     assert not ax.get_legend().get_frame_on()
-    assert ax.get_legend()._ncols == 2
+    assert ax.get_legend()._ncols == 1
+    fig.canvas.draw()
+    buffer, target = ax.get_legend().get_texts()
+    assert target.get_window_extent().y1 < buffer.get_window_extent().y0
+    assert ax.get_legend().get_window_extent().y1 <= ax.bbox.y0 + .73*ax.bbox.height
     assert lines[2, 'buffer'].get_linestyle() == lines[2, 'target'].get_linestyle() == '-'
     assert all(line.get_linestyle() == '-' for line in ax.get_legend().get_lines())
     plt.close(fig)
@@ -48,6 +52,8 @@ def test_projected_labels_remain_centered_parallel_and_outboard_after_resize():
             for text in labels:
                 assert not text.get_clip_on()
                 fraction = getattr(text, '_axis_position_fraction', .5)
+                if getattr(text, '_bo_stack_depth_label', False):
+                    assert fraction == .5
                 np.testing.assert_allclose(
                     text.xy,
                     text._axis_start + (text._axis_end - text._axis_start) * fraction,
@@ -63,6 +69,9 @@ def test_projected_labels_remain_centered_parallel_and_outboard_after_resize():
             iteration_ticks = [text for text in ax.texts if getattr(text, '_bo_axis_tick', '') == 'iteration']
             assert all(text.get_rotation() == 0. for text in iteration_ticks)
             assert all(text.get_ha() == text.get_va() == 'center' for text in iteration_ticks)
+            depth_label = next(text for text in labels if getattr(text, '_bo_stack_depth_label', False))
+            renderer = fig.canvas.get_renderer()
+            assert not depth_label.get_window_extent(renderer).overlaps(iteration_ticks[1].get_window_extent(renderer))
             for tick in [line for line in ax.lines if hasattr(line, '_point')]:
                 points = ax.transData.transform(np.column_stack(tick.get_data()))
                 start, end = ax.transData.transform([tick._axis_start, tick._axis_end])

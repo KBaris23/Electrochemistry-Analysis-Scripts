@@ -118,7 +118,11 @@ def test_compact_swv_title_preserves_requested_points_unless_opted_in(monkeypatc
     try:
         header = next(t for t in fig.texts if 'Iteration 98' in t.get_text())
         if auto_fit:
-            assert header.get_fontsize() < title_points
+            assert header.get_fontsize() <= title_points
+            if panel_width == .30:
+                assert header.get_fontsize() < title_points
+            fig.canvas.draw()
+            assert header.get_window_extent(fig.canvas.get_renderer()).width <= panel_width * fig.get_figwidth() * fig.dpi
             assert '\n' not in header.get_text()
         else:
             assert header.get_fontsize() == title_points

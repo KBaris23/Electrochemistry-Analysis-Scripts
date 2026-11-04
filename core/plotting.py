@@ -12,6 +12,7 @@ from matplotlib import cm
 
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 from scipy.interpolate import PchipInterpolator
 from scipy.optimize import OptimizeWarning, curve_fit, minimize_scalar
 import warnings
@@ -553,6 +554,7 @@ def add_scan_vlines(
     alpha: float = 0.6,
     label_prefix: str = "",
     label_mode: str = "boundary",
+    strip_row: int = 0,
 ):
 
     if not vlines:
@@ -560,6 +562,11 @@ def add_scan_vlines(
         return
 
     ordered_vlines = [(float(x), str(label)) for x, label in vlines]
+    # Retain interval semantics for optional paper-figure annotation styling.
+    # These positions already use the displayed measurement numbering.
+    interval_groups = list(getattr(ax, "_swv_titration_interval_groups", []))
+    interval_groups.append((tuple(ordered_vlines), str(label_prefix), float(y_frac)))
+    ax._swv_titration_interval_groups = interval_groups
 
     for x, _label in ordered_vlines:
 
@@ -572,7 +579,50 @@ def add_scan_vlines(
         )
         boundary._swv_titration_vline = True
 
-    midpoint_labels = str(label_mode).strip().lower() in {
+    normalized_label_mode = str(label_mode).strip().lower()
+    dose_strip = normalized_label_mode in {
+        "Dose strip (all concentrations)".lower(),
+        "Dose strip (every other concentration)".lower(),
+    }
+    if dose_strip:
+        strip_y = 1.015 + .11 * max(0, int(strip_row))
+        intervals = [
+            ((left_x + right_x) / 2.0, left_label)
+            for (left_x, left_label), (right_x, _right_label)
+            in zip(ordered_vlines[:-1], ordered_vlines[1:])
+            if right_x > left_x and str(left_label).strip()
+            and str(left_label).strip().lower() != "end"
+        ]
+        if normalized_label_mode == "dose strip (every other concentration)":
+            intervals = [
+                entry for index, entry in enumerate(intervals)
+                if index == 0 or index == len(intervals) - 1 or index % 2 == 0
+            ]
+        strip = Rectangle(
+            (0, strip_y), 1, .095, transform=ax.transAxes,
+            facecolor="#f5f7f8", edgecolor="#cbd3d8", linewidth=.55,
+            clip_on=False, zorder=8,
+        )
+        strip._swv_titration_dose_strip = True
+        ax.add_patch(strip)
+        ax.set_title(ax.get_title(), pad=29 + 13 * max(0, int(strip_row)))
+        if label_prefix.strip():
+            source_label = ax.text(
+                -.01, strip_y + .047, label_prefix.strip().rstrip(":"),
+                transform=ax.transAxes, ha="right", va="center", fontsize=7,
+                color="#303840", clip_on=False, zorder=9,
+            )
+            source_label._swv_titration_dose_strip = True
+        for x, label in intervals:
+            label_artist = ax.text(
+                x, strip_y + .047, label, transform=ax.get_xaxis_transform(),
+                ha="center", va="center", rotation=0, fontsize=8,
+                fontweight="normal", color="#303840", clip_on=False, zorder=9,
+            )
+            label_artist._swv_titration_dose_strip = True
+        return
+
+    midpoint_labels = normalized_label_mode in {
         "step_midpoint",
         "midpoint",
         "centered",
@@ -3417,6 +3467,7 @@ def plot_metric_vs_scan(
                 color=mapping_color,
                 label_prefix=f"{readable}: " if multiple_mappings else "",
                 label_mode=vline_label_mode,
+                strip_row=mapping_index,
             )
     else:
         add_scan_vlines(
@@ -5366,6 +5417,7 @@ def plot_titration_concentration_vs_measurement(
                 color=colors.get(mapped_channels[0], "gray") if multiple_mappings else "gray",
                 label_prefix=f"{readable}: " if multiple_mappings else "",
                 label_mode=vline_label_mode,
+                strip_row=mapping_index,
             )
     else:
         add_scan_vlines(

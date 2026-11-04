@@ -44,9 +44,12 @@ analysis_outputs/
 analysis_sessions/
 # Session recipes/caches may contain private absolute paths; never publish them.
 *.analysis-session.json
+*.analysis-session.previous.json
+*.analysis-session.tmp
 *.results.pkl.gz
 figure-workspaces-index.json
 figure_composer_presets.json.tmp
+.figure_composer_settings/
 bo_figure_set_g7_i47_refined/
 mini_bo_g7_i47
 
@@ -71,3 +74,32 @@ scripts/publish_journal_additions.py
 scripts/publish_signal_on.py
 scripts/regenerate_validation_release.py
 scripts/release_titrations.py
+scripts/generate_titration_3e_package.py
+scripts/generate_titration_3g.py
+
+# Local Q-score manuscript studies, exploratory renderers, and exports
+/scripts/audit_q_peak_variability_cases.py
+/scripts/export_planar_c_landscape.py
+/scripts/export_q_powerpoint_individuals.py
+/scripts/preview_landscape_options.py
+/scripts/q_denominator_ablation.py
+/scripts/render_bo_landscape_slice.py
+/scripts/render_planar_q_slice_topography.py
+/scripts/render_planar_q_surface_publication.py
+/scripts/render_planar_q_topology_example.py
+/scripts/render_planar_q_true3d_examples.py
+/scripts/render_q_edge_cases.py
+/scripts/render_q_sweep_ablation.py
+/reports/q_denominator_ablation_planar_kana_bo_113013.md
+/reports/q_sweep_ablation_planar_kana_ch3_steps_2_6mV.md
+/figures/q_denominator_edge_cases_planar_kana_clean_q_jump.*
+/figures/q_powerpoint_individuals/
+/figures/q_sweep_ablation/
+/mini_bo_g7_i47.zip
+/reports/q_score_denominator_study/
+
+# Local diagnostics and browser-test outputs
+*.log
+/results/
+/test-results/
+/playwright-report/

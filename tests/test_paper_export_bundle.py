@@ -1,6 +1,7 @@
 from io import BytesIO
 import io
 import ast
+import copy
 from datetime import datetime
 import json
 from pathlib import Path
@@ -17,9 +18,10 @@ def app_functions():
     """Load only the export helper, without app startup or private audit scripts."""
     source = Path(__file__).resolve().parents[1] / 'app.py'
     tree = ast.parse(source.read_text(encoding='utf-8'))
-    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_paper_figure_downloads')
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+             and n.name in {'_paper_figure_downloads', '_paper_serialize_exports'}]
     namespace = dict(plt=plt, Optional=Optional, datetime=datetime, json=json, io=io, zipfile=zipfile)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), namespace)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), 'exec'), namespace)
     return namespace
 
 
@@ -109,3 +111,42 @@ def test_preview_offers_deferred_full_resolution_format_downloads():
         assert set(archive.namelist()) == {
             'preview.png', 'preview.pdf', 'preview.svg', 'figure-metadata.json',
         }
+
+
+def test_selected_subpanel_png_uses_source_figure_and_embeds_panel_metadata():
+    api = app_functions()
+    api['copy'] = copy
+    downloads = {}
+
+    class Column:
+        def download_button(self, label, data, **kwargs):
+            downloads[kwargs['file_name']] = data
+
+    api['st'] = SimpleNamespace(
+        session_state={'paper_titration_export_dpi': 600},
+        columns=lambda n: [Column() for _ in range(n)],
+        pyplot=lambda *a, **k: None,
+        selectbox=lambda label, choices, **kwargs: choices[1],
+        download_button=Column().download_button,
+    )
+    composite, axis = plt.subplots(figsize=(5, 2))
+    axis.plot([0, 1], [0, 1])
+    first, first_axis = plt.subplots(figsize=(3, 2))
+    first_axis.plot([0, 1], [0, 1])
+    second, second_axis = plt.subplots(figsize=(3, 2))
+    second_axis.plot([0, 1], [1, 0])
+    composite._paper_export_templates = [first, second]
+    composite._paper_panel_roles = ['manual_swv', 'response']
+    api['_paper_figure_downloads'](composite, 'example', {'recipe': {'kind': 'test'}})
+    panel = downloads['example_panel_B.png']()
+    with Image.open(BytesIO(panel)) as image:
+        assert image.width >= 1700
+        assert image.info['dpi'][0] == pytest.approx(600, abs=1)
+        embedded = json.loads(image.info['SWV Figure Metadata'])
+        assert embedded['panel_index'] == 1
+        assert embedded['panel_role'] == 'response'
+        assert embedded['recipe'] == {'kind': 'test'}
+    assert downloads['example_panel_B.pdf']().startswith(b'%PDF')
+    assert b'<svg' in downloads['example_panel_B.svg']()
+    plt.close(first)
+    plt.close(second)

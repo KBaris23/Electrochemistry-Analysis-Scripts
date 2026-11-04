@@ -23,7 +23,7 @@ def test_explicit_action_changes_appearance_only():
     assert state['bo_composer_height_1'] == pytest.approx(.17)
     assert state['bo_composer_left_1'] == .72
     assert state['bo_composer_bottom_1'] == .51
-    assert state['bo_composer_auto_fit_title_1'] is True
+    assert state['bo_composer_auto_fit_title_1'] is False
     assert state['bo_composer_title_size_1'] == 12.
     assert state['bo_composer_trace_width_1'] == 1.5
     assert state['bo_composer_title_size_2'] == 25.

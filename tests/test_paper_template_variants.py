@@ -29,6 +29,130 @@ def test_titration_export_request_is_queued_after_preview(api):
     assert api['st'].session_state['_paper_titration_export_requested'] is True
 
 
+def test_headless_replay_includes_native_prediction_collector(api):
+    assert api['supports_langmuir']('peak_current_selected')
+    assert api['collect_titration_measurement_accuracy_rows'](
+        [], metric_cfg={'Peak current': ('peak_current_selected', 'Current')},
+        channels=[], vlines=[], scan_range=(1, 10), edge_trim_fraction=.15,
+    ) == []
+
+
+@pytest.mark.parametrize('figure_type, expected', [
+    ('Type 3E - Titration and Langmuir', ['response', 'langmuir']),
+    ('Type 3F - SWVs only', ['manual_swv', 'optimized_swv']),
+    ('Type 3G - Titration, Langmuir and accuracy', ['response', 'langmuir', 'accuracy']),
+    ('Type 4B - Concentration prediction and accuracy', ['concentration', 'accuracy']),
+])
+def test_new_two_column_type_roles(api, figure_type, expected):
+    assert api['_paper_panel_roles'](figure_type) == expected
+
+
+def test_type3e_keeps_type3d_physical_panel_sizes_and_fonts(api):
+    reference = {
+        'paper_titration_width': 14.2, 'paper_titration_row_height': 2.6,
+        'paper_axis_label_font_size': 8., 'paper_tick_font_size': 6.8,
+        'paper_titration_row_layout_type_3d_swvs_and_response_only_0': [
+            [.02, .08, .22, .84], [.26, .08, .22, .84], [.5, .08, .37, .84]],
+    }
+    adapted = api['_paper_type3e_format_from_type3d'](reference)
+    rects = adapted['paper_titration_row_layout_type_3e_titration_and_langmuir_0']
+    assert adapted['paper_titration_width'] * rects[0][2] == pytest.approx(14.2 * .37)
+    assert adapted['paper_titration_width'] * rects[1][2] == pytest.approx(14.2 * .22)
+    assert adapted['paper_titration_row_height'] == 2.6
+    assert rects[0][1::2] == [.08, .84]
+    assert adapted['paper_axis_label_font_size'] == 8.
+    assert adapted['paper_tick_font_size'] == 6.8
+
+
+def test_type3g_uses_same_calibration_for_fit_and_accuracy(api, monkeypatch):
+    state = api['st'].session_state
+    state.update(api['_paper_type3g_format']({}))
+    state.update(paper_titration_fit_display_range=True)
+    calls = {}
+    def capture(name):
+        def run(*args, **kwargs):
+            calls[name] = kwargs
+            return [] if name == 'predictions' else plt.figure()
+        return run
+    for key, name in [('_paper_response_panel', 'response'),
+                      ('plot_titration_langmuir', 'fit'),
+                      ('collect_titration_measurement_accuracy_rows', 'predictions'),
+                      ('plot_titration_concentration_accuracy', 'accuracy'),
+                      ('_paper_composite_figure', 'composite')]:
+        monkeypatch.setitem(api, key, capture(name))
+    common = dict(vlines=[(1, 'buffer'), (11, '80 uM')],
+                  concentration_unit='uM', baseline_mode='preceding_buffer',
+                  edge_trim_fraction=.15, included_step_labels=['80 uM'])
+    api['_paper_type3g_figure']([], [], [(7, 'opt', 'control', (61, 200))],
+        fit_options=common, colors={'opt': '#0072B2', 'control': '#D55E00'},
+        response_directions={})
+    for key in (*common.keys(), 'scan_range', 'channels'):
+        assert calls['fit'][key] == calls['predictions'][key]
+    assert calls['fit']['scan_range'] == (61, 200)
+    assert calls['accuracy']['square_axes']
+    assert calls['composite']['panel_roles'] == ['response', 'langmuir', 'accuracy']
+    assert state['paper_titration_dose_font_size'] == 5.5
+
+
+def test_equal_plot_gaps_survive_export_rebuild(api):
+    figures = []
+    for left in (.12, .2, .31):
+        figure = plt.figure(figsize=(3, 2))
+        axis = figure.add_axes([left, .2, .6, .65])
+        axis.plot([0, 1], [0, 1])
+        figures.append(figure)
+    api['st'].session_state['paper_titration_full_panel_canvas'] = True
+    composite = api['_paper_composite_figure'](
+        figures, 1, 3, width=12.05, row_height=3.2, restyle=False,
+        panel_roles=['response', 'langmuir', 'accuracy'], equal_column_gaps=True,
+        raster_dpi=72,
+    )
+    for figure in (composite, composite._paper_export_factory(100)):
+        figure.canvas.draw()
+        bounds = []
+        for axis, guide in zip(figure.axes, figure._paper_panel_plot_guides):
+            box = axis.get_position()
+            left, _, width, _ = guide['source_box']
+            bounds.append((box.x0 + left*box.width, box.x0 + (left+width)*box.width))
+        assert bounds[1][0]-bounds[0][1] == pytest.approx(bounds[2][0]-bounds[1][1])
+
+
+def test_four_column_composite_expands_canvas_for_panel_pixels(api):
+    api['st'].session_state['paper_titration_min_panel_width'] = 3.0
+    figures = []
+    for _ in range(4):
+        figure, axis = plt.subplots(figsize=(2, 1.5))
+        axis.plot([0, 1], [0, 1])
+        figures.append(figure)
+    output = api['_paper_composite_figure'](
+        figures, 1, 4, width=10.0, row_height=2.4,
+        restyle=True, raster_dpi=72,
+    )
+    assert output.get_figwidth() >= 3.0 * (4 + 3 * .16) / .95
+    assert len(output._paper_export_templates) == 4
+    full = output._paper_export_factory(600)
+    assert full.axes[0].images[0].get_array().shape[1] >= 1800
+    plt.close(output)
+    plt.close(full)
+
+
+def test_stacked_panel_rebuilds_from_original_figures_at_export_dpi(api):
+    figures = []
+    for value in (0, 1):
+        figure, axis = plt.subplots(figsize=(2, 1))
+        axis.plot([0, 1], [value, 1 - value])
+        figures.append(figure)
+    preview = api['_paper_stack_vertically'](
+        figures, font_size=8, cell_w=2.5, cell_h=2.2, raster_dpi=72,
+    )
+    low_width = preview.axes[0].images[0].get_array().shape[1]
+    full = preview._paper_panel_export_factory(600, 3.0)
+    high_width = full.axes[0].images[0].get_array().shape[1]
+    assert high_width > low_width * 5
+    plt.close(preview)
+    plt.close(full)
+
+
 def test_titration_figure_type_preset_overwrites_format_without_data_choices(api, tmp_path):
     path = tmp_path / 'titration-presets.json'
     figure_type = 'Type 3D - SWVs and response only'
@@ -394,9 +518,54 @@ def test_3d_render_branch_does_not_call_langmuir(api):
     assert len(rendered[1]._paper_source_figures) == 3
 
 
+@pytest.mark.parametrize('kind, expected_calls, rendered_name', [
+    ('Type 3E - Titration and Langmuir', ['response', 'langmuir'], 'type3e'),
+    ('Type 3F - SWVs only', ['Manual', 'Optimized'], 'type3f'),
+])
+def test_new_type3_figures_render_only_requested_panels(api, kind, expected_calls, rendered_name):
+    tree = ast.parse(Path('app.py').read_text(encoding='utf-8'))
+    branch = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
+                  and ast.unparse(n.test) == "figure_type.startswith('Type 3')")
+    calls = []
+
+    def panel(name):
+        calls.append(name)
+        figure, axis = plt.subplots(figsize=(2, 1.5))
+        axis.plot([0, 1], [0, 1])
+        return figure
+
+    env = dict(api, figure_type=kind,
+               comparisons=[(3, 'optimized', 'manual', (1, 20))],
+               paper_source_results=[], paper_metric_results=[],
+               paper_trace_region='Corrected peak', paper_zero_anchors=True,
+               paper_accepted_only=True, paper_swv_display='Overlaid',
+               optimized_display_label='Optimized', unoptimized_display_label='Manual',
+               response_title_template='Response',
+               paper_fit_baseline='first_buffer',
+               optimized_trace_title='Optimized', unoptimized_trace_title='Manual',
+               paper_trace_stride=1, paper_response_display='Overlaid',
+               paper_y_label='Current', paper_display_vlines=[],
+               paper_display_vlines_by_channel={}, consistent_channel_colors={},
+               paper_response_change=False, panels=[],
+               paper_panel_roles=api['_paper_panel_roles'](kind),
+               paper_width=9., paper_row_height=2.5, paper_font=8.,
+               paper_raster_dpi=72, paper_column_gap=.16, paper_row_gap=.18,
+               paper_rows=1, paper_extra_columns=[],
+               prepare_titration_swv_traces=lambda rows, **kwargs: rows,
+               plot_overlaid_traces=lambda *args, **kwargs: panel(kwargs['title']),
+               plot_metric_vs_scan=lambda *args, **kwargs: panel('response'),
+               comparison_langmuir=lambda *args, **kwargs: panel('langmuir'))
+    exec(compile(ast.Module(body=branch.body, type_ignores=[]), 'app.py', 'exec'), env)
+    assert calls == expected_calls
+    rendered = api['st'].session_state['paper_titration_render']
+    assert rendered[0] == rendered_name
+    assert len(rendered[1]._paper_source_figures) == 2
+
+
 @pytest.mark.parametrize('kind, expected', [
     ('Type 4 - Concentration validation', ['concentration', 'accuracy']),
     ('Type 4A - Langmuir and concentration validation', ['langmuir', 'concentration', 'accuracy']),
+    ('Type 4B - Concentration prediction and accuracy', ['concentration', 'accuracy']),
 ])
 def test_prediction_render_branch_order_and_calibration(api, kind, expected):
     tree = ast.parse(Path('app.py').read_text(encoding='utf-8'))
@@ -437,5 +606,5 @@ def test_prediction_render_branch_order_and_calibration(api, kind, expected):
     exec(compile(ast.Module(body=node.orelse, type_ignores=[]), 'app.py', 'exec'), env)
     assert calls == expected
     rendered = api['st'].session_state['paper_titration_render']
-    assert rendered[0] == ('type4a' if '4A' in kind else 'type4')
+    assert rendered[0] == ('type4a' if '4A' in kind else 'type4b' if '4B' in kind else 'type4')
     assert len(rendered[1]._paper_source_figures) == len(expected)

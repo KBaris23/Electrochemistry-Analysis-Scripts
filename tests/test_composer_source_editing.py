@@ -189,6 +189,19 @@ def test_map_source_edit_updates_linked_slice_without_changing_other_plane():
     assert state["bo_composer_type1_compact_slice_values"] == [.003,.007]
 
 
+def test_equal_map_planes_keep_their_slots_when_one_is_changed():
+    state = {"bo_composer_count": 6, "bo_composer_type1_compact_linked_controls": True,
+             "bo_composer_type1_compact_slice_values": [.004, .007]}
+    apply_source_edit(state, {"index": 4, "spec": {
+        "kind": "Measured 2D map", "slice_value": .007,
+    }})
+    assert state["bo_composer_type1_compact_slice_values"] == [.007, .007]
+    apply_source_edit(state, {"index": 5, "spec": {
+        "kind": "Measured 2D map", "slice_value": .002,
+    }})
+    assert state["bo_composer_type1_compact_slice_values"] == [.007, .002]
+
+
 def test_chronological_source_controls_round_trip_without_layout_changes():
     state = {"bo_composer_count": 1, "bo_composer_left_0": .05}
     assert apply_source_edit(state, {"index": 0, "spec": {

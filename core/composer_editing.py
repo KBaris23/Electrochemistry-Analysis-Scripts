@@ -18,7 +18,7 @@ def preset_with_current_selections(config, current):
     for i in range(int(current.get('bo_composer_count', 0))):
         current_by_kind.setdefault(current.get(f'bo_composer_kind_{i}'), []).append(i)
     occurrences = {}
-    choices = {'channels', 'observation_iteration', 'slice_axis', 'slice_value', 'group_id'}
+    choices = {'channels', 'observation_iteration', 'slice_axis', 'slice_value', 'group_id', 'optimization_direction'}
     for index in range(int(saved.get('bo_composer_count', 0))):
         kind = saved.get(f'bo_composer_kind_{index}')
         ordinal = occurrences.get(kind, 0)
@@ -87,7 +87,7 @@ def restore_compact_swv_appearance(state, index, canvas_size=(14., 10.)):
     state[f'bo_composer_swv_title_style_{index}'] = 'Compact signal role'
     state[f'bo_composer_custom_title_{index}'] = ''
     state[f'bo_composer_hide_title_{index}'] = False
-    state[f'bo_composer_auto_fit_title_{index}'] = True
+    state[f'bo_composer_auto_fit_title_{index}'] = False
     # Reference slot is 2.61 x 1.70 inches on a 14 x 10 inch canvas.
     width = min(.95, max(.05, 2.61 / float(canvas_size[0])))
     height = min(.95, max(.05, 1.70 / float(canvas_size[1])))
@@ -210,13 +210,17 @@ SOURCE_FIELDS = {
         "highlight_color_mode": "measured_highlight_color_mode",
         "highlight_colors": "measured_highlight_colors",
         "q_colorbar_inset": "q_colorbar_inset",
+        "show_best_parameters": "show_best_parameters",
+        "best_parameters_placement": "best_parameters_placement",
+        "show_path_start": "path_start", "show_path_final": "path_final",
     },
     "Measured 2D map": {
         "channels": "real_channels", "metric": "real_metric", "phase": "real_phase",
         "average_channels": "real_average", "x": "real_x", "y": "real_y",
         "slice_axis": "real_slice_axis", "slice_value": "real_slice_value",
+        "show_q_colorbar": "real_show_q_colorbar",
     },
-    "Global trend": {"metric": "global_metric", "running_mean_window": "global_running_mean", "group_id": "global_group"},
+    "Global trend": {"metric": "global_metric", "running_mean_window": "global_running_mean", "group_id": "global_group", "optimization_direction": "global_direction", "show_q_score_legend": "show_q_score_legend"},
     "Channel trend": {"metric": "channel_metric", "channels": "channel_channels"},
     "Buffer/target trend": {"metric": "paired_metric", "channels": "paired_channels"},
     "Chronological SWV stack": {
@@ -228,6 +232,8 @@ SOURCE_FIELDS = {
         "voltage_display_range": "stack_voltage_range",
         "voltage_min": "stack_voltage_min", "voltage_max": "stack_voltage_max",
         "stack_legend_location": "stack_legend_location",
+        "stack_legend_columns": "stack_legend_columns",
+        "stack_legend_y": "stack_legend_y",
         "coordinate_frame_style": "stack_axis_style", "current_axis_scale": "stack_current_axis_scale",
         "reverse_stack_order": "stack_reverse_order", "show_axis_ticks": "stack_axis_ticks",
         "stack_axis_gap": "stack_axis_gap", "stack_depth_spacing": "stack_depth_spacing",
@@ -273,7 +279,10 @@ def apply_source_edit(state, edit):
         state["bo_composer_type1_compact_linked_controls"] = False
     for field, key in SOURCE_FIELDS[spec["kind"]].items():
         if field in spec:
-            state[f"bo_composer_{key}_{index}"] = copy.deepcopy(spec[field])
+            value = copy.deepcopy(spec[field])
+            if field == 'stack_legend_y' and value is not None:
+                value = int(round(float(value) * 100))
+            state[f"bo_composer_{key}_{index}"] = value
     if spec["kind"] == "Measured 3D tensor" and spec.get("highlight_colors"):
         colors = list(spec["highlight_colors"])
         if colors:
@@ -321,7 +330,9 @@ def apply_source_edit(state, edit):
             planes = list(state.get(prefix + "_slice_values", []))
             if len(planes) > index-map_start:
                 planes[index-map_start] = spec["slice_value"]
-                state[prefix + "_slice_values"] = list(dict.fromkeys(planes))
+                # Each position belongs to a map; equal plane values must not
+                # collapse the list and shift the other maps' selections.
+                state[prefix + "_slice_values"] = planes
     state["bo_composer_active_panel"] = index
     # Source changes are cheap state edits. Rebuilding every panel here made
     # Update feel frozen; the user can preview one source or render explicitly.

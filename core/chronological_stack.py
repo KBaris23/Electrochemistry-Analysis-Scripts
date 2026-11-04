@@ -58,7 +58,8 @@ class _AxisTick(Line2D):
 def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
                           line_width=1.5, show_ticks=True, current_scale=.72,
                           current_top=None, normalized=False, legend_location="upper right",
-                          axis_gap=.08, depth_spacing=1.18):
+                          axis_gap=.08, depth_spacing=1.18,
+                          legend_columns=1, legend_y=None):
     iterations = sorted({row["iteration"] for row in rows})
     ordered = iterations if reverse else iterations[::-1]
     ranks = {iteration: rank for rank, iteration in enumerate(ordered)}
@@ -131,9 +132,8 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
     voltage_label = axis_title('Voltage (V)', 'voltage', 21.)
     current_label = axis_title('Normalized Current' if normalized else 'Current (µA)',
                                'current', 26., position=.75)
-    # The midpoint is also a labelled iteration tick. Keep the axis title on
-    # the first quarter of the diagonal so it cannot sit on that tick.
-    label = axis_title('Iteration Number', 'iteration', 34., position=.25)
+    # Center along the axis; perpendicular point padding clears its middle tick.
+    label = axis_title('Iteration Number', 'iteration', 50., position=.5)
     label._bo_stack_depth_label = True
     for item in (voltage_label, current_label, label):
         item._bo_axis_label = True
@@ -145,8 +145,9 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
                       linestyle="-", lw=1.3) for phase in phases],
               [phase.title() for phase in phases], loc=legend_location,
               bbox_to_anchor=(.98 if 'right' in legend_location else .02,
-                              .90 if 'upper' in legend_location else .10),
-              ncol=min(2, len(phases)), fontsize=8, frameon=False,
+                              float(legend_y) if legend_y is not None else
+                              (.72 if 'upper' in legend_location else .10)),
+              ncol=min(max(1, int(legend_columns)), len(phases)), fontsize=8, frameon=False,
               borderpad=0, borderaxespad=0, handlelength=1.6, handletextpad=.45,
               columnspacing=1.25, labelspacing=.35)
     bounds = np.asarray(bounds)

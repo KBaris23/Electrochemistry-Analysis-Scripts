@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.plotting import (
     CONCENTRATION_DISPLAY_MODES,
+    add_scan_vlines,
     _langmuir_isotherm,
     _invert_langmuir_response,
     _prepare_titration_fit_points,
@@ -351,6 +352,77 @@ def test_midpoint_titration_labels_keep_boundaries_and_hide_closing_label():
     assert len(boundaries) == 3
     assert [label.get_text() for label in labels] == ["buffer", "10 uM"]
     assert np.allclose([label.get_position()[0] for label in labels], [2.5, 5.5])
+
+
+def test_dose_strip_keeps_boundaries_and_centers_horizontal_labels():
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots()
+    markers = [(1, "buffer"), (4, "10 uM"), (7, "20 uM"), (10, "end")]
+    add_scan_vlines(axis, markers, label_mode="Dose strip (all concentrations)")
+
+    boundaries = [line for line in axis.lines if getattr(line, "_swv_titration_vline", False)]
+    labels = [text for text in axis.texts if getattr(text, "_swv_titration_dose_strip", False)]
+    assert len(boundaries) == 4
+    assert [text.get_text() for text in labels] == ["buffer", "10 uM", "20 uM"]
+    assert np.allclose([text.get_position()[0] for text in labels], [2.5, 5.5, 8.5])
+    assert all(text.get_rotation() == 0 and text.get_position()[1] > 1 for text in labels)
+    assert any(getattr(patch, "_swv_titration_dose_strip", False) for patch in axis.patches)
+    plt.close(figure)
+
+
+def test_sparse_dose_strip_keeps_first_last_and_alternating_doses():
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots()
+    markers = [(index, str(index)) for index in range(1, 7)] + [(7, "end")]
+    add_scan_vlines(axis, markers, label_mode="Dose strip (every other concentration)")
+
+    labels = [text.get_text() for text in axis.texts
+              if getattr(text, "_swv_titration_dose_strip", False)]
+    assert labels == ["1", "3", "5", "6"]
+    assert len([line for line in axis.lines if getattr(line, "_swv_titration_vline", False)]) == 7
+    plt.close(figure)
+
+
+def test_channel_specific_dose_strips_use_separate_rows():
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots()
+    markers = [(1, "1 nM"), (4, "2 nM"), (7, "end")]
+    add_scan_vlines(axis, markers, label_mode="Dose strip (all concentrations)",
+                    label_prefix="Control: ", strip_row=0)
+    add_scan_vlines(axis, markers, label_mode="Dose strip (all concentrations)",
+                    label_prefix="Optimized: ", strip_row=1)
+
+    strips = [patch for patch in axis.patches
+              if getattr(patch, "_swv_titration_dose_strip", False)]
+    assert len(strips) == 2
+    assert strips[1].get_y() > strips[0].get_y() + strips[0].get_height()
+    labels = [text.get_text() for text in axis.texts
+              if getattr(text, "_swv_titration_dose_strip", False)]
+    assert labels == ["Control", "1 nM", "2 nM", "Optimized", "1 nM", "2 nM"]
+    plt.close(figure)
+
+
+def test_concentration_prediction_plot_accepts_dose_strip_mode():
+    import matplotlib.pyplot as plt
+
+    rows = [
+        {"channel": 1, "scan_number": index, "known_concentration": float(index),
+         "predicted_concentration": float(index) * 1.1}
+        for index in range(1, 5)
+    ]
+    figure = plot_titration_concentration_vs_measurement(
+        rows, vlines=[(1, "1 nM"), (3, "3 nM"), (5, "end")],
+        vline_label_mode="Dose strip (all concentrations)",
+    )
+
+    assert figure is not None
+    labels = [text.get_text() for text in figure.axes[0].texts
+              if getattr(text, "_swv_titration_dose_strip", False)]
+    assert labels == ["1 nM", "3 nM"]
+    plt.close(figure)
 
 
 def test_metric_plot_plateau_overlay_is_disconnected_and_has_std_error_bars():

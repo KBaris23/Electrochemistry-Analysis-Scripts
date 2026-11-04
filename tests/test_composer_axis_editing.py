@@ -5,6 +5,24 @@ import bo_session_viewer as viewer
 from core.chronological_stack import draw_coordinate_stack
 
 
+def test_standardize_text_clears_stale_overrides_without_changing_data(monkeypatch):
+    state = dict(bo_composer_count=3, bo_composer_font_size=14,
+                 bo_composer_title_size_0=8., bo_composer_z_axis_size_2=20.,
+                 bo_composer_individual_axis_sizes_2=True, bo_composer_auto_fit_title_0=True,
+                 bo_composer_validation_channel='7_max', bo_composer_left_0=.03,
+                 bo_composer_editor_last={'values': {'title_size': 8.}})
+    monkeypatch.setattr(viewer.st, 'session_state', state)
+    viewer._composer_standardize_text_sizes()
+    for index in range(3):
+        for field in ('title_size', 'axis_label_size', 'tick_size', 'legend_size', 'z_axis_size'):
+            assert state[f'bo_composer_{field}_{index}'] == 14.
+        assert not state[f'bo_composer_individual_axis_sizes_{index}']
+        assert not state[f'bo_composer_auto_fit_title_{index}']
+    assert 'bo_composer_editor_last' not in state
+    assert state['bo_composer_validation_channel'] == '7_max'
+    assert state['bo_composer_left_0'] == .03
+
+
 def test_stack_title_has_separate_lane_and_editable_names():
     fig, ax = plt.subplots(figsize=(5, 4))
     rows = [dict(iteration=i, phase='buffer', voltage=np.linspace(-.4, 0, 40),

@@ -15,7 +15,7 @@ def app_functions():
     functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
     selected = {name for name in functions if name.startswith("_paper_")}
     selected.update(("annotate_swv_peak_height_metrics", "apply_swv_settings_split_for_display",
-                     "_apply_paper_recipe"))
+                     "_apply_paper_recipe", "collect_titration_measurement_accuracy_rows"))
     while True:
         dependencies = {node.id for name in selected for node in ast.walk(functions[name])
                         if isinstance(node, ast.Name)} & functions.keys()
@@ -31,7 +31,7 @@ def app_functions():
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(isinstance(target, ast.Name) and (
-                target.id.startswith("_PAPER_") or target.id == "SWV_SETTING_FIELDS"
+                target.id.startswith("_PAPER_") or target.id in {"SWV_SETTING_FIELDS", "LANGMUIR_METRIC_KEYS"}
             ) for target in targets):
                 nodes.append(node)
     namespace = {"__name__": "paper_replay_helpers"}

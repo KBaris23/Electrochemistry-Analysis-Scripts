@@ -101,6 +101,326 @@ def test_bo_optimization_template_places_five_panels_inside_canvas():
         assert 0 <= bottom and bottom + height <= 1.0
 
 
+def test_type2b_keeps_full_q_history_above_best_truncated_cube():
+    state = viewer._paper_bo_validation_best_path_preset()['config']['state']
+    assert state['bo_composer_aspect'] == '16:9'
+    assert [state[f'bo_composer_kind_{i}'] for i in range(state['bo_composer_count'])] == [
+        'Global trend', 'Measured 3D tensor', 'Chronological SWV stack',
+    ]
+    assert state['bo_composer_bottom_0'] > state['bo_composer_bottom_1']
+    assert state['bo_composer_measured_stop_at_best_1'] is True
+    assert state['bo_composer_measured_path_projection_1'] is False
+    reference = viewer._paper_bo_validation_focused_preset()['config']['state']
+    size = viewer.COMPOSER_CANVAS_SIZES[state['bo_composer_aspect']]
+    reference_size = viewer.COMPOSER_CANVAS_SIZES[reference['bo_composer_aspect']]
+    for index, source in ((0, 1), (1, 0)):
+        if index == 0:
+            for dimension, inches, reference_inches in zip(('width', 'height'), size, reference_size):
+                assert state[f'bo_composer_{dimension}_{index}'] * inches == pytest.approx(
+                    reference[f'bo_composer_{dimension}_{source}'] * reference_inches)
+        for field in ('title_size', 'axis_label_size', 'tick_size', 'legend_size'):
+            assert state[f'bo_composer_{field}_{index}'] == reference[f'bo_composer_{field}_{source}']
+    assert state['bo_composer_bottom_2'] == state['bo_composer_bottom_1']
+    assert state['bo_composer_bottom_1'] + state['bo_composer_height_1'] == pytest.approx(
+        state['bo_composer_bottom_0'] + state['bo_composer_height_0'])
+    assert state['bo_composer_bottom_2'] + state['bo_composer_height_2'] < state['bo_composer_bottom_0']
+    assert max(state[f'bo_composer_left_{i}'] + state[f'bo_composer_width_{i}']
+               for i in (0, 2)) < state['bo_composer_left_1']
+    assert 'bo_composer_stack_auto_polish_2' not in state
+    assert state['bo_composer_stack_axis_style_2'] == 'Shared-Origin Three-Axis Frame'
+    assert state['bo_composer_stack_show_all_2'] is True
+    assert state['bo_composer_show_best_2'] is False
+    assert state['bo_composer_measured_y_1'] == reference['bo_composer_measured_y_0']
+    assert state['bo_composer_measured_z_1'] == reference['bo_composer_measured_z_0']
+    for field in ('camera_x', 'camera_y', 'camera_z', 'camera_zoom', 'measured_dot_size'):
+        assert state[f'bo_composer_{field}_1'] == reference[f'bo_composer_{field}_0']
+    assert 'bo_composer_stack_channels_2' not in state
+    assert 'bo_composer_validation_excluded_iterations' not in state
+
+
+def test_independent_q_panels_keep_minimize_and_maximize_runs_separate():
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    history = pd.DataFrame([
+        dict(group_id=7, iteration=i, optimization_direction=direction, Q_run=q)
+        for direction, values in [('maximize', [1., 9., 2.]), ('minimize', [-1., -2., -8.])]
+        for i, q in enumerate(values, 1)])
+    specs = [dict(kind='Global trend', group_id=7, optimization_direction=direction,
+                  metric='Q_run', show_best=True, show_label=False, rect=(.07 + i*.49, .15, .4, .7))
+             for i, direction in enumerate(('maximize', 'minimize'))]
+    fig = viewer._build_composer_figure({'config': {}}, history, [], {}, {}, False,
+        specs, '16:9', 'Arial', 10, 9, '', 72)
+    try:
+        assert list(fig.axes[0].lines[0].get_ydata()) == [1., 9., 2.]
+        assert list(fig.axes[1].lines[0].get_ydata()) == [-1., -2., -8.]
+        assert any(line.get_label() == 'Best observed: 2' for line in fig.axes[0].lines)
+        assert any(line.get_label() == 'Best observed: 3' for line in fig.axes[1].lines)
+    finally:
+        plt.close(fig)
+
+
+def test_panel_channel_selects_its_own_group_and_direction():
+    import pandas as pd
+    observations = [dict(group_id=g, iteration=1, optimization_direction=d, analysis_channels=[f'{g}_{suffix}'])
+                    for g in (7, 8) for d, suffix in [('maximize', 'max'), ('minimize', 'min')]]
+    history = pd.DataFrame(observations).assign(Q_run=[1., -2., 3., -4.])
+    for channel, group, direction in [('7_max', 7, 'maximize'), ('8_min', 8, 'minimize')]:
+        selected, frame = viewer._composer_panel_scope({'channels': [channel], 'optimization_direction': 'Both'}, observations, history)
+        assert len(selected) == len(frame) == 1
+        assert selected[0]['group_id'] == group
+        assert frame.optimization_direction.iloc[0] == direction
+
+
+def test_cube_best_cutoff_preserves_parameter_bounds(monkeypatch):
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    points = pd.DataFrame({
+        'iteration': [1, 2, 3], 'group_id': [1, 1, 1],
+        'amplitude': [.01, .05, .2],
+        'frequency': [100., 200., 500.],
+        'step_potential': [.001, .004, .010],
+        'value': [1., 3., 2.],
+    })
+    monkeypatch.setattr(viewer, '_composer_real_points', lambda spec, rows: points)
+    figure = plt.figure(figsize=(4, 4))
+    slot = figure.add_axes([.1, .1, .8, .8])
+    axis = viewer._composer_draw_cube(figure, slot, {
+        'rect': (.1, .1, .8, .8), 'x': 'amplitude', 'y': 'frequency',
+        'z': 'step_potential', 'metric': 'Paired Q', 'best_iteration': 2,
+        'stop_at_best': True, 'show_iteration_path': True,
+        'show_path_endpoints': True, 'show_path_projection': True,
+        'show_example_markers': True, 'highlight_iterations': [],
+    }, [])
+    assert axis.get_xlim()[1] == pytest.approx(.2)
+    assert len(axis.collections[0]._offsets3d[0]) == 2
+    assert [label for _, label, _, _ in axis._composer_endpoint_labels] == [
+        'Start · iter 1',
+    ]
+    plt.close(figure)
+
+
+@pytest.mark.parametrize('q_range,uniform_size', [((0, 2), None), ((-12, 27), None), ((-12, 27), 14.)])
+def test_type2b_render_has_readable_q_axes_and_no_wall_projections(monkeypatch, tmp_path, q_range, uniform_size):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    state = viewer._paper_bo_validation_best_path_preset()['config']['state']
+    rng = np.random.default_rng(42)
+    points = pd.DataFrame({
+        'iteration': np.arange(1, 41), 'group_id': 1,
+        'amplitude': rng.uniform(.01, .2, 40),
+        'frequency': rng.uniform(10, 500, 40),
+        'step_potential': rng.uniform(.001, .01, 40),
+        'value': rng.uniform(*q_range, 40),
+    })
+    history = points[['iteration', 'group_id']].assign(
+        Q_run=points.value, optimization_direction='maximize',
+    )
+    monkeypatch.setattr(viewer, '_composer_real_points', lambda *args: points)
+    voltage = np.linspace(-.5, .1, 120)
+    rows = [dict(iteration=iteration, phase=phase, voltage=voltage,
+                 current=height * np.exp(-((voltage + .2) / .06) ** 2))
+            for iteration in range(1, 41)
+            for phase, height in (('buffer', 1 + iteration / 80), ('target', 1.5 + iteration / 80))]
+    monkeypatch.setattr(viewer, '_composer_trace_entries', lambda *args: [])
+    monkeypatch.setattr(viewer, '_chronological_swv_stack_entries', lambda *args, **kwargs: (rows, [], []))
+    specs = []
+    for index in range(3):
+        spec = dict(kind=state[f'bo_composer_kind_{index}'], show_label=False, show_best=True)
+        spec['rect'] = tuple(state[f'bo_composer_{key}_{index}'] for key in ('left', 'bottom', 'width', 'height'))
+        for field in ('title_size', 'axis_label_size', 'tick_size', 'legend_size'):
+            spec[field] = uniform_size or state[f'bo_composer_{field}_{index}']
+        specs.append(spec)
+    specs[0].update(metric='Q_run', show_best_so_far=True)
+    specs[1].update(metric='Paired Q', x='amplitude',
+                    y=state['bo_composer_measured_y_1'], z=state['bo_composer_measured_z_1'],
+                    camera={'eye': {axis: state[f'bo_composer_camera_{axis}_1'] for axis in ('x', 'y', 'z')}},
+                    dot_size=state['bo_composer_measured_dot_size_1'],
+                    fade_path=state['bo_composer_fade_path_1'],
+                    path_line_width=state['bo_composer_path_width_1'],
+                    show_iteration_path=True, stop_at_best=True,
+                    show_path_endpoints=state['bo_composer_path_endpoints_1'],
+                    show_path_projection=state['bo_composer_measured_path_projection_1'],
+                    best_label_dx=-36, best_label_dy=-10, start_label_dx=-12, start_label_dy=-16,
+                    colorbar_side='right')
+    specs[2].update(channels=['1'], corrected=True, show_best=False, hide_title=True,
+                    use_bo_snapshot=False, phases=['buffer', 'target'], excluded_iterations=[])
+    fig = viewer._build_composer_figure(
+        {'config': {}}, history, [], {}, {}, False, specs,
+        state['bo_composer_aspect'], state['bo_composer_font'], state['bo_composer_font_size'],
+        9, '', 100, journal_style=True,
+    )
+    try:
+        # Verify the final fitted plot, not just the requested slot dimensions.
+        ax = fig.axes[0]
+        assert ax.get_position().width * fig.get_figwidth() > 4
+        assert ax.get_position().height * fig.get_figheight() > 1
+        assert ax.title.get_fontsize() == specs[0]['title_size']
+        assert all(text.get_fontsize() == specs[0]['legend_size'] for text in ax.get_legend().get_texts())
+        cube = next(axis for axis in fig.axes if axis.name == '3d')
+        assert not any(line.get_linestyle() == '--' for line in cube.lines)
+        path_lines = [line for line in cube.lines if getattr(line, '_composer_iteration_path', False)]
+        assert path_lines
+        assert all(line.get_linewidth() == 2.0 for line in path_lines)
+        iteration_bar = next(axis for axis in fig.axes if hasattr(axis, '_composer_follow_q_axis'))
+        assert iteration_bar.get_position().width > iteration_bar._composer_follow_q_axis.get_position().width
+        q_bar = iteration_bar._composer_follow_q_axis
+        renderer = fig.canvas.get_renderer()
+        from mpl_toolkits.mplot3d import proj3d
+        from itertools import product
+        vertices = np.array(list(product(cube.get_xlim(), cube.get_ylim(), cube.get_zlim())))
+        px, py, _ = proj3d.proj_transform(*vertices.T, cube.get_proj())
+        cube_right = cube.transData.transform(np.column_stack([px, py]))[:, 0].max()
+        assert 0 < q_bar.bbox.x0 - cube_right <= renderer.points_to_pixels(12.) + .1
+        tick_right = max(label.get_window_extent(renderer).x1 for label in q_bar.get_yticklabels())
+        assert iteration_bar.bbox.x0 - tick_right >= renderer.points_to_pixels(4.) - .1
+        if uniform_size is None:
+            assert iteration_bar.bbox.x0 - q_bar.bbox.x1 < 46
+        assert iteration_bar.title.get_window_extent(renderer).x0 > q_bar.title.get_window_extent(renderer).x1
+        assert iteration_bar.title.get_fontsize() == specs[1]['axis_label_size']
+        assert all(label.get_fontsize() == specs[1]['tick_size'] for label in q_bar.get_yticklabels())
+        assert cube.zaxis.label.get_fontsize() == specs[1]['axis_label_size']
+        assert all(text.get_fontsize() == specs[1]['legend_size']
+                   for text in cube.texts if text.get_text().startswith('Best '))
+        assert cube.get_zlabel() == 'Frequency (Hz)'
+        assert cube.get_ylabel() == 'Step size (mV)'
+        stack_host = next(axis for axis in fig.axes if hasattr(axis, '_composer_vector_figure'))
+        stack = stack_host._composer_vector_figure
+        # The raster preview and vector source occupy the same physical size;
+        # embedding must not scale the requested text points.
+        np.testing.assert_allclose(stack.get_size_inches(),
+            np.array(fig.get_size_inches()) * np.array(stack_host.get_position().bounds[2:]))
+        stack_axis = stack.axes[0]
+        assert all(text.get_fontsize() == specs[2]['axis_label_size']
+                   for text in stack_axis.texts if getattr(text, '_bo_axis_label', False))
+        assert all(text.get_fontsize() == specs[2]['tick_size']
+                   for text in stack_axis.texts if getattr(text, '_bo_axis_tick', False))
+        assert all(text.get_fontsize() == specs[2]['legend_size']
+                   for text in stack_axis.get_legend().get_texts())
+        assert cube.azim == pytest.approx(np.degrees(np.arctan2(1.15, 1.65)))
+        assert len(fig._composer_panel_groups) == 3
+        assert fig._composer_panel_audit[-1]['coordinate_frame_style'] == 'Shared-Origin Three-Axis Frame'
+        fig.savefig(tmp_path / 'type2b_preview.png', dpi=120, facecolor='white')
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize('aspect,rects', [
+    ('ACS 1-col tall (3.3 x 7.0 in)', ((.10, .61, .82, .29), (.06, .08, .88, .47))),
+    ('BO path workspace (6.4 x 9 in)', ((.11, .755, .78, .2), (.06, .04, .88, .624))),
+])
+def test_loaded_type2b_upgrades_once_preserving_data_and_custom_titles(aspect, rects):
+    state = dict(bo_composer_count=2, bo_composer_aspect=aspect,
+                 bo_composer_kind_0='Global trend', bo_composer_kind_1='Measured 3D tensor',
+                 bo_composer_validation_linked=True, bo_composer_measured_stop_at_best_1=True,
+                 bo_composer_validation_channel='8_max', bo_composer_validation_group=8,
+                 bo_composer_validation_excluded_iterations=[3],
+                 bo_composer_custom_title_0='My Q plot', bo_composer_render_old='stale',
+                 bo_composer_measured_path_projection_1=True)
+    for index, rect in enumerate(rects):
+        state.update({f'bo_composer_{field}_{index}': value
+                      for field, value in zip(('left', 'bottom', 'width', 'height'), rect)})
+    custom = {**state, 'bo_composer_width_0': .5}
+    assert not viewer._composer_upgrade_original_type2b(custom)
+    assert custom['bo_composer_count'] == 2
+    assert viewer._composer_upgrade_original_type2b(state)
+    assert state['bo_composer_count'] == 3
+    assert not state['bo_composer_measured_path_projection_1']
+    assert 'bo_composer_render_old' not in state
+    assert state['bo_composer_auto_render']
+    assert state['bo_composer_validation_channel'] == '8_max'
+    assert state['bo_composer_validation_group'] == 8
+    assert state['bo_composer_validation_excluded_iterations'] == [3]
+    assert state['bo_composer_custom_title_0'] == 'My Q plot'
+    assert not viewer._composer_upgrade_original_type2b(state)
+
+
+def test_loaded_type2b_cube_view_updates_once_without_changing_layout_or_data():
+    state = viewer._paper_bo_validation_best_path_preset()['config']['state']
+    state.pop('bo_composer_type2b_cube_style_version')
+    state.update(bo_composer_measured_y_1='frequency', bo_composer_measured_z_1='step_potential',
+                 bo_composer_camera_x_1=1.45, bo_composer_validation_channel='8_min',
+                 bo_composer_render_old='stale', bo_composer_custom_title_1='My cube')
+    geometry = {k: v for k, v in state.items() if any(f'bo_composer_{f}_' in k for f in ('left', 'bottom', 'width', 'height'))}
+    assert viewer._composer_upgrade_type2b_cube(state)
+    assert state['bo_composer_measured_y_1'] == 'step_potential'
+    assert state['bo_composer_measured_z_1'] == 'frequency'
+    assert state['bo_composer_camera_x_1'] == 1.65
+    assert state['bo_composer_validation_channel'] == '8_min'
+    assert state['bo_composer_custom_title_1'] == 'My cube'
+    assert all(state[k] == v for k, v in geometry.items())
+    assert 'bo_composer_render_old' not in state
+    assert state['bo_composer_auto_render']
+    state['bo_composer_camera_x_1'] = 2.0
+    assert not viewer._composer_upgrade_type2b_cube(state)
+    assert state['bo_composer_camera_x_1'] == 2.0
+
+
+def test_type2b_layout_moves_cube_right_and_preserves_data_and_polish_choice():
+    state = viewer._paper_bo_validation_best_path_preset()['config']['state']
+    state.pop('bo_composer_type2b_layout_version')
+    state.pop('bo_composer_type2b_path_style_version')
+    state.update(bo_composer_aspect='BO path and stack workspace (12.8 x 9 in)',
+                 bo_composer_validation_channel='7_max', bo_composer_stack_auto_polish_2=False,
+                 bo_composer_left_1=.03, bo_composer_height_1=.624)
+    assert viewer._composer_upgrade_type2b_layout(state)
+    assert state['bo_composer_aspect'] == '16:9'
+    assert state['bo_composer_height_1'] == .9
+    assert state['bo_composer_left_1'] == .48
+    assert state['bo_composer_validation_channel'] == '7_max'
+    assert state['bo_composer_stack_auto_polish_2'] is False
+    assert state['bo_composer_path_width_1'] == 2.0
+    assert not viewer._composer_upgrade_type2b_layout(state)
+
+
+def test_type2b_existing_v2_layout_swaps_once_preserving_fonts_and_sources():
+    state = viewer._paper_bo_validation_best_path_preset()['config']['state']
+    state.update(bo_composer_type2b_layout_version=2, bo_composer_left_1=.02,
+                 bo_composer_left_0=.58, bo_composer_left_2=.55,
+                 bo_composer_title_size_1=17., bo_composer_validation_channel='7_max',
+                 bo_composer_validation_excluded_iterations=[2, 22])
+    assert viewer._composer_upgrade_type2b_layout(state)
+    assert state['bo_composer_left_1'] == .48
+    assert state['bo_composer_left_0'] == .03
+    assert state['bo_composer_left_2'] == .02
+    assert state['bo_composer_title_size_1'] == 17.
+    assert state['bo_composer_validation_channel'] == '7_max'
+    assert state['bo_composer_validation_excluded_iterations'] == [2, 22]
+    state['bo_composer_left_1'] = .5
+    assert not viewer._composer_upgrade_type2b_layout(state)
+    assert state['bo_composer_left_1'] == .5
+
+
+def test_type2b_stale_geometry_with_new_version_flag_is_repaired_once():
+    state = viewer._paper_bo_validation_best_path_preset()['config']['state']
+    state.pop('bo_composer_type2b_colorbar_version')
+    state.update(bo_composer_left_1=.02, bo_composer_left_0=.58, bo_composer_left_2=.55,
+                 bo_composer_render_old={'png': b'old preview'})
+    assert viewer._composer_upgrade_type2b_layout(state)
+    assert state['bo_composer_left_1'] == .48
+    assert state['bo_composer_left_2'] == .02
+    assert 'bo_composer_render_old' not in state
+    # A later deliberate manual rearrangement remains editable.
+    state.update(bo_composer_left_1=.02, bo_composer_left_2=.55)
+    assert not viewer._composer_upgrade_type2b_layout(state)
+
+
+def test_type2b_saved_menu_entry_has_the_updated_columns():
+    name = 'Type 2B - Q history and best-point path'
+    menu = {name: viewer._paper_bo_validation_best_path_preset()}
+    menu.update(viewer._composer_load_presets())
+    config = menu[name]['config']
+    state = config['state']
+    assert state['bo_composer_left_0'] < state['bo_composer_left_1']
+    assert state['bo_composer_left_2'] < state['bo_composer_left_1']
+    assert state['bo_composer_bottom_0'] > state['bo_composer_bottom_2']
+    for index, panel in enumerate(config['panels']):
+        assert panel['rect'] == [state[f'bo_composer_{field}_{index}']
+                                 for field in ('left', 'bottom', 'width', 'height')]
+
+
 def test_titration_template_validates_against_baseline_sources():
     sources = ["Global trend", "Captured plot", "Image file"]
     preset = viewer._composer_titration_main_preset()
@@ -570,7 +890,12 @@ def test_paper_figure_types_have_requested_linked_layouts():
     validation = viewer._paper_bo_validation_preset()["config"]["state"]
     assert validation["bo_composer_count"] == 5
     kinds = [validation[f'bo_composer_kind_{i}'] for i in range(5)]
-    assert validation[f"bo_composer_global_running_mean_{kinds.index('Global trend')}"] == 5
+    stored_validation = viewer._composer_load_builtin_preset("Type 2 - BO validation")
+    expected_mean = (
+        stored_validation["config"]["state"][f"bo_composer_global_running_mean_{kinds.index('Global trend')}"]
+        if stored_validation and stored_validation.get("use_saved_config") else 5
+    )
+    assert validation[f"bo_composer_global_running_mean_{kinds.index('Global trend')}"] == expected_mean
     assert validation[f"bo_composer_paired_metric_{kinds.index('Buffer/target trend')}"] == "Peak prominence"
     focused = viewer._paper_bo_validation_focused_preset()["config"]["state"]
     assert focused["bo_composer_count"] == 3

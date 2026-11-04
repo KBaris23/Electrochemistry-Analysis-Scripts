@@ -4,7 +4,53 @@ from core.workspace_sessions import (
     load_workspace,
     safe_session_name,
     save_workspace,
+    workspace_cache_status,
 )
+
+
+def test_missing_source_folder_retains_offline_cache(tmp_path):
+    missing = tmp_path / 'usb'
+    payload = {'state': {'folders': [str(missing)]},
+               'source_signature': [2, [[str(missing / 'trace.csv'), 123, 456]]]}
+    assert workspace_cache_status(payload, (2, ())) == 'offline'
+
+
+def test_reachable_changed_or_deleted_source_invalidates_cache(tmp_path):
+    source = tmp_path / 'trace.csv'
+    payload = {'state': {'folders': [str(tmp_path)]},
+               'source_signature': [2, [[str(source), 123, 456]]]}
+    assert workspace_cache_status(payload, (2, ())) == 'changed'
+    assert workspace_cache_status(payload, (2, ((str(source), 124, 456),))) == 'changed'
+    assert workspace_cache_status(payload, (2, ((str(source), 123, 456),))) == 'valid'
+
+
+def test_offline_cache_still_validates_reachable_sources(tmp_path):
+    missing = tmp_path / 'usb'
+    local = tmp_path / 'trace.csv'
+    payload = {'state': {'folders': [str(missing), str(tmp_path)]},
+               'source_signature': [2, [[str(missing / 'trace.csv'), 1, 2],
+                                        [str(local), 3, 4]]]}
+    assert workspace_cache_status(payload, (2, ((str(local), 3, 4),))) == 'offline'
+    assert workspace_cache_status(payload, (2, ((str(local), 5, 4),))) == 'changed'
+    assert workspace_cache_status(payload, (2, ())) == 'changed'
+    assert workspace_cache_status(payload, (3, ((str(local), 3, 4),))) == 'changed'
+
+
+def test_missing_file_in_sibling_directory_is_not_offline(tmp_path):
+    missing = tmp_path / 'usb'
+    payload = {'state': {'folders': [str(missing)]},
+               'source_signature': [2, [[str(tmp_path / 'usb-other' / 'trace.csv'), 1, 2]]]}
+    assert workspace_cache_status(payload, (2, ())) == 'changed'
+
+
+def test_legacy_offline_cache_and_single_folder_recipe(tmp_path):
+    missing = str(tmp_path / 'usb')
+    recipe, _ = save_workspace(tmp_path, 'legacy', {'folders': missing},
+                               results=[{'voltage': [1, 2]}], cache_results=True)
+    payload, rows = load_workspace(recipe)
+    assert payload['state']['folders'] == [missing]
+    assert rows == [{'voltage': [1, 2]}]
+    assert workspace_cache_status(payload, (2, ())) == 'offline'
 
 
 def test_workspace_recipe_round_trip_and_optional_results_cache(tmp_path):
@@ -61,6 +107,8 @@ def test_button_events_are_not_saved_or_restored(tmp_path):
         'bo_real_update_plots': False, 'bo_rescore_test_reset_controls': False,
         'bo_synced_gifs_5_50_350_button': False,
         'bo_composer_stack_spacing_reset_3': False,
+        'bo_composer_standardize_text': False,
+        'bo_composer_standardize_text_button': True,
         'paper_type3_titration_metadata': False,
         'paper_type3_titration_open_composer': False,
         'paper_type3_titration_png': False,
@@ -149,3 +197,33 @@ def test_cube_label_choice_survives_source_edit_and_session(tmp_path):
     path, _ = save_workspace(tmp_path, 'labels_off', state)
     payload, _ = load_workspace(path)
     assert payload['state']['bo_composer_show_highlight_labels_0'] is False
+
+
+def test_save_paper_settings_preserves_cache_and_analysis(tmp_path):
+    import json
+    from core.workspace_sessions import save_workspace, save_paper_settings, load_workspace
+    state = {'folders': [str(tmp_path)], 'swv_smooth_window': 15,
+             'paper_titration_physical_0': 7, 'paper_titration_width': 14.2}
+    path, cache = save_workspace(tmp_path, 'example', state, results=[{'value': 42}],
+                                 cache_results=True, source_signature=['original'])
+    original_cache = cache.read_bytes()
+    save_paper_settings(path, {**state, 'swv_smooth_window': 21,
+                              'paper_titration_physical_0': 5,
+                              'paper_titration_width': 9.23})
+    payload, rows = load_workspace(path)
+    assert payload['state']['paper_titration_physical_0'] == 5
+    assert payload['state']['paper_titration_width'] == 9.23
+    assert payload['state']['swv_smooth_window'] == 15
+    assert payload['source_signature'] == ['original']
+    assert rows == [{'value': 42}]
+    assert cache.read_bytes() == original_cache
+    assert path.with_suffix('.previous.json').exists()
+
+
+def test_save_paper_settings_accepts_legacy_single_folder(tmp_path):
+    from core.workspace_sessions import save_paper_settings
+    recipe, _ = save_workspace(tmp_path, 'legacy-settings', {'folders': str(tmp_path)})
+    payload, _ = load_workspace(recipe)
+    save_paper_settings(recipe, {**payload['state'], 'paper_titration_width': 12.05})
+    updated, _ = load_workspace(recipe)
+    assert updated['state']['paper_titration_width'] == 12.05

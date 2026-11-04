@@ -63,8 +63,16 @@ recorded with the figure.
 
 ### BO Figure Composer
 
+- **Local settings cache** saves/restores all composer settings independently of
+  templates. Each panel also has **Save settings / Restore settings** controls
+  for its data selections, processing, appearance, axes and position. Saves are
+  local to the experiment and group and survive app restarts. **Save all settings**
+  also updates every section's snapshot; **Restore all settings** uses the last
+  whole-figure snapshot. Reopen source data or recapture plots as needed: the
+  cache stores settings, not captured plot data. Linked source controls still
+  govern linked panels. No template is overwritten by these controls.
 - Types **1/1A/1B/1C** show parameter-sweep landscapes, slices and example SWVs.
-- Types **2/2A** show real BO validation, including Q history, measured cubes,
+- Types **2/2A/2B** show real BO validation, including Q history, measured cubes,
   buffer/target trends, chronological stacks and parallel coordinates.
 - Linked source controls keep a figure on one channel/group/direction. Disable
   linking only when intentionally comparing independent sources.

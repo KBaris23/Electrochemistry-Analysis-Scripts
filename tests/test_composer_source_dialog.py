@@ -3,6 +3,95 @@ from streamlit.testing.v1 import AppTest
 import bo_session_viewer as viewer
 
 
+def test_capture_offers_replace_action_for_selected_panel(monkeypatch):
+    from types import SimpleNamespace
+    buttons = {}
+    monkeypatch.setattr(viewer.st, 'session_state', {
+        'bo_composer_count': 2, 'bo_composer_active_panel': 1,
+    })
+    container = SimpleNamespace(button=lambda label, **kwargs: buttons.update({label: kwargs}))
+    viewer._render_add_to_composer_button(
+        container, b'preview', key='example', file_stem='trace', figure=None,
+        settings={'channel': '1'}, label='Trace',
+    )
+    assert set(buttons) == {'Add to Composer', 'Replace selected Composer panel B'}
+    replacement = buttons['Replace selected Composer panel B']
+    assert replacement['on_click'] is viewer._add_plot_to_composer_callback
+    assert replacement['kwargs']['replace_index'] == 1
+    assert replacement['kwargs']['label'] == 'Trace'
+    assert replacement['kwargs']['settings'] == {'channel': '1'}
+
+
+def test_live_type2b_session_upgrades_before_widgets_and_stays_upgraded():
+    app = AppTest.from_string('''
+import streamlit as st
+from bo_session_viewer import _composer_upgrade_original_type2b, COMPOSER_CANVAS_SIZES
+if 'initialized' not in st.session_state:
+    st.session_state.update(initialized=True, bo_composer_count=2,
+        bo_composer_kind_0='Global trend', bo_composer_kind_1='Measured 3D tensor',
+        bo_composer_validation_linked=True, bo_composer_measured_stop_at_best_1=True,
+        bo_composer_aspect='ACS 1-col tall (3.3 x 7.0 in)',
+        bo_composer_measured_path_projection_1=True, bo_composer_render_old='stale')
+    for index, rect in enumerate(((.10, .61, .82, .29), (.06, .08, .88, .47))):
+        for field, value in zip(('left', 'bottom', 'width', 'height'), rect):
+            st.session_state[f'bo_composer_{field}_{index}'] = value
+st.session_state['upgraded'] = _composer_upgrade_original_type2b(st.session_state)
+st.selectbox('Canvas', list(COMPOSER_CANVAS_SIZES), key='bo_composer_aspect')
+st.number_input('Panels', 1, 24, key='bo_composer_count')
+st.checkbox('Wall projections', key='bo_composer_measured_path_projection_1')
+''').run()
+    assert not app.exception
+    assert app.session_state['upgraded']
+    assert app.session_state['bo_composer_auto_render']
+    assert app.number_input[0].value == 3
+    assert app.selectbox[0].value == '16:9'
+    assert not app.checkbox[0].value
+    app.run()
+    assert not app.exception
+    assert not app.session_state['upgraded']
+    assert app.number_input[0].value == 3
+
+
+@pytest.mark.parametrize('count,cube_index,planes,prefix', [
+    (5, 0, 2, 'bo_composer_type1_compact'),
+    (6, 3, 2, 'bo_composer_type1_compact'),
+    (8, 3, 4, 'bo_composer_type1'),
+])
+def test_linked_slice_dropdowns_replace_choices_and_survive_reruns(
+    tmp_path, count, cube_index, planes, prefix,
+):
+    shared = prefix + '_slice_values'
+    cube = f'bo_composer_real_slice_values_{cube_index}'
+    app = AppTest.from_string(f'''
+import streamlit as st
+from bo_session_viewer import _composer_linked_slice_controls
+st.session_state.setdefault('bo_composer_count', {count})
+st.session_state.setdefault('{prefix}_linked_controls', True)
+st.session_state.setdefault('{shared}', [.010] * {planes})
+options = [.002, .004, .006, .008, .010]
+chosen = _composer_linked_slice_controls(st, options, {cube_index}, '{shared}', {planes})
+st.session_state['{cube}'] = list(chosen)
+_composer_linked_slice_controls(st, options, {cube_index}, '{cube}', {planes})
+st.session_state['test_saved_state'] = {{key: value for key, value in st.session_state.items() if key.startswith('bo_composer_')}}
+''').run()
+    assert not app.exception
+    first = f'bo_composer_editor_slice_{cube}_0'
+    second = f'bo_composer_editor_slice_{shared}_1'
+    assert app.selectbox(key=first).options == ['2 mV', '4 mV', '6 mV', '8 mV', '10 mV']
+    app.selectbox(key=first).select(.002).run()
+    app.selectbox(key=second).select(.006).run()
+    expected = [.002, .006] + [.010] * (planes - 2)
+    for _ in range(2):
+        app.run()
+        assert not app.exception
+        assert app.session_state[shared] == expected
+        assert app.session_state[cube] == expected
+    from core.workspace_sessions import save_workspace, load_workspace
+    path, _ = save_workspace(tmp_path, 'slices', app.session_state['test_saved_state'])
+    state = load_workspace(path)[0]['state']
+    assert state[shared] == state[cube] == expected
+
+
 def test_linked_cube_iteration_choice_survives_reruns_and_restore(tmp_path):
     app = AppTest.from_string('''
 import streamlit as st
@@ -215,11 +304,15 @@ v._render_composer_source_route('SWV traces', {'root':'test','config':{}},
     app.button[0].click().run()
     next(c for c in app.checkbox if c.label == 'Show every successful trace').set_value(False).run()
     next(n for n in app.number_input if n.label == 'Maximum displayed traces').set_value(24).run()
+    next(s for s in app.selectbox if s.label == 'Stack legend columns').select(2).run()
+    next(s for s in app.slider if s.label == 'Stack legend height (%)').set_value(60).run()
     next(r for r in app.radio if r.label == 'Chronological voltage range').set_value('Full analyzed voltage range').run()
     next(b for b in app.button if b.label == 'Update panel A').click().run()
     assert not app.exception
     assert app.session_state['bo_composer_stack_max_traces_0'] == 24
     assert app.session_state['bo_composer_stack_bracket_0'] is False
+    assert app.session_state['bo_composer_stack_legend_columns_0'] == 2
+    assert app.session_state['bo_composer_stack_legend_y_0'] == 60
     assert app.session_state['bo_composer_stack_voltage_range_0'] == 'Full analyzed voltage range'
     assert app.session_state['bo_composer_width_0'] == .4
     assert app.session_state['bo_composer_jump_tab'] == 'Figure Composer'

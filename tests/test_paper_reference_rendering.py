@@ -31,10 +31,10 @@ def test_reference_validation_layout():
     assert all(not state[f"bo_composer_show_label_{i}"] for i in range(5))
 
 
-def test_reference_trend_has_mean_not_misleading_cummax(monkeypatch):
-    monkeypatch.setattr(viewer, "_composer_metric_series", lambda h, m: (pd.Series([1,2,3]), pd.Series([3.,1.,2.])))
+def test_reference_trend_has_mean_not_misleading_cummax():
+    history = pd.DataFrame({'iteration': [1, 2, 3], 'Q_run': [3., 1., 2.]})
     fig, ax = plt.subplots()
-    viewer._composer_draw_global(ax, pd.DataFrame(), "Q_run", 10, 2)
+    viewer._composer_draw_global(ax, history, "Q_run", 10, 2)
     assert len(ax.lines) == 2
     np.testing.assert_allclose(ax.lines[1].get_ydata(), [3.,2.,1.5])
     assert ax.lines[1].get_linestyle() == "--"

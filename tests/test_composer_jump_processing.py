@@ -60,6 +60,89 @@ def test_type2_auto_polish_flags_spike_without_rejecting_smooth_family():
     assert set(flagged) == {11}
 
 
+def test_stack_render_does_not_auto_polish_even_with_old_enabled_setting(monkeypatch):
+    voltage = np.linspace(-.5, -.05, 180)
+    rows = [dict(iteration=i, phase='buffer', voltage=voltage,
+                 current=.08 * np.exp(-((voltage + .24 + i * .0005) / .07) ** 2))
+            for i in range(1, 12)]
+    rows[-1]['current'][80] += .3
+    original = rows[-1]['current'].copy()
+    monkeypatch.setattr(v, '_composer_trace_entries', lambda *args: [])
+    monkeypatch.setattr(v, '_chronological_swv_stack_entries', lambda *args, **kwargs: (rows, [], rows))
+    spec = dict(channels=['1'], corrected=True, use_bo_snapshot=False, excluded_iterations=[])
+    def unexpected_polish(*args):
+        raise AssertionError('Rendering must not run auto-polish')
+    monkeypatch.setattr(v, '_anomalous_swv_iterations', unexpected_polish)
+    for enabled in (None, False, True):
+        selected = spec if enabled is None else {**spec, 'auto_polish': enabled}
+        fig = v._composer_build_chronological_swv(selected, {'config': {}}, [], {})
+        assert list(fig._bo_successful_iterations) == list(range(1, 12))
+        assert np.array_equal(rows[-1]['current'], original)
+        plt.close(fig)
+
+
+def test_auto_polish_click_selects_exclusions_once_and_clear_restores_them():
+    from streamlit.testing.v1 import AppTest
+    app = AppTest.from_string('''
+import streamlit as st
+import bo_session_viewer as v
+from unittest.mock import patch
+st.session_state.setdefault('calls', 0)
+st.session_state.setdefault('bo_composer_validation_excluded_iterations', [3])
+def anomalies(*args):
+    st.session_state['calls'] += 1
+    return {11: ['spike']}
+with patch.object(v, '_composer_type2_swv_anomalies', anomalies):
+    v._composer_polish_controls({}, [], st.session_state, 2)
+st.multiselect('Excluded iterations', list(range(1, 12)), key='bo_composer_validation_excluded_iterations')
+''').run()
+    assert not app.exception
+    assert app.session_state['calls'] == 0
+    app.selectbox(key='bo_composer_polish_strength').select('Stronger').run()
+    assert app.session_state['calls'] == 0
+    app.button(key='bo_composer_validation_auto_polish_button').click().run()
+    assert not app.exception
+    assert app.session_state['calls'] == 1
+    assert app.multiselect[0].value == [3, 11]
+    app.run()
+    assert app.session_state['calls'] == 1
+    assert app.multiselect[0].value == [3, 11]
+    app.button(key='bo_composer_validation_clear_exclusions_button').click().run()
+    assert not app.exception
+    assert app.multiselect[0].value == []
+    app.run()
+    assert app.session_state['calls'] == 1
+    assert app.multiselect[0].value == []
+
+
+def test_polish_flags_missing_requested_phase_but_allows_single_phase_stack(monkeypatch):
+    state = {'bo_composer_count': 1, 'bo_composer_kind_0': 'Chronological SWV stack',
+             'bo_composer_stack_channels_0': ['7_max'],
+             'bo_composer_stack_phases_0': ['buffer', 'target']}
+    loaded = [{'iteration': 1, 'phase': 'buffer'}, {'iteration': 1, 'phase': 'target'},
+              {'iteration': 2, 'phase': 'buffer'}]
+    monkeypatch.setattr(v, '_composer_trace_entries', lambda *args: [])
+    monkeypatch.setattr(v, '_chronological_swv_stack_entries', lambda *args, **kwargs: (loaded, ['failed target'], []))
+    monkeypatch.setattr(v, '_anomalous_swv_iterations', lambda *args, **kwargs: {})
+    assert v._composer_type2_swv_anomalies({'config': {}}, [], state) == {
+        2: ['no accepted target traces']}
+    state['bo_composer_stack_phases_0'] = ['buffer']
+    assert v._composer_type2_swv_anomalies({'config': {}}, [], state) == {}
+
+
+def test_stronger_polish_detects_moderate_deviation_without_flagging_smooth_family():
+    voltage = np.linspace(-.5, -.05, 180)
+    rows = [dict(iteration=i, phase='buffer', voltage=voltage,
+                 current=.08 * np.exp(-((voltage + .24 + i * .0002) / .07) ** 2))
+            for i in range(1, 12)]
+    assert not v._anomalous_swv_iterations(rows, strength='Stronger')
+    rows[-1]['current'] = .08 * np.exp(-((voltage + .19) / .07) ** 2)
+    conservative = v._anomalous_swv_iterations(rows)
+    stronger = v._anomalous_swv_iterations(rows, strength='Stronger')
+    assert set(conservative) <= set(stronger)
+    assert 11 in stronger
+
+
 def test_type2_auto_polish_flags_subtle_isolated_baseline_step():
     voltage = np.linspace(-.5, -.05, 180)
     rows = []

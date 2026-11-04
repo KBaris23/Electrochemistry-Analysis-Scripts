@@ -49,6 +49,7 @@ def available_workspaces(local_directory: str | Path, legacy_directory: str | Pa
     return dict(sorted(result.items()))
 RECOVERY_STEM = "recovery"
 _EXCLUDED_PREFIXES = (
+    "bo_composer_standardize_text",
     "bo_scoring_restore_",
     "_bo_runtime_",
     "FormSubmitter:", "_workspace_pending_",
@@ -64,6 +65,8 @@ _EXCLUDED_PREFIXES = (
     "bo_composer_validation_clear_exclusions",
 )
 _EXCLUDED_KEYS = {
+    '_paper_save_settings',
+    'paper_titration_format_preset_overwrite', 'paper_titration_format_preset_reload',
     '_workspace_recovery_at', '_bo_lazy_tabs',
     "paper_recipe_upload", "paper_recipe_apply", "_pending_paper_recipe",
     "bo_composer_find_peak_example", "bo_hp_response_render_button",
@@ -178,6 +181,36 @@ def save_workspace(
     return recipe_path, written_cache
 
 
+def save_paper_settings(path: str | Path, state: Mapping[str, Any]) -> Path:
+    """Update figure defaults without rewriting/removing an existing analysis cache."""
+    target = Path(path).expanduser().resolve()
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    previous = payload.get("state", {})
+    def normalize(folders):
+        if isinstance(folders, str):
+            folders = [folders]
+        return [os.path.normcase(str(Path(p).resolve())) for p in folders or []]
+    if normalize(previous.get("folders")) != normalize(state.get("folders")):
+        raise ValueError("This saved session uses different source folders. Open the intended session first.")
+    settings = serializable_state(state)
+    def is_figure_setting(key):
+        return ((key.startswith("paper_") and not key.startswith("paper_titration_render"))
+                or key.startswith(("_paper_recipe_", "_paper_type3", "swv_titration_"))
+                or key in {"swv_post_vlines_input", "swv_remove_extreme_titration_outliers",
+                           "swv_fit_titration_langmuir", "_paper_titration_blue_orange_v1",
+                           "_paper_swv_plasma_defaults_v1"})
+    previous = {k: v for k, v in previous.items() if not is_figure_setting(k)}
+    previous.update({k: v for k, v in settings.items() if is_figure_setting(k)})
+    payload["state"] = previous
+    payload["saved_utc"] = datetime.now(timezone.utc).isoformat()
+    backup = target.with_suffix(".previous.json")
+    backup.write_bytes(target.read_bytes())
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(target)
+    return target
+
+
 def list_workspaces(directory: str | Path) -> list[Path]:
     root = Path(directory).expanduser()
     if not root.is_dir():
@@ -199,6 +232,10 @@ def load_workspace(path: str | Path) -> tuple[dict[str, Any], Any | None]:
     if payload.get("schema_version") != SCHEMA_VERSION or not isinstance(payload.get("state"), dict):
         raise ValueError("Unsupported or invalid analysis-session file.")
     payload['state'] = serializable_state(payload['state'])
+    # Older hand-built recipes sometimes stored a single folder as text.
+    # Restore a folder list so the sidebar does not split it into characters.
+    if isinstance(payload['state'].get('folders'), str):
+        payload['state']['folders'] = [payload['state']['folders']]
     # Older recipes stored this choice as a checkbox. Explicitly restore the
     # new radio too, so a previous live workspace cannot leak its range choice.
     for key, value in list(payload['state'].items()):
@@ -225,3 +262,33 @@ def load_workspace(path: str | Path) -> tuple[dict[str, Any], Any | None]:
             with gzip.open(cache_path, "rb") as handle:
                 results = pickle.load(handle)
     return payload, results
+
+
+def workspace_cache_status(payload: Mapping[str, Any], current_signature: Any) -> str:
+    """Distinguish unavailable sources from changed sources on cached reopen.
+
+    Offline caches are frozen analysis snapshots. Validate every reachable
+    source; missing files within a reachable folder still invalidate a cache.
+    """
+    folders = payload.get('state', {}).get('folders') or []
+    if isinstance(folders, str):
+        folders = [folders]
+    # Normalize lexically: resolving thousands of paths on an absent USB can
+    # block on filesystem probes even though these files cannot be inspected.
+    missing_roots = [Path(os.path.abspath(folder)) for folder in folders if not Path(folder).exists()]
+    saved = payload.get('source_signature')
+    if saved is None:
+        return 'offline' if missing_roots else 'legacy'
+    if json.dumps(saved, sort_keys=True) == json.dumps(current_signature, sort_keys=True):
+        return 'offline' if missing_roots else 'valid'
+    if not missing_roots or saved[0] != current_signature[0]:
+        return 'changed'
+    previous = {str(row[0]): tuple(row[1:]) for row in saved[1]}
+    current = {str(row[0]): tuple(row[1:]) for row in current_signature[1]}
+    if any(previous.get(path) != stat for path, stat in current.items()):
+        return 'changed'
+    for path in previous.keys() - current.keys():
+        source = Path(os.path.abspath(path))
+        if not any(source == root or root in source.parents for root in missing_roots):
+            return 'changed'
+    return 'offline'
