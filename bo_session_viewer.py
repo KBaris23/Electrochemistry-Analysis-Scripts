@@ -148,7 +148,7 @@ COMPOSER_PNG_METADATA_KEY = "SWVFigureComposer"
 COMPOSER_PRESET_STORE = Path(__file__).with_name("figure_composer_presets.json")
 LEGACY_COMPOSER_PRESET_STORE = Path(__file__).with_name(".figure_composer_presets.json")
 COMPOSER_SETTINGS_CACHE_DIR = Path(__file__).with_name(".figure_composer_settings")
-COMPOSER_RENDER_VERSION = 'stable-layout-and-settings-v13'
+COMPOSER_RENDER_VERSION = 'stable-layout-and-settings-v15-stack-legend'
 OBSERVED_PATH_COLORS = ("#e31a1c", "#000000")
 SWV_PHASE_COLORS = {
     "buffer": "#1f77b4",
@@ -20515,6 +20515,7 @@ def _chronological_swv_stack_entries(
     include_analysis_landmarks: bool = False,
     crop_to_minima: bool = False,
     voltage_display_range: str | None = None,
+    display_repair: bool = False,
 ) -> tuple[list[dict], list[str], list[tuple[dict, dict]]]:
     batch_size = max(1, int((config or {}).get("paired_batch_size", 1) or 1))
     phase_filter = (
@@ -20576,6 +20577,7 @@ def _chronological_swv_stack_entries(
     for stack_index, (observation, item) in enumerate(entries):
         phase, path, channel = item["phase"], item["path"], _trace_channel_key(item)
         try:
+            display_recovery = None
             raw_requires_landmarks = not corrected and (
                 include_analysis_landmarks
                 or normalize_to_peak
@@ -20597,12 +20599,24 @@ def _chronological_swv_stack_entries(
                     "raw_current",
                 )
             else:
-                voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
-                    path,
-                    corrected,
-                    analysis,
-                    corrected_trace_key,
-                )
+                try:
+                    voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
+                        path, corrected, analysis, corrected_trace_key)
+                except ValueError as original_error:
+                    if not display_repair or not corrected:
+                        raise
+                    # Retain readable measurements rejected by BO acceptance
+                    # gates, without altering the analysis snapshot or Q values.
+                    relaxed = dict(analysis, min_peak_height_uA=None,
+                                   correct_baseline_jumps=False,
+                                   require_local_minima_on_both_sides=False)
+                    for key in ('peak_voltage_min_v', 'peak_voltage_max_v',
+                                'left_min_voltage_min_v', 'left_min_voltage_max_v',
+                                'right_min_voltage_min_v', 'right_min_voltage_max_v'):
+                        relaxed.pop(key, None)
+                    voltage, y, peak_idx, left_idx, right_idx = _swv_trace_arrays(
+                        path, corrected, relaxed, corrected_trace_key)
+                    display_recovery = str(original_error)
             if offset_to_baseline:
                 y = _offset_trace_to_minima_baseline(y, left_idx, right_idx)
             if normalize_to_peak:
@@ -20695,6 +20709,7 @@ def _chronological_swv_stack_entries(
                 "voltage": voltage,
                 "current": current,
                 "landmarks": landmarks,
+                **({'display_recovery': display_recovery} if display_recovery else {}),
             })
         except Exception as exc:
             errors.append(f"Iteration {observation.get('iteration')}, {phase}, channel {channel}, {Path(path).name}: {exc}")
@@ -21309,8 +21324,13 @@ def _plot_chronological_swv_stack(
     stack_axis_gap: float = .08,
     stack_depth_spacing: float = 1.18,
     voltage_display_range: str | None = None,
+    stack_iteration_range: tuple[int, int] | None = None,
+    stack_display_smoothing: bool = False,
+    stack_smoothing_strength: str = 'Moderate',
+    stack_polish_mode: str = 'Off',
 ):
     """Render SWVs as a diagonal chronological stack."""
+    corrected = corrected or stack_polish_mode != 'Off'
     fig, ax = plt.subplots(figsize=(9, 5.5))
     ax._bo_chronological_swv_stack = True
     loaded, errors, entries = _chronological_swv_stack_entries(
@@ -21330,15 +21350,37 @@ def _plot_chronological_swv_stack(
         selected_phases,
         crop_to_minima=crop_to_minima,
         voltage_display_range=voltage_display_range,
+        display_repair=stack_polish_mode != 'Off',
     )
 
     fig._composer_trace_failures = list(errors)
     fig._bo_stack_trace_counts = {'considered': len(entries), 'included': len(loaded),
                                  'excluded': len(entries) - len(loaded)}
     if not loaded:
+        if stack_polish_mode != 'Off':
+            from core.swv_display_polish import polish_display_rows
+            _, fig._bo_stack_display_polish = polish_display_rows(
+                [], exclude_unrecoverable=stack_polish_mode == 'Repair then exclude unrecoverable')
         ax.text(.5, .5, "No accepted traces to display.", ha="center", va="center")
         ax.set_axis_off()
         return fig, errors
+
+    if stack_polish_mode != 'Off':
+        from core.swv_display_polish import polish_display_rows
+        loaded, polish = polish_display_rows(
+            loaded, exclude_unrecoverable=stack_polish_mode == 'Repair then exclude unrecoverable',
+            normalize=normalize_to_peak)
+        fig._bo_stack_display_polish = polish
+        fig._bo_stack_trace_counts.update(included=len(loaded), excluded=len(entries)-len(loaded))
+        if not loaded:
+            ax.text(.5, .5, 'No repairable traces. Select Keep traces to inspect them.',
+                    ha='center', va='center')
+            ax.set_axis_off()
+            return fig, errors
+    elif stack_display_smoothing:
+        from core.swv_display_smoothing import smooth_display_rows
+        loaded, smoothing = smooth_display_rows(loaded, stack_smoothing_strength)
+        fig._bo_stack_display_smoothing = smoothing
 
     if compact_stack and coordinate_frame_style == "Shared-Origin Three-Axis Frame":
         from core.chronological_stack import draw_coordinate_stack
@@ -21348,7 +21390,8 @@ def _plot_chronological_swv_stack(
                               current_top=current_axis_top, normalized=normalize_to_peak,
                               legend_location=stack_legend_location,
                               legend_columns=stack_legend_columns, legend_y=stack_legend_y,
-                              axis_gap=stack_axis_gap, depth_spacing=stack_depth_spacing)
+                              axis_gap=stack_axis_gap, depth_spacing=stack_depth_spacing,
+                              iteration_range=stack_iteration_range)
         return fig, errors
 
     if compact_stack:
@@ -21417,9 +21460,12 @@ def _plot_chronological_swv_stack(
             ) or channel_colors.get(row["channel"], "#155e63")
         )
         best_width = stack_line_width * 2.8
+        plot_x = row["voltage"] + offset_index * x_step
+        plot_y = row["current"] + offset_index * y_step
+        cuts = [segment[0] for segment in row.get('display_segments', [])[1:] if segment]
         ax.plot(
-            row["voltage"] + offset_index * x_step,
-            row["current"] + offset_index * y_step,
+            np.insert(plot_x, cuts, np.nan),
+            np.insert(plot_y, cuts, np.nan),
             color=trace_color,
             linestyle="-",
             linewidth=best_width if is_best else stack_line_width * (.7 + .3*age),
@@ -35586,6 +35632,8 @@ def _composer_draw_embedded_figure(
             "trace_failures": list(getattr(panel_figure, "_composer_trace_failures", ())),
             "coordinate_frame_style": getattr(panel_figure, "_bo_coordinate_frame_style", None),
             "stack_calibration": getattr(panel_figure, "_bo_stack_calibration", None),
+            "display_smoothing": getattr(panel_figure, "_bo_stack_display_smoothing", None),
+            "display_polish": getattr(panel_figure, "_bo_stack_display_polish", None),
             "trace_counts": getattr(panel_figure, "_bo_stack_trace_counts", None),
         }
         if any(panel_audit.values()):
@@ -36773,6 +36821,13 @@ def _composer_build_chronological_swv(
         stack_legend_y=spec.get("stack_legend_y"),
         stack_axis_gap=spec.get('stack_axis_gap', .08),
         stack_depth_spacing=spec.get('stack_depth_spacing', 1.18),
+        stack_iteration_range=(
+            (int(spec.get('stack_iteration_start', 1)), int(spec.get('stack_iteration_end', 50)))
+            if spec.get('stack_fixed_iterations', False) else None
+        ),
+        stack_display_smoothing=bool(spec.get('stack_display_smoothing', False)),
+        stack_smoothing_strength=spec.get('stack_smoothing_strength', 'Moderate'),
+        stack_polish_mode=spec.get('stack_polish_mode', 'Off'),
     )
     if errors:
         figure._composer_trace_failures = list(errors)
@@ -38479,6 +38534,47 @@ def _composer_stack_spacing_controls(spec, index=None):
         float(spec.get('stack_axis_gap', .08)), .01, **keys('stack_axis_gap'))
     spec['stack_depth_spacing'] = st.slider('Iteration spacing', .5, 2.,
         float(spec.get('stack_depth_spacing', 1.18)), .02, **keys('stack_depth_spacing'))
+    shared_frame = spec.get('coordinate_frame_style', 'Shared-Origin Three-Axis Frame') == 'Shared-Origin Three-Axis Frame'
+    spec['stack_fixed_iterations'] = st.checkbox(
+        'Keep original iteration axis (leave gaps)',
+        value=bool(spec.get('stack_fixed_iterations', False)),
+        disabled=not shared_frame, **keys('stack_fixed_iterations'),
+        help='Keep the axis at 1–50 by default, even when endpoint or middle iterations are excluded. Requires the shared-origin frame. Retained traces keep their original positions.',
+    )
+    if spec['stack_fixed_iterations'] and shared_frame:
+        columns = st.columns(2)
+        for field, label, default in [('stack_iteration_start', 'Iteration axis start', 1),
+                                      ('stack_iteration_end', 'Iteration axis end', 50)]:
+            spec[field] = int(columns[0 if default == 1 else 1].number_input(
+                label, min_value=1, value=int(spec.get(field, default)),
+                step=1, **keys(field)))
+        st.caption('Excluded iterations leave empty positions. Axis limits expand if a retained trace lies outside them.')
+
+
+def _composer_stack_smoothing_controls(spec, index=None):
+    keys = lambda field: {'key': f'bo_composer_{field}_{index}'} if index is not None else {}
+    modes = ['Off', 'Repair (keep traces)', 'Repair then exclude unrecoverable']
+    mode = spec.get('stack_polish_mode', 'Off')
+    spec['stack_polish_mode'] = st.selectbox(
+        'Baseline polishing', modes, index=modes.index(mode) if mode in modes else 0,
+        **keys('stack_polish_mode'),
+        help='Repair each corrected trace independently. Unstable outer baselines fall back to that trace’s own correction bracket, within the selected voltage range.')
+    if spec['stack_polish_mode'] != 'Off':
+        st.caption('Uses corrected traces with display-only baseline repair and light smoothing. Raw files and Q stay unchanged. '
+                   'The render report lists recovered, shortened and unresolved traces.')
+    with st.expander('Advanced smoothing'):
+        spec['stack_display_smoothing'] = st.checkbox(
+            'Smooth displayed SWVs (keep traces)',
+            value=bool(spec.get('stack_display_smoothing', False)),
+            disabled=spec['stack_polish_mode'] != 'Off',
+            **keys('stack_display_smoothing'),
+            help='Used when baseline polishing is off. Local despiking and Savitzky–Golay smoothing; source data and Q are unchanged.')
+        strengths = ['Light', 'Moderate', 'Strong']
+        spec['stack_smoothing_strength'] = st.selectbox(
+            'Display smoothing strength', strengths,
+            index=strengths.index(spec.get('stack_smoothing_strength', 'Moderate')),
+            disabled=not spec['stack_display_smoothing'] or spec['stack_polish_mode'] != 'Off',
+            **keys('stack_smoothing_strength'))
 
 
 def _composer_source_link_controls():
@@ -38773,13 +38869,24 @@ def _composer_filter_excluded_history(
     return history.loc[~numeric_iteration.isin(excluded_set)].copy()
 
 
+def _composer_polish_stack_appearance(state, stack_index):
+    """Adjust presentation without modifying waveform processing or rejecting data."""
+    state['bo_composer_validation_excluded_iterations'] = []
+    state['bo_composer_validation_cleanup_report'] = {}
+    for field, value in {
+        'show_all': True, 'width': .7, 'fade': .25,
+        'depth_spacing': 1.5, 'axis_gap': .10,
+    }.items():
+        state[f'bo_composer_stack_{field}_{stack_index}'] = value
+
+
 def _composer_polish_controls(session, observations, state, stack_index):
     st.selectbox('Auto-polish sensitivity', ['Conservative', 'Stronger'],
                  key='bo_composer_polish_strength',
-                 help='Stronger flags more waveform deviations. Changing this does not run polishing; click Auto-polish to apply. This excludes iterations, not smooths traces.')
-    cleanup_cols = st.columns([1.7, 1.0])
+                 help='For the original Auto-polish: Conservative is the default; Stronger selects more outlier iterations. Runs only when clicked.')
+    cleanup_cols = st.columns(2)
     if cleanup_cols[0].button(
-        'Auto-polish Type 2 SWVs', key='bo_composer_validation_auto_polish_button',
+        'Auto-polish', key='bo_composer_validation_auto_polish_button',
         disabled=stack_index is None,
         help='Check the current stack for spikes, jumps and waveform outliers, then select their iterations for exclusion. Runs only when clicked.',
     ):
@@ -38788,13 +38895,31 @@ def _composer_polish_controls(session, observations, state, stack_index):
         existing = _composer_excluded_iteration_set(state.get('bo_composer_validation_excluded_iterations', []))
         state['bo_composer_validation_excluded_iterations'] = sorted(existing | set(report))
         state[f'bo_composer_stack_depth_spacing_{stack_index}'] = 1.28
+        state[f'bo_composer_stack_polish_mode_{stack_index}'] = 'Off'
+        state[f'bo_composer_stack_display_smoothing_{stack_index}'] = False
         state['bo_composer_validation_cleanup_report'] = report
     if cleanup_cols[1].button(
+        'Auto-polish (keep traces)', key='bo_composer_validation_repair_button',
+        disabled=stack_index is None,
+        help='Restore excluded iterations, repair baselines and lightly smooth. Only troublesome outer tails use their own corrected bracket; the shared/custom window stays selected for other traces.',
+    ):
+        _composer_polish_stack_appearance(state, stack_index)
+        state[f'bo_composer_stack_polish_mode_{stack_index}'] = 'Repair (keep traces)'
+        state[f'bo_composer_stack_corrected_{stack_index}'] = True
+        state[f'bo_composer_stack_display_smoothing_{stack_index}'] = False
+        state[f'bo_composer_stack_depth_spacing_{stack_index}'] = 1.28
+        st.success('Baseline repair enabled; iteration exclusions cleared. Render to see the repaired traces and report.')
+    if st.button(
         'Clear exclusions', key='bo_composer_validation_clear_exclusions_button',
         help='Restore the excluded iterations. Auto-polish will not run again unless you click it.',
     ):
         state['bo_composer_validation_excluded_iterations'] = []
         state['bo_composer_validation_cleanup_report'] = {}
+        mode_key = f'bo_composer_stack_polish_mode_{stack_index}'
+        if state.get(mode_key) == 'Repair then exclude unrecoverable':
+            state[mode_key] = 'Repair (keep traces)'
+    st.caption('Auto-polish uses the original outlier exclusions. Keep traces repairs the display; '
+               'optional exclusion of unrecoverable traces is available under Baseline polishing in the stack settings.')
     report = state.get('bo_composer_validation_cleanup_report')
     if report:
         st.caption('Auto-polish selected: ' + ', '.join(
@@ -39128,6 +39253,7 @@ def _composer_source_controls(index, source_spec, session, history, observations
         ))
         draft["current_axis_top"] = st.number_input("Current-axis maximum (0 = detected peak)", min_value=0., value=float(draft.get("current_axis_top") or 0.), format="%.6f")
         _composer_stack_spacing_controls(draft)
+        _composer_stack_smoothing_controls(draft)
         stack_ranges = [
             "Corrected peak bracket",
             "Full analyzed voltage range",
@@ -40620,6 +40746,7 @@ def _render_figure_composer(
                             on_click=_composer_reset_stack_spacing, args=(index,),
                             help='Applies the new iteration direction and spacing to older saved sessions.')
                         _composer_stack_spacing_controls(spec, index)
+                        _composer_stack_smoothing_controls(spec, index)
                         spec['reverse_stack_order'] = stack_frame_cols[0].checkbox(
                             'Newest traces recede', value=False,
                             key=f'bo_composer_stack_reverse_order_{index}',
@@ -42028,6 +42155,32 @@ def _render_figure_composer(
     else:
         from core.figure_preview import render_figure_preview
         render_figure_preview(rendered["png"])
+        try:
+            preview_metadata = json.loads(rendered.get('metadata', b'{}'))
+        except (TypeError, ValueError):
+            preview_metadata = {}
+        for panel in preview_metadata.get('render_audit', {}).get('panels', []):
+            polish = panel.get('display_polish')
+            if not polish:
+                continue
+            with st.expander('SWV polishing report'):
+                st.caption(f"{polish['output_traces']} of {polish['input_traces']} loaded traces retained; "
+                           f"{polish['restricted_traces']} shown within their own bracket; "
+                           f"{polish['unresolved_traces']} need review; {polish['excluded_traces']} excluded.")
+                if polish.get('recovered_traces'):
+                    st.caption(f"{polish['recovered_traces']} traces failed saved BO acceptance checks and were recovered for display only. Their recorded analysis status and Q are unchanged.")
+                failures = panel.get('trace_failures', [])
+                if failures:
+                    st.caption(f'{len(failures)} additional traces could not be loaded or corrected.')
+                    st.write(failures)
+                st.dataframe(pd.DataFrame([{
+                    'Iteration': row.get('iteration'), 'Phase': row.get('phase'),
+                    'Channel': row.get('channel'), 'Source': row.get('path'),
+                    'Changes': '; '.join(row.get('actions', [])),
+                    'Review': '; '.join(row.get('warnings', [])),
+                    'Original acceptance failure': row.get('display_recovery', ''),
+                    'Excluded': row.get('excluded', False),
+                } for row in polish.get('traces', [])]), hide_index=True)
         preview_only = bool(rendered.get("preview_only"))
         if rendered.get("signature") != config_signature:
             st.caption("Last rendered version")

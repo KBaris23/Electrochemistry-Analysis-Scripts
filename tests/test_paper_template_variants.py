@@ -29,6 +29,64 @@ def test_titration_export_request_is_queued_after_preview(api):
     assert api['st'].session_state['_paper_titration_export_requested'] is True
 
 
+def test_new_type_edits_survive_switching_and_saved_session(api, tmp_path):
+    from core.workspace_sessions import save_paper_settings
+    first = 'Type 3H - Vertical titration, Langmuir and accuracy'
+    second = 'Type 3G - Titration, Langmuir and accuracy'
+    state = api['st'].session_state
+    state.update(folders=[str(tmp_path)], paper_titration_type=first,
+                 paper_titration_width=7.3, _paper_previous_type=first)
+    state['paper_titration_type'] = second
+    api['_paper_titration_apply_selected_type_preset']()
+    state['_paper_previous_type'] = second
+    state['paper_titration_type'] = first
+    api['_paper_titration_apply_selected_type_preset']()
+    assert state['paper_titration_width'] == 7.3
+    state['_paper_previous_type'] = first
+    recipe, _ = save_workspace(tmp_path, 'formats', state)
+    state['paper_titration_width'] = 8.2
+    api['_paper_titration_remember_format'](state)
+    save_paper_settings(recipe, state)
+    payload, _ = load_workspace(recipe)
+    state.clear()
+    state.update(payload['state'])
+    assert state['_paper_type3_formats'][first]['paper_titration_width'] == 8.2
+    state['paper_titration_type'] = second
+    api['_paper_titration_apply_selected_type_preset']()
+    state['_paper_previous_type'] = second
+    state['paper_titration_type'] = first
+    api['_paper_titration_apply_selected_type_preset']()
+    assert state['paper_titration_width'] == 8.2
+
+
+def test_paper_choices_survive_navigation_and_sidebar_save(tmp_path):
+    app = AppTest.from_string(f'''
+import streamlit as st
+from bo_session_viewer import _preserve_bo_widget_choices
+from core.workspace_sessions import save_workspace, load_workspace
+_preserve_bo_widget_choices(prefix=("bo_", "paper_", "swv_titration_"))
+view = st.radio('View', ['Paper Figures', 'Metrics'])
+if view == 'Paper Figures':
+    st.number_input('Width', value=6., key='paper_titration_width')
+    st.multiselect('Steps', ['80 uM', '160 uM'], key='swv_titration_included_steps')
+if st.button('Save'):
+    path, _ = save_workspace({str(tmp_path)!r}, 'navigation', st.session_state)
+    payload, _ = load_workspace(path)
+    st.session_state['saved_settings'] = payload['state']
+''', default_timeout=30).run()
+    app.number_input(key='paper_titration_width').set_value(8.2).run()
+    app.multiselect(key='swv_titration_included_steps').set_value(['160 uM']).run()
+    app.radio[0].set_value('Metrics').run()
+    app.button[0].click().run()
+    assert not app.exception
+    saved = app.session_state['saved_settings']
+    assert saved['paper_titration_width'] == 8.2
+    assert saved['swv_titration_included_steps'] == ['160 uM']
+    app.radio[0].set_value('Paper Figures').run()
+    assert app.number_input(key='paper_titration_width').value == 8.2
+    assert app.multiselect(key='swv_titration_included_steps').value == ['160 uM']
+
+
 def test_headless_replay_includes_native_prediction_collector(api):
     assert api['supports_langmuir']('peak_current_selected')
     assert api['collect_titration_measurement_accuracy_rows'](
@@ -41,6 +99,7 @@ def test_headless_replay_includes_native_prediction_collector(api):
     ('Type 3E - Titration and Langmuir', ['response', 'langmuir']),
     ('Type 3F - SWVs only', ['manual_swv', 'optimized_swv']),
     ('Type 3G - Titration, Langmuir and accuracy', ['response', 'langmuir', 'accuracy']),
+    ('Type 3H - Vertical titration, Langmuir and accuracy', ['response', 'langmuir', 'accuracy']),
     ('Type 4B - Concentration prediction and accuracy', ['concentration', 'accuracy']),
 ])
 def test_new_two_column_type_roles(api, figure_type, expected):
@@ -115,6 +174,60 @@ def test_equal_plot_gaps_survive_export_rebuild(api):
             left, _, width, _ = guide['source_box']
             bounds.append((box.x0 + left*box.width, box.x0 + (left+width)*box.width))
         assert bounds[1][0]-bounds[0][1] == pytest.approx(bounds[2][0]-bounds[1][1])
+
+
+def test_vertical_type3h_plot_widths_and_order_survive_export(api):
+    state = api['st'].session_state
+    state.update(api['_paper_type3h_format']({}))
+    state['paper_titration_type'] = 'Type 3H - Vertical titration, Langmuir and accuracy'
+    layout = state['paper_titration_row_layout_type_3h_vertical_titration_langmuir_and_accuracy_0']
+    sources = []
+    for label in ('Response', 'Fit', 'Prediction'):
+        fig, ax = plt.subplots()
+        ax.plot([1, 2], [2, 4])
+        ax.set_ylabel(label)
+        sources.append(fig)
+    figure = api['_paper_composite_figure'](
+        sources, 1, 3, width=6., row_height=9.6, row_layouts=[layout],
+        panel_roles=['response', 'langmuir', 'accuracy'], raster_dpi=72)
+    for rendered in (figure, figure._paper_export_factory(80)):
+        rendered.canvas.draw()
+        bounds = []
+        for axis, guide in zip(rendered.axes, rendered._paper_panel_plot_guides):
+            box = axis.get_position()
+            left, _, width, _ = guide['source_box']
+            bounds.append((box.x0 + left*box.width, width*box.width))
+        np.testing.assert_allclose(bounds, [bounds[0]] * 3, atol=1e-6)
+        assert rendered.axes[0].get_position().y0 > rendered.axes[1].get_position().y1
+        assert rendered.axes[1].get_position().y0 > rendered.axes[2].get_position().y1
+
+
+def test_type3h_places_second_channel_stack_beside_first(api, monkeypatch):
+    state = api['st'].session_state
+    state.update(api['_paper_type3h_format']({}))
+    state['paper_titration_type'] = 'Type 3H - Vertical titration, Langmuir and accuracy'
+    def panel(*args, **kwargs):
+        fig, ax = plt.subplots()
+        ax.plot([1, 2], [1, 2])
+        return fig
+    for name in ('_paper_response_panel', 'plot_titration_langmuir',
+                 'plot_titration_concentration_accuracy'):
+        monkeypatch.setitem(api, name, panel)
+    monkeypatch.setitem(api, 'collect_titration_measurement_accuracy_rows', lambda *a, **k: [])
+    figure = api['_paper_type3g_figure'](
+        [], [], [(3, 'opt3', 'control3', (1, 50)), (5, 'opt5', 'control5', (1, 50))],
+        fit_options=dict(vlines=[], concentration_unit='uM'), colors={},
+        response_directions={}, raster_dpi=72)
+    for rendered in (figure, figure._paper_export_factory(80)):
+        assert tuple(rendered.get_size_inches()) == pytest.approx((12., 9.6))
+        boxes = [axis.get_position() for axis in rendered.axes]
+        assert boxes[0].x1 < boxes[3].x0
+        for left, right in zip(boxes[:3], boxes[3:]):
+            assert (left.y0, left.height, left.width) == pytest.approx(
+                (right.y0, right.height, right.width))
+        for start in (0, 3):
+            assert boxes[start].y0 > boxes[start+1].y1
+            assert boxes[start+1].y0 > boxes[start+2].y1
 
 
 def test_four_column_composite_expands_canvas_for_panel_pixels(api):

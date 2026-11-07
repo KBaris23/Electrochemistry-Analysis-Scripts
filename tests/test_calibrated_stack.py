@@ -13,6 +13,63 @@ def rows():
             for i in (2, 7, 50) for phase in ("buffer", "target")]
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+def test_fixed_iteration_axis_retains_positions_when_endpoints_and_middle_are_excluded(reverse):
+    figures = []
+    traces = {}
+    try:
+        for label, selected in [('full', rows()), ('filtered', [r for r in rows() if r['iteration'] == 7])]:
+            fig, ax = plt.subplots()
+            figures.append(fig)
+            draw_coordinate_stack(fig, ax, selected, reverse=reverse, iteration_range=(1, 50))
+            ticks = [t.get_text() for t in ax.texts if getattr(t, '_bo_axis_tick', '') == 'iteration']
+            assert ticks == (['1', '25', '50'] if reverse else ['50', '25', '1'])
+            traces[label] = [line for line in ax.lines if getattr(line, '_bo_stack_iteration', None) == 7]
+            assert fig._bo_stack_calibration['iteration_axis_range'] == [1, 50]
+        assert len(traces['filtered']) == 2
+        for before, after in zip(traces['full'], traces['filtered']):
+            np.testing.assert_array_equal(before.get_xdata(), after.get_xdata())
+            np.testing.assert_array_equal(before.get_ydata(), after.get_ydata())
+        assert figures[-1]._bo_successful_iterations == [7]
+    finally:
+        for fig in figures:
+            plt.close(fig)
+
+
+def test_fixed_iteration_axis_extends_limits_without_hiding_retained_traces():
+    fig, ax = plt.subplots()
+    try:
+        draw_coordinate_stack(fig, ax, rows(), iteration_range=(10, 40))
+        assert fig._bo_stack_calibration['iteration_axis_range'] == [2, 50]
+        assert len([line for line in ax.lines if hasattr(line, '_bo_stack_iteration')]) == 6
+    finally:
+        plt.close(fig)
+
+
+def test_fixed_iteration_controls_survive_source_edit_and_workspace(tmp_path):
+    from streamlit.testing.v1 import AppTest
+    from core.workspace_sessions import save_workspace, load_workspace
+    app = AppTest.from_string('''
+import streamlit as st
+import bo_session_viewer as viewer
+spec = {}
+viewer._composer_stack_spacing_controls(spec, index=0)
+st.session_state['spec'] = spec
+''').run()
+    app.checkbox(key='bo_composer_stack_fixed_iterations_0').check().run()
+    assert not app.exception
+    spec = app.session_state['spec']
+    assert spec['stack_iteration_start'] == 1
+    assert spec['stack_iteration_end'] == 50
+    state = {'bo_composer_count': 1}
+    assert apply_source_edit(state, {'index': 0, 'spec': {'kind': 'Chronological SWV stack', **spec}})
+    path, _ = save_workspace(tmp_path, 'fixed-axis', state)
+    saved, _ = load_workspace(path)
+    assert saved['state']['bo_composer_stack_fixed_iterations_0'] is True
+    assert saved['state']['bo_composer_stack_iteration_start_0'] == 1
+    assert saved['state']['bo_composer_stack_iteration_end_0'] == 50
+
+
 def test_depth_follows_buffer_iterations_and_rear_fades():
     fig, ax = plt.subplots()
     draw_coordinate_stack(fig, ax, rows(), reverse=True, axis_gap=0.)

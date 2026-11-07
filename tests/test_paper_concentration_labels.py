@@ -53,12 +53,21 @@ def test_centered_numbers_unit_once_shading_and_independent_font(api):
 
 
 def test_top_row_only_never_hides_different_concentrations(api):
+    api['st'].session_state['paper_titration_dose_top_row_only'] = True
     seen = {}
     for row, dose, expected_labels in [(0, '80 uM', 4), (1, '80 uM', 0), (2, '40 uM', 4)]:
         fig, ax = panel(dose)
         api['_paper_concentration_labels'](fig, row_index=row, seen_schedules=seen)
         assert len(labels(ax)) == expected_labels
         assert len(ax.patches) == 2
+
+
+def test_matching_schedules_are_labeled_on_every_row_by_default(api):
+    seen = {}
+    for row in range(2):
+        fig, ax = panel()
+        api['_paper_concentration_labels'](fig, row_index=row, seen_schedules=seen)
+        assert len(labels(ax)) == 4
 
 
 def test_caption_only_buffer_and_repeated_units_are_options(api):

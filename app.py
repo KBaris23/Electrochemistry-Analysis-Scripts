@@ -1957,7 +1957,7 @@ def _paper_panel_roles(figure_type: str, extra_columns=()) -> list[str]:
         return ["response", "langmuir"]
     if figure_type.startswith("Type 3F"):
         return ["manual_swv", "optimized_swv"]
-    if figure_type.startswith("Type 3G"):
+    if figure_type.startswith(("Type 3G", "Type 3H")):
         return ["response", "langmuir", "accuracy"]
     roles = ["manual_swv", "optimized_swv", "response"]
     if figure_type.startswith("Type 3D"):
@@ -2210,7 +2210,7 @@ def _paper_concentration_labels(source, *, row_index=0, seen_schedules=None):
         "swv_titration_concentration_unit", "uM")))
     display_unit = "µM" if unit == "uM" else unit
     unit_once = bool(st.session_state.get("paper_titration_dose_unit_once", True))
-    top_only = bool(st.session_state.get("paper_titration_dose_top_row_only", True))
+    top_only = bool(st.session_state.get("paper_titration_dose_top_row_only", False))
     first_buffer = st.session_state.get(
         "paper_titration_buffer_explanation", "First buffer interval") == "First buffer interval"
     shade_alpha = float(st.session_state.get("paper_titration_buffer_shade_alpha", .35))
@@ -2467,10 +2467,73 @@ def _paper_style_source(source: plt.Figure, font_size: float, cell_w: float, cel
             source.tight_layout()
         except Exception:
             pass
+    if str(st.session_state.get("paper_titration_type", "")).startswith("Type 3H"):
+        # Shared plotting width, rather than merely equal outer image widths.
+        # Keep the prediction legend below its axes when widening its data area.
+        for axis in source.axes:
+            box = axis.get_position()
+            axis.set_box_aspect(None)
+            axis.set_aspect("auto")
+            axis.set_position([.16, box.y0, .80, box.height])
+            legend = axis.get_legend()
+            if legend is not None and getattr(legend, "_swv_keep_location", False):
+                legend.set_bbox_to_anchor(
+                    (.56, max(.12, min(.76, source.get_figheight() * .35) - .38)
+                     / source.get_figheight()), transform=source.transFigure)
     _paper_reserve_dose_label_space(source)
+    if (str(st.session_state.get("paper_titration_type", "")).startswith("Type 3H")
+            and axis_label_size > 12):
+        # Large text needs line wrapping and physical clearance below the plot;
+        # keep the original canvas and the shared width of the three panels.
+        for axis in source.axes:
+            ylabel = axis.get_ylabel()
+            ylabel = ylabel.replace("Change in Peak Current", "Change in Peak\nCurrent")
+            ylabel = ylabel.replace("Predicted concentration (", "Predicted\nconcentration\n(")
+            axis.set_ylabel(ylabel, fontsize=axis_label_size)
+            box = axis.get_position()
+            axis.set_position([.25, box.y0, .71, box.height])
+            legend = axis.get_legend()
+            if legend is not None and getattr(legend, "_swv_keep_location", False):
+                height = source.get_figheight()
+                bottom = min(1.36, height * .48)
+                top = .32
+                axis.set_position([.25, bottom / height, .71,
+                                   (height - bottom - top) / height])
+                handles = getattr(legend, "legend_handles", [])
+                labels = [text.get_text() for text in legend.get_texts()]
+                legend = axis.legend(handles, labels, fontsize=legend_size,
+                                     loc="upper center", ncol=2, frameon=False,
+                                     columnspacing=.8, handletextpad=.4,
+                                     borderaxespad=0,
+                                     bbox_to_anchor=(.58, .68 / height),
+                                     bbox_transform=source.transFigure)
+                legend._swv_keep_location = True
+                summaries = [text for text in axis.texts
+                             if getattr(text, "_swv_error_summary", False)]
+                gap = font_size * .8 * 1.35 / 72 / (height - bottom - top)
+                for index, summary in enumerate(summaries):
+                    summary.set_y(.97 - index * gap)
+    if (str(st.session_state.get("paper_titration_type", "")).startswith("Type 3H")
+            and st.session_state.get("paper_titration_square_accuracy", False)):
+        for axis in compact_axes:
+            axis.set_box_aspect(1)
     if any(getattr(text, "_paper_dose_interval_label", False)
            for axis in source.axes for text in axis.texts):
         _paper_position_dose_labels(source)
+        if (str(st.session_state.get("paper_titration_type", "")).startswith("Type 3H")
+                and axis_label_size > 12):
+            source.canvas.draw()
+            renderer = source.canvas.get_renderer()
+            for axis in source.axes:
+                legend = axis.get_legend()
+                if legend is None:
+                    continue
+                legend_box = legend.get_window_extent(renderer)
+                for text in axis.texts:
+                    if (getattr(text, "_paper_dose_interval_label", False)
+                            and text.get_window_extent(renderer).overlaps(legend_box)):
+                        text.set_y(float(st.session_state.get(
+                            "paper_titration_dose_label_height", .88)))
 
 
 def _paper_figure_image(source: plt.Figure, dpi: int = 300) -> np.ndarray:
@@ -2838,8 +2901,13 @@ def _paper_type3g_figure(
     response_change=True, display_vlines=None, display_channel_vlines=None,
     row_layouts=None, raster_dpi=160, capture_sources=True, show_lod=False, show_uloq=False,
 ):
-    """Native Type 3G renderer shared by the app and saved-session exports."""
+    """Native Type 3G/3H renderer shared by the app and saved-session exports."""
     state = st.session_state
+    vertical = str(state.get("paper_titration_type", "")).startswith("Type 3H")
+    if vertical and not row_layouts:
+        layout_key = "paper_titration_row_layout_type_3h_vertical_titration_langmuir_and_accuracy_0"
+        layout = state.get(layout_key, _paper_type3h_format({})[layout_key])
+        row_layouts = [copy.deepcopy(layout) for _ in comparisons]
     panels = []
     optimized_label = str(state.get("paper_optimized_label", "Optimized Method"))
     control_label = str(state.get("paper_unoptimized_label", "Control Method"))
@@ -2881,17 +2949,124 @@ def _paper_type3g_figure(
             concentration_regularization=float(state.get("paper_concentration_regularization", .0001)),
             concentration_display_boundary=float(state.get("paper_concentration_display_boundary", 0.)),
         ))
+    group_count = len(comparisons)
+    if vertical:
+        # Repeat each editable three-panel stack across columns, keeping the
+        # same physical panel size and the source/export order within each group.
+        row_layouts = [[
+            [(group + left) / group_count, bottom, width / group_count, height]
+            for group, layout in enumerate(row_layouts)
+            for left, bottom, width, height in _paper_normalize_row_layout(layout, 3)
+        ]]
     return _paper_composite_figure(
-        panels, len(comparisons), 3,
-        width=float(state.get("paper_titration_width", 12.8)),
+        panels, 1 if vertical else group_count, 3 * group_count if vertical else 3,
+        width=float(state.get("paper_titration_width", 12.8)) * (group_count if vertical else 1),
         row_height=float(state.get("paper_titration_row_height", 3.2)),
         font_size=float(state.get("paper_titration_font", 8.)),
         column_gap=float(state.get("paper_titration_column_gap", .16)),
         row_gap=float(state.get("paper_titration_row_gap", .18)),
-        panel_roles=["response", "langmuir", "accuracy"], row_layouts=row_layouts,
+        panel_roles=["response", "langmuir", "accuracy"] * (group_count if vertical else 1),
+        row_layouts=row_layouts,
         raster_dpi=raster_dpi, capture_sources=capture_sources,
-        equal_column_gaps=bool(state.get("paper_titration_equal_column_gaps", True)),
+        equal_column_gaps=not vertical and bool(state.get("paper_titration_equal_column_gaps", True)),
     )
+
+
+def _paper_exclude_final_titration_pair(recipe, rows, comparisons):
+    """Remove the final buffer/target pair from data, fit selection and markers."""
+    recipe = copy.deepcopy(recipe)
+    markers = recipe['vlines']
+    ends = {hi for _, _, _, (_, hi) in comparisons}
+    if len(ends) != 1:
+        raise ValueError('Final-pair exclusion requires a shared display endpoint.')
+    visible = [v for v in markers if float(v[0]) <= next(iter(ends))
+               and str(v[1]).lower() != 'end']
+    if (len(visible) < 2 or str(visible[-2][1]).lower() != 'buffer'
+            or 'buffer' in str(visible[-1][1]).lower()):
+        raise ValueError('Expected a final visible buffer/target sequence.')
+    cutoff, target = float(visible[-2][0]), str(visible[-1][1])
+    def trim(values):
+        return [v for v in values if float(v[0]) < cutoff] + [[cutoff, 'end']]
+    recipe['vlines'] = trim(markers)
+    recipe['channel_vlines'] = {k: trim(v) for k, v in recipe['channel_vlines'].items()}
+    # The saved interval identities distinguish repeated buffer/target labels.
+    included = recipe.get('included_steps')
+    if included:
+        target_index = max((i for i, label in enumerate(included) if label == target), default=-1)
+        if target_index < 1 or not included[target_index-1].startswith('buffer'):
+            raise ValueError('Final selected step labels do not match the removed pair.')
+        recipe['included_steps'] = included[:target_index-1]
+    retained = [row for row in rows if float(row['scan_number']) < cutoff]
+    comparisons = [(p, o, m, (lo, min(hi, int(cutoff) - 1)))
+                   for p, o, m, (lo, hi) in comparisons]
+    return recipe, retained, comparisons, dict(
+        excluded_from_measurement=cutoff, excluded_target=target,
+        removed_rows=len(rows) - len(retained), applies_to='response, fit and prediction')
+
+
+
+def _paper_type3h_format(reference: Mapping[str, Any]) -> dict:
+    """Vertical response, fit and prediction panels with matching plot widths."""
+    values = _paper_type3g_format(reference)
+    values.pop("paper_titration_row_layout_type_3g_titration_langmuir_and_accuracy_0", None)
+    values.update({
+        "paper_titration_width": 6.0,
+        "paper_titration_row_height": 9.6,
+        "paper_titration_equal_column_gaps": False,
+        "paper_titration_row_layout_type_3h_vertical_titration_langmuir_and_accuracy_0": [
+            [.02, .69, .96, .29], [.02, .36, .96, .29], [.02, .02, .96, .30],
+        ],
+        "paper_validation_square_axes": False,
+        "paper_titration_aspect_accuracy_mode": "Automatic",
+        "paper_titration_aspect_response_mode": "Automatic",
+        "paper_titration_aspect_langmuir_mode": "Automatic",
+        "paper_titration_clear_dose_labels": True,
+        "paper_titration_dose_top_row_only": False,
+    })
+    return values
+
+
+def _paper_titration_remember_format(state, figure_type=None) -> None:
+    """Keep the latest edits for every visited figure type, including new ones."""
+    figure_type = str(figure_type or state.get("paper_titration_type") or "")
+    if not figure_type:
+        return
+    current = dict(state)
+    current["paper_titration_type"] = figure_type
+    formats = copy.deepcopy(state.get("_paper_type3_formats", {}))
+    formats[figure_type] = _paper_titration_format_values(current)
+    state["_paper_type3_formats"] = formats
+
+
+def _paper_titration_apply_named_preset() -> None:
+    from core.paper_presets import load_titration_presets
+
+    state = st.session_state
+    name = state.get("paper_titration_format_preset_named")
+    preset = load_titration_presets()[name]
+    _paper_titration_remember_format(state)
+    state.pop("paper_titration_dose_clearance", None)
+    state["paper_titration_type"] = preset["figure_type"]
+    # Use the same whitelist as saved formatting, never restore data choices.
+    state.update(_paper_titration_format_values({
+        **preset["controls"], "paper_titration_type": preset["figure_type"],
+    }))
+    state["_paper_previous_type"] = preset["figure_type"]
+    _paper_titration_remember_format(state)
+    state["_paper_titration_type_preset_notice"] = f"Loaded {name}."
+
+
+def _paper_titration_named_preset_controls() -> None:
+    from core.paper_presets import load_titration_presets
+
+    presets = load_titration_presets()
+    if not presets:
+        return
+    st.selectbox("Titration figure preset", list(presets),
+                 key="paper_titration_format_preset_named")
+    st.button("Apply titration preset", on_click=_paper_titration_apply_named_preset,
+              key="paper_titration_format_preset_apply_named",
+              help="Load saved titles, text sizes and panel layout. Keeps channels, methods, display ranges and fitting choices.")
 
 
 def _paper_titration_apply_selected_type_preset() -> None:
@@ -2901,14 +3076,14 @@ def _paper_titration_apply_selected_type_preset() -> None:
     # Session-specific formats take precedence over global presets. Keep edits
     # when switching between the response/fit and SWV figures.
     previous_type = str(st.session_state.get("_paper_previous_type", ""))
-    session_formats = copy.deepcopy(st.session_state.get("_paper_type3_formats", {}))
-    if previous_type in session_formats:
-        previous = dict(st.session_state)
-        previous["paper_titration_type"] = previous_type
-        session_formats[previous_type] = _paper_titration_format_values(previous)
-        st.session_state["_paper_type3_formats"] = session_formats
+    if previous_type:
+        _paper_titration_remember_format(st.session_state, previous_type)
+    session_formats = st.session_state.get("_paper_type3_formats", {})
     if figure_type in session_formats:
         st.session_state.update(copy.deepcopy(session_formats[figure_type]))
+        return
+    if figure_type.startswith("Type 3H") and figure_type not in presets:
+        st.session_state.update(_paper_type3h_format(_paper_titration_format_values(st.session_state)))
         return
     if figure_type.startswith("Type 3G") and figure_type not in presets:
         reference = st.session_state.get("_paper_type3d_format") or _paper_titration_format_values(st.session_state)
@@ -3838,8 +4013,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Composer panels must survive navigation back to Metrics or other views.
-_preserve_bo_widget_choices()
+# Figure settings must survive navigation to views where their widgets are hidden.
+_preserve_bo_widget_choices(prefix=("bo_", "paper_", "swv_titration_"))
 
 
 st.markdown("""
@@ -8852,6 +9027,7 @@ if view == "Paper Figures":
                 and not st.session_state.get("_paper_type3e_size_version")):
             _paper_titration_apply_selected_type_preset()
             st.session_state["_paper_type3e_size_version"] = 1
+        _paper_titration_named_preset_controls()
         figure_type = st.radio(
             "Figure type",
             [
@@ -8863,6 +9039,7 @@ if view == "Paper Figures":
                 "Type 3E - Titration and Langmuir",
                 "Type 3F - SWVs only",
                 "Type 3G - Titration, Langmuir and accuracy",
+                "Type 3H - Vertical titration, Langmuir and accuracy",
                 "Type 4 - Concentration validation",
                 "Type 4A - Langmuir and concentration validation",
                 "Type 4B - Concentration prediction and accuracy",
@@ -8878,7 +9055,8 @@ if view == "Paper Figures":
                 "for the ON and OFF rows, with a shared fit panel. "
                 "Type 3D omits fitting panels. Type 3E pairs titration and Langmuir; "
                 "Type 3F shows the two SWV methods only. Type 3G combines titration, "
-                "Langmuir, and a larger predicted-vs-known panel. Type 4A adds Langmuir before "
+                "Langmuir, and a larger predicted-vs-known panel. Type 3H stacks these "
+                "vertically with matching plot widths. Type 4A adds Langmuir before "
                 "the two prediction panels; Type 4B keeps only those two panels."
             ),
         )
@@ -8938,12 +9116,12 @@ if view == "Paper Figures":
             st.stop()
         is_directional_type3 = figure_type.startswith(("Type 3A", "Type 3B", "Type 3C"))
         has_paired_directional_langmuirs = figure_type.startswith("Type 3C")
-        if figure_type.startswith(("Type 4", "Type 3G")):
+        if figure_type.startswith(("Type 4", "Type 3G", "Type 3H")):
             with st.expander("Concentration validation layout", expanded=True):
                 if figure_type.startswith("Type 3G"):
                     st.checkbox("Equal spacing between plotting areas", value=True,
                                 key="paper_titration_equal_column_gaps")
-                if not figure_type.startswith("Type 3G"):
+                if not figure_type.startswith(("Type 3G", "Type 3H")):
                     st.slider("Predicted-vs-known width (%)", 30, 60, 45,
                               key="paper_validation_width_percent")
                     st.slider("Validation panel gap", 0., .25, .04, .01,
@@ -9063,11 +9241,12 @@ if view == "Paper Figures":
                   help='Overlaid plasma SWVs, every trace, zero correction anchors, and buffer-referenced response. Keeps your channel, methods and scan range.')
         control_cols = st.columns(4)
         paper_font = float(control_cols[0].number_input(
-            "Font size (pt)", 5.0, 14.0, value=8.0, step=.5,
+            "Font size (pt)", 5.0, 30.0, value=8.0, step=.5,
             key="paper_titration_font",
         ))
         paper_width = float(control_cols[1].number_input(
-            "Canvas width (in)", 6.0, 30.0, value=10.0, step=.5,
+            "Stack width (in)" if figure_type.startswith("Type 3H") else "Canvas width (in)",
+            6.0, 30.0, value=10.0, step=.5,
             key="paper_titration_width",
         ))
         paper_raster_dpi = int(control_cols[2].number_input(
@@ -9098,7 +9277,7 @@ if view == "Paper Figures":
             key="paper_output_dataset",
             help="Portable figure packages use dataset/[maximize|minimize]/ only; no titrations or channel subfolders are created.",
         ).strip() or "dataset"
-        with st.expander("Titles, legend labels, and typography", expanded=figure_type.startswith(("Type 3E", "Type 3G"))):
+        with st.expander("Titles, legend labels, and typography", expanded=figure_type.startswith(("Type 3E", "Type 3G", "Type 3H"))):
             role_cols = st.columns(2)
             optimized_display_label = role_cols[0].text_input(
                 "Optimized legend label", value="Optimized Method", key="paper_optimized_label"
@@ -9234,7 +9413,7 @@ if view == "Paper Figures":
         paper_response_display = display_cols[2].radio(
             "Response curves", ["Overlaid", "Stacked"], horizontal=True,
             key="paper_titration_response_display",
-            disabled=figure_type.startswith("Type 3G"),
+            disabled=figure_type.startswith(("Type 3G", "Type 3H")),
         )
         paper_extra_columns = display_cols[3].multiselect(
             "Extra Type 3 columns",
@@ -9293,7 +9472,7 @@ if view == "Paper Figures":
                 key="paper_titration_buffer_shade_alpha", disabled=not clear_doses,
             )
             buffer_cols[2].checkbox(
-                "Label only the top row for matching schedules", value=True,
+                "Label only the top row for matching schedules", value=False,
                 key="paper_titration_dose_top_row_only", disabled=not clear_doses,
                 help="Lower rows keep the gray shading. Different concentration schedules keep their own labels.",
             )
@@ -9311,7 +9490,7 @@ if view == "Paper Figures":
                         help="Keeps physical font points and panel margins intact. PDF/SVG retain the source curves and text instead of preview images.")
             layout_cols = st.columns(4)
             paper_row_height = float(layout_cols[0].number_input(
-                "Row height (in)", 1.5, 6.0,
+                "Row height (in)", 1.5, 20.0,
                 value=3.1 if figure_type.startswith("Type 4") else 2.6,
                 step=.1, key="paper_titration_row_height",
             ))
@@ -9661,7 +9840,7 @@ if view == "Paper Figures":
             "Type 4 reuses this calibration; it is not independent validation."
         )
         paper_recipe = {
-            'renderer_version': 'native-type3g-equal-columns-v10',
+            'renderer_version': 'native-type3gh-presets-v12',
             'analysis_state': {key: value for key, value in serializable_state(st.session_state).items()
                                if key.startswith('swv_')},
             'controls': {key: value for key, value in st.session_state.items()
@@ -9689,6 +9868,7 @@ if view == "Paper Figures":
             help="Save channels, methods, ranges, titration labels and figure formatting; keep the existing analysis cache.",
         ):
             try:
+                _paper_titration_remember_format(st.session_state)
                 save_paper_settings(save_path, st.session_state)
                 st.success(f"Saved figure settings to {save_name}.")
             except Exception as exc:
@@ -9965,7 +10145,7 @@ if view == "Paper Figures":
                     st.session_state["paper_titration_render"] = (
                         "type3_signal_on_off", composite, 2, paper_width, paper_font
                     )
-            elif figure_type.startswith("Type 3G"):
+            elif figure_type.startswith(("Type 3G", "Type 3H")):
                 composite = _paper_type3g_figure(
                     paper_source_results, paper_metric_results, comparisons,
                     fit_options=dict(
@@ -9985,7 +10165,8 @@ if view == "Paper Figures":
                     show_lod=show_titration_lod, show_uloq=show_titration_uloq,
                 )
                 st.session_state["paper_titration_render"] = (
-                    "type3g", composite, paper_rows, paper_width, paper_font
+                    "type3h" if figure_type.startswith("Type 3H") else "type3g",
+                    composite, paper_rows, paper_width, paper_font
                 )
             elif figure_type.startswith("Type 3"):
                 concentration_schedules_seen = {}

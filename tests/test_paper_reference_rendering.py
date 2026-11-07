@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+import re
 import bo_session_viewer as viewer
 from core.plotting import add_titration_on_off_difference
 from pathlib import Path
@@ -79,7 +80,7 @@ def test_type3_can_append_both_concentration_validation_panels():
     assert '"Concentration by measurement"' in source
     assert 'extra_column == "Concentration by measurement"' in source
     assert 'title=f"Channel {physical} | Concentration by Measurement"' in source
-    assert '"Canvas width (in)", 6.0, 30.0' in source
+    assert re.search(r'"Canvas width \(in\)",\s*6\.0,\s*30\.0', source)
     assert 'key="paper_titration_swv_full_range"' in source
 
 

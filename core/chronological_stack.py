@@ -1,6 +1,6 @@
 """Compact, calibrated projection of chronological SWV traces.
 
-Depth is ordinal (accepted iterations), not elapsed time. Buffer and target
+Depth can be ordinal or preserve gaps in original iteration numbers. Buffer and target
 replicates from the same iteration always occupy the same depth plane.
 """
 import numpy as np
@@ -59,11 +59,20 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
                           line_width=1.5, show_ticks=True, current_scale=.72,
                           current_top=None, normalized=False, legend_location="upper right",
                           axis_gap=.08, depth_spacing=1.18,
-                          legend_columns=1, legend_y=None):
+                          legend_columns=1, legend_y=None, iteration_range=None):
     iterations = sorted({row["iteration"] for row in rows})
     ordered = iterations if reverse else iterations[::-1]
     ranks = {iteration: rank for rank, iteration in enumerate(ordered)}
     count = max(1, len(ordered) - 1)
+    axis_order = ordered
+    if iteration_range is not None:
+        # Extend undersized limits rather than hiding any retained waveforms.
+        first = min(int(min(iteration_range)), int(min(iterations)))
+        last = max(int(max(iteration_range)), int(max(iterations)))
+        count = max(1, last - first)
+        ranks = {iteration: iteration - first if reverse else last - iteration
+                 for iteration in iterations}
+        axis_order = sorted({first, (first + last) // 2, last}, reverse=not reverse)
     vmin = min(float(np.min(row["voltage"])) for row in rows)
     vmax = max(float(np.max(row["voltage"])) for row in rows)
     vspan = max(vmax - vmin, 1e-12)
@@ -77,7 +86,7 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
     # cannot change the reported current or silently clip a trace.
     gain = .68 * float(current_scale) / .72 / top
     origin = np.array([-.045 - axis_gap, -axis_gap])
-    depth = np.array([-.48, .90]) * depth_spacing if len(ordered) > 1 else np.zeros(2)
+    depth = np.array([-.48, .90]) * depth_spacing if len(axis_order) > 1 else np.zeros(2)
     colors = {"buffer": "#0072B2", "target": "#D55E00", "measurement": "#0072B2"}
     bounds = [origin, origin + depth, origin + [1.045, 0], origin + [0, top * gain]]
     for row in sorted(rows, key=lambda item: ranks[item["iteration"]], reverse=True):
@@ -86,7 +95,9 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
         phase = str(row.get("phase", "measurement")).lower()
         x = (np.asarray(row["voltage"]) - vmin) / vspan + offset[0]
         y = np.asarray(row["current"]) * gain + offset[1]
-        line, = ax.plot(x, y, color=colors.get(phase, "#555555"),
+        cuts = [segment[0] for segment in row.get('display_segments', [])[1:] if segment]
+        line, = ax.plot(np.insert(x, cuts, np.nan), np.insert(y, cuts, np.nan),
+                        color=colors.get(phase, "#555555"),
                         linestyle="-",
                         linewidth=line_width,
                         alpha=fade_floor + (1. - fade_floor) * (1. - fraction) ** 2,
@@ -113,8 +124,13 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
         ax.add_artist(label_artist)
         label_artist._bo_axis_tick = kind
     if show_ticks:
-        for rank in sorted({0, (len(ordered)-1)//2, len(ordered)-1}):
-            tick(origin + depth * rank / count, str(ordered[rank]), "iteration")
+        if iteration_range is not None:
+            for iteration in axis_order:
+                rank = iteration - first if reverse else last - iteration
+                tick(origin + depth * rank / count, str(iteration), "iteration")
+        else:
+            for rank in sorted({0, (len(ordered)-1)//2, len(ordered)-1}):
+                tick(origin + depth * rank / count, str(ordered[rank]), "iteration")
         for value in MaxNLocator(nbins=3).tick_values(vmin, vmax):
             if vmin <= value <= vmax:
                 tick(np.array([(value-vmin)/vspan, origin[1]]), f"{value:g}", "voltage")
@@ -144,7 +160,7 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
     ax.legend([Line2D([], [], color=colors.get(phase, "#555555"), marker="o", markersize=3,
                       linestyle="-", lw=1.3) for phase in phases],
               [phase.title() for phase in phases], loc=legend_location,
-              bbox_to_anchor=(.98 if 'right' in legend_location else .02,
+              bbox_to_anchor=(.93 if 'right' in legend_location else .02,
                               float(legend_y) if legend_y is not None else
                               (.72 if 'upper' in legend_location else .10)),
               ncol=min(max(1, int(legend_columns)), len(phases)), fontsize=8, frameon=False,
@@ -161,7 +177,9 @@ def draw_coordinate_stack(fig, ax, rows, *, reverse=False, fade_floor=.18,
     fig._bo_coordinate_frame_style = "Shared-Origin Three-Axis Frame"
     fig._bo_stack_calibration = {"voltage_range": [vmin, vmax], "current_axis_top": top,
                                  "current_scale_mode": "manual" if current_top else "detected_peak",
-                                 "iteration_order": ordered, "depth_spacing": "accepted_iteration",
+                                 "iteration_order": ordered,
+                                 "iteration_axis_range": [first, last] if iteration_range is not None else [min(iterations), max(iterations)],
+                                 "depth_spacing": "original_iteration" if iteration_range is not None else "accepted_iteration",
                                  "rear_opacity": fade_floor, "axis_gap": axis_gap,
                                  "depth_spacing_scale": depth_spacing, "axis_arrowheads": False}
     return fig

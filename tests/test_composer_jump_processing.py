@@ -89,6 +89,8 @@ import bo_session_viewer as v
 from unittest.mock import patch
 st.session_state.setdefault('calls', 0)
 st.session_state.setdefault('bo_composer_validation_excluded_iterations', [3])
+st.session_state.setdefault('bo_composer_stack_polish_mode_2', 'Repair (keep traces)')
+st.session_state.setdefault('bo_composer_stack_display_smoothing_2', True)
 def anomalies(*args):
     st.session_state['calls'] += 1
     return {11: ['spike']}
@@ -98,12 +100,15 @@ st.multiselect('Excluded iterations', list(range(1, 12)), key='bo_composer_valid
 ''').run()
     assert not app.exception
     assert app.session_state['calls'] == 0
+    assert app.selectbox(key='bo_composer_polish_strength').value == 'Conservative'
     app.selectbox(key='bo_composer_polish_strength').select('Stronger').run()
     assert app.session_state['calls'] == 0
     app.button(key='bo_composer_validation_auto_polish_button').click().run()
     assert not app.exception
     assert app.session_state['calls'] == 1
     assert app.multiselect[0].value == [3, 11]
+    assert app.session_state['bo_composer_stack_polish_mode_2'] == 'Off'
+    assert app.session_state['bo_composer_stack_display_smoothing_2'] is False
     app.run()
     assert app.session_state['calls'] == 1
     assert app.multiselect[0].value == [3, 11]
@@ -113,6 +118,37 @@ st.multiselect('Excluded iterations', list(range(1, 12)), key='bo_composer_valid
     app.run()
     assert app.session_state['calls'] == 1
     assert app.multiselect[0].value == []
+
+
+def test_repair_polish_restores_traces_without_running_exclusion_detector():
+    from streamlit.testing.v1 import AppTest
+    app = AppTest.from_string('''
+import streamlit as st
+import bo_session_viewer as v
+from unittest.mock import patch
+st.session_state.setdefault('bo_composer_validation_excluded_iterations', [1, 9])
+st.session_state.setdefault('bo_composer_stack_show_all_2', False)
+st.session_state.setdefault('bo_composer_stack_corrected_2', True)
+st.session_state.setdefault('bo_composer_stack_trace_key_2', 'corrected_current')
+st.session_state.setdefault('bo_composer_stack_voltage_range_2', 'Full analyzed voltage range')
+with patch.object(v, '_composer_type2_swv_anomalies', side_effect=AssertionError('Must not reject traces')):
+    v._composer_polish_controls({}, [], st.session_state, 2)
+st.multiselect('Excluded iterations', list(range(1, 12)), key='bo_composer_validation_excluded_iterations')
+st.checkbox('All traces', key='bo_composer_stack_show_all_2')
+''').run()
+    app.button(key='bo_composer_validation_repair_button').click().run()
+    assert not app.exception
+    assert app.multiselect[0].value == []
+    assert app.checkbox[0].value is True
+    assert app.session_state['bo_composer_stack_width_2'] == .7
+    assert app.session_state['bo_composer_stack_depth_spacing_2'] == 1.28
+    assert app.session_state['bo_composer_stack_polish_mode_2'] == 'Repair (keep traces)'
+    assert app.session_state['bo_composer_stack_corrected_2'] is True
+    assert app.session_state['bo_composer_stack_trace_key_2'] == 'corrected_current'
+    assert app.session_state['bo_composer_stack_voltage_range_2'] == 'Full analyzed voltage range'
+    app.run()
+    assert app.multiselect[0].value == []
+    assert app.checkbox[0].value is True
 
 
 def test_polish_flags_missing_requested_phase_but_allows_single_phase_stack(monkeypatch):

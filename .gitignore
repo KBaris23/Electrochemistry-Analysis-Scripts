@@ -76,6 +76,9 @@ scripts/regenerate_validation_release.py
 scripts/release_titrations.py
 scripts/generate_titration_3e_package.py
 scripts/generate_titration_3g.py
+scripts/generate_titration_compact.py
+scripts/generate_titration_page.py
+scripts/preview_stack_polish.py
 
 # Local Q-score manuscript studies, exploratory renderers, and exports
 /scripts/audit_q_peak_variability_cases.py

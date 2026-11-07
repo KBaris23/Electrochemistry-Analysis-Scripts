@@ -62,11 +62,13 @@ _EXCLUDED_PREFIXES = (
     "bo_composer_capture_preview_", "bo_gif_", "bo_sim_",
     "bo_composer_stack_spacing_reset_",
     "bo_composer_validation_auto_polish",
+    "bo_composer_validation_repair_button",
     "bo_composer_validation_clear_exclusions",
 )
 _EXCLUDED_KEYS = {
     '_paper_save_settings',
     'paper_titration_format_preset_overwrite', 'paper_titration_format_preset_reload',
+    'paper_titration_format_preset_apply_named',
     '_workspace_recovery_at', '_bo_lazy_tabs',
     "paper_recipe_upload", "paper_recipe_apply", "_pending_paper_recipe",
     "bo_composer_find_peak_example", "bo_hp_response_render_button",
@@ -199,7 +201,10 @@ def save_paper_settings(path: str | Path, state: Mapping[str, Any]) -> Path:
                 or key in {"swv_post_vlines_input", "swv_remove_extreme_titration_outliers",
                            "swv_fit_titration_langmuir", "_paper_titration_blue_orange_v1",
                            "_paper_swv_plasma_defaults_v1"})
-    previous = {k: v for k, v in previous.items() if not is_figure_setting(k)}
+    # A hidden Streamlit control may be absent from live state. Absence is not
+    # an instruction to erase another template's saved settings; explicit
+    # empty/False values still overwrite the previous value below.
+    previous = dict(previous)
     previous.update({k: v for k, v in settings.items() if is_figure_setting(k)})
     payload["state"] = previous
     payload["saved_utc"] = datetime.now(timezone.utc).isoformat()

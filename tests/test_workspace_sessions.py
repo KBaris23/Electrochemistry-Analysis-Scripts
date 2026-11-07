@@ -227,3 +227,23 @@ def test_save_paper_settings_accepts_legacy_single_folder(tmp_path):
     save_paper_settings(recipe, {**payload['state'], 'paper_titration_width': 12.05})
     updated, _ = load_workspace(recipe)
     assert updated['state']['paper_titration_width'] == 12.05
+
+
+def test_save_paper_settings_keeps_hidden_controls_and_accepts_explicit_resets(tmp_path):
+    from core.workspace_sessions import save_paper_settings
+    recipe, _ = save_workspace(tmp_path, 'hidden-settings', {
+        'folders': [str(tmp_path)],
+        'paper_titration_swv_voltage_min': -.45,
+        'paper_titration_dose_top_row_only': True,
+        'swv_titration_included_steps': ['80 uM'],
+    })
+    save_paper_settings(recipe, {
+        'folders': [str(tmp_path)], 'paper_titration_width': 9.,
+        'paper_titration_dose_top_row_only': False,
+        'swv_titration_included_steps': [],
+    })
+    payload, _ = load_workspace(recipe)
+    assert payload['state']['paper_titration_swv_voltage_min'] == -.45
+    assert payload['state']['paper_titration_width'] == 9.
+    assert payload['state']['paper_titration_dose_top_row_only'] is False
+    assert payload['state']['swv_titration_included_steps'] == []

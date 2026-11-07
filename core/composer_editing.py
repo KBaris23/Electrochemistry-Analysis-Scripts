@@ -237,6 +237,11 @@ SOURCE_FIELDS = {
         "coordinate_frame_style": "stack_axis_style", "current_axis_scale": "stack_current_axis_scale",
         "reverse_stack_order": "stack_reverse_order", "show_axis_ticks": "stack_axis_ticks",
         "stack_axis_gap": "stack_axis_gap", "stack_depth_spacing": "stack_depth_spacing",
+        "stack_fixed_iterations": "stack_fixed_iterations",
+        "stack_display_smoothing": "stack_display_smoothing",
+        "stack_polish_mode": "stack_polish_mode",
+        "stack_smoothing_strength": "stack_smoothing_strength",
+        "stack_iteration_start": "stack_iteration_start", "stack_iteration_end": "stack_iteration_end",
         "show_all_successful": "stack_show_all", "custom_title": "custom_title",
     },
     "Measured parallel coordinates": {
