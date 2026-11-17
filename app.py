@@ -64,6 +64,10 @@ from core import (
     run_cv_batch,
     run_batch,
 )
+from core.electrode_mapping import (
+    parse_electrode_mapping, electrode_label, organize_results,
+)
+from core.cv_exports import build_cv_figures_zip, cv_channel_file_stem
 from core.analysis import analyze_swv_arrays
 from core.plotting import (
     CONCENTRATION_DISPLAY_MODES, add_titration_on_off_difference, prepare_titration_swv_traces,
@@ -969,7 +973,16 @@ def render_downloadable_pyplot(
     plot_kind: Optional[str] = None,
     trace_modulo_key: Optional[str] = None,
     trace_alpha_key: Optional[str] = None,
+    download_bundle: Optional[List[Tuple[str, bytes]]] = None,
 ) -> None:
+    if globals().get("analysis_mode") == "CV" and "electrode_" not in file_stem:
+        mapping = _electrode_display_mapping()
+        if mapping:
+            file_stem = re.sub(
+                r"ch(\d+)(?=_|$)",
+                lambda match: cv_channel_file_stem(int(match.group(1)), mapping),
+                file_stem,
+            )
     settings_prefix = (
         "swv_langmuir_plot" if plot_kind == "langmuir_fit" else "swv_plot"
     )
@@ -1742,6 +1755,8 @@ def render_downloadable_pyplot(
             else "tight"
         ),
     )
+    if download_bundle is not None:
+        download_bundle.append((f"{safe_download_stem(file_stem)}.png", buffer.getvalue()))
     if globals().get("analysis_mode") == "SWV":
         plot_slot.image(
             buffer.getvalue(),
@@ -4394,6 +4409,8 @@ def build_results_export_rows(analysis_mode: str, results: List[dict]) -> Tuple[
             "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
 
+    if any(r.get("electrode") is not None for r in results):
+        export_keys.insert(1, "electrode")
     csv_rows = []
     for r in results:
         row = {}
@@ -4625,7 +4642,7 @@ def build_export_pdf(
                     lambda ch=ch, ch_res=ch_res: plot_cv_overlaid_cycles(
                         ch_res,
                         y_key=raw_overlay_key,
-                        title=f"Ch{ch} raw",
+                        title=f"{_display_channel_label(ch)} raw",
                         show_peak_markers=True,
                         show_peak_reference_vlines=True,
                     ),
@@ -4635,7 +4652,7 @@ def build_export_pdf(
                     lambda ch=ch, ch_res=ch_res: plot_cv_overlaid_cycles(
                         ch_res,
                         y_key=fitted_overlay_key,
-                        title=f"Ch{ch} smoothed",
+                        title=f"{_display_channel_label(ch)} smoothed",
                         show_peak_markers=True,
                         show_peak_reference_vlines=True,
                     ),
@@ -4646,7 +4663,7 @@ def build_export_pdf(
                     lambda ch=ch, ch_res=ch_res: plot_overlaid_traces(
                         ch_res,
                         y_key=raw_overlay_key,
-                        title=f"Ch{ch} raw",
+                        title=f"{_display_channel_label(ch)} raw",
                     ),
                 ))
                 fitted_factories.append((
@@ -4654,7 +4671,7 @@ def build_export_pdf(
                     lambda ch=ch, ch_res=ch_res: plot_overlaid_traces(
                         ch_res,
                         y_key=fitted_overlay_key,
-                        title=f"Ch{ch} smoothed corrected",
+                        title=f"{_display_channel_label(ch)} smoothed corrected",
                         show_peak_markers=True,
                         show_zero_baseline=True,
                     ),
@@ -4690,7 +4707,7 @@ def build_export_pdf(
                             _metric_results(metric),
                             metric=metric,
                             channels=[ch],
-                            title=f"Ch{ch} | {label}",
+                            title=f"{_display_channel_label(ch)} | {label}",
                             ylabel=ylabel,
                             vlines=active_vlines,
                             scan_range=scan_range,
@@ -4739,7 +4756,7 @@ def build_export_pdf(
                             results,
                             drift_metric=drift_key,
                             channels=[ch],
-                            title=f"Ch{ch} | {label}",
+                            title=f"{_display_channel_label(ch)} | {label}",
                             ylabel=ylabel,
                             vlines=active_vlines,
                             scan_range=scan_range,
@@ -5593,6 +5610,23 @@ def filter_vlines_to_results_axis(
     return in_range
 
 
+def _electrode_display_mapping():
+    if st.session_state.get("channel_organization") != "Organize by electrode":
+        return {}
+    try:
+        return parse_electrode_mapping(st.session_state.get("electrode_mapping_array", ""))
+    except ValueError:
+        return {}
+
+
+def _display_channel_label(channel):
+    return electrode_label(channel, _electrode_display_mapping())
+
+
+def _display_channel_option(option):
+    return option if option == "All channels" else _display_channel_label(_channel_option_value(option))
+
+
 def _channel_display_sort_key(channel: Any) -> tuple:
     text = str(channel)
     match = re.fullmatch(
@@ -5603,6 +5637,10 @@ def _channel_display_sort_key(channel: Any) -> tuple:
     if match:
         channel_number = int(match.group(1))
         group_number = int(match.group(2) or 0)
+        mapping = _electrode_display_mapping()
+        if mapping:
+            return (0 if channel_number in mapping else 1,
+                    mapping.get(channel_number, channel_number), group_number, text)
         return (0, channel_number, group_number, text)
     try:
         return (0, int(channel), 0, text)
@@ -5649,6 +5687,8 @@ def _channel_option_value(option: str) -> Any:
 
 
 def _compact_titration_channel_label(channel: Any) -> str:
+    if _electrode_display_mapping():
+        return _display_channel_label(str(channel).split("|", 1)[0].strip())
     text = str(channel).split("|", 1)[0].strip()
     match = re.fullmatch(r"(?:Ch)?(\d+)\s+group\s+(\d+)", text, re.IGNORECASE)
     if match:
@@ -5768,6 +5808,8 @@ def format_swv_overlay_title(channel: Any, rows: List[dict]) -> str:
         else f"Channel {original_channel}"
     )
 
+    if _electrode_display_mapping():
+        channel_label = _display_channel_label(original_channel)
     method_names = []
     for row in rows:
         try:
@@ -6960,6 +7002,30 @@ with st.sidebar:
         except ValueError:
             channel_selection_invalid = True
             st.error("Invalid channel list  use integers separated by commas.")
+    mapping_text = st.text_input(
+        "Electrode → channel mapping array",
+        key="electrode_mapping_array",
+        placeholder="[8, 6, 1, 2, 3, 4, 5, 7]",
+        help="Array position is the electrode number: [8, 6] means electrode 1 = channel 8 and electrode 2 = channel 6. Channel selection above always uses acquisition channel numbers.",
+    )
+    electrode_mapping = {}
+    mapping_invalid = False
+    try:
+        electrode_mapping = parse_electrode_mapping(mapping_text)
+    except ValueError as exc:
+        mapping_invalid = True
+        st.error(str(exc))
+    channel_organization = st.radio(
+        "Organize results by",
+        ["Organize by channel", "Organize by electrode"],
+        key="channel_organization",
+    )
+    organize_by_electrode = channel_organization == "Organize by electrode"
+    if organize_by_electrode and not electrode_mapping and not mapping_invalid:
+        st.info("Enter a mapping array to organize by electrode.")
+    if electrode_mapping:
+        st.caption(" · ".join(f"E{electrode} = Ch{channel}" for channel, electrode in electrode_mapping.items()))
+        st.caption("Unmapped channels follow the mapped electrodes. Channel IDs remain in tables and exports.")
     swv_grouping_mode = "None"
     use_swv_settings_grouping = False
     use_swv_modulo_split = False
@@ -7620,6 +7686,9 @@ if len(results) == 0:
     st.warning("No results returned for the current selection. Check folder paths and file naming pattern.")
     st.stop()
 
+if mapping_invalid and organize_by_electrode:
+    st.warning("Correct the electrode mapping or select Organize by channel.")
+    st.stop()
 # Streamlit can retain analysis rows across a code reload. Backfill the parsed
 # filename time so rows created by an earlier app version also support time plots.
 display_subsection_bounds: Optional[Tuple[int, int]] = None
@@ -7764,18 +7833,38 @@ if analysis_mode == "SWV":
                 )
 
 if analysis_mode == "CV":
+    cv_all_block_results = results
     ec_labels = [label for label in ["EC3", "EC4"] if any(r.get("ec_label") == label for r in results)]
     other_labels = sorted({r.get("ec_label") for r in results if r.get("ec_label") not in set(ec_labels) and r.get("ec_label")})
     cv_label_options = ec_labels + other_labels
+    cv_block_names = {}
+    for label in cv_label_options:
+        block_rows = [r for r in results if r.get("ec_label") == label]
+        cycle_counts = sorted({
+            int(r["method_nscans"])
+            for r in block_rows if r.get("method_nscans") is not None
+        })
+        cycle_description = "/".join(str(count) for count in cycle_counts)
+        cv_block_names[label] = (
+            f"{label} — {cycle_description} cycles per file"
+            if cycle_description else label
+        )
+    cv_file_count = len({r.get("file_path") for r in results if r.get("file_path")})
+    st.caption(
+        f"Loaded {cv_file_count} CV files across {len(cv_label_options)} blocks. "
+        "Select a block below to view its cycles and metrics."
+    )
     selected_cv_label = st.radio(
         "CV block",
         cv_label_options,
+        format_func=lambda label: cv_block_names[label],
         horizontal=True,
         index=0 if cv_label_options else None,
-        help="Metrics are shown across cycle number inside the selected EC block.",
+        help="All blocks are loaded. Plots and metrics show only the selected block, with cycles numbered within each file.",
     ) if cv_label_options else None
     if selected_cv_label:
         results = [r for r in results if r.get("ec_label") == selected_cv_label]
+        st.caption(f"Showing {cv_block_names[selected_cv_label]}.")
     st.caption(
         "CV files are segmented into repeated cycles using the method metadata and turning points in the voltage trace."
     )
@@ -8286,6 +8375,7 @@ x_axis_label = (
     if analysis_mode == "CV"
     else ("Filtered scan number" if swv_method_filter_applied else "Scan number")
 )
+results = organize_results(results, electrode_mapping, organize_by_electrode)
 ok_results     = [r for r in results if r.get("status") == "OK"]
 failed_results = [r for r in results if r.get("status") == "FAILED"]
 channel_indexes = build_channel_indexes(results, scan_range=plot_scan_range)
@@ -8294,6 +8384,8 @@ failed_results_by_channel = channel_indexes["failed_in_range_by_channel"]
 ok_plot_results_by_channel = channel_indexes["ok_in_range_by_channel"]
 all_channels   = sorted(results_by_channel, key=_channel_display_sort_key)
 channels_display = channels_to_plot if channels_to_plot else all_channels
+if organize_by_electrode:
+    channels_display = sorted(channels_display, key=_channel_display_sort_key)
 
 plot_results = results
 plot_active_vlines = active_vlines
@@ -8908,6 +9000,56 @@ view = st.radio(
     horizontal=True,
     key="analysis_view",
 )
+
+if analysis_mode == "CV":
+    # Keep overlay preferences when their widgets are hidden on the Export view.
+    for preference in ("cv_show_peak_markers", "cv_show_peak_reference_vlines"):
+        st.session_state[preference] = st.session_state.get(preference, True)
+
+if analysis_mode == "CV" and view in {"Overlays", "Export"}:
+    with st.expander("Batch download — all CV blocks (EC3 / EC4)", expanded=True):
+        st.caption(
+            "Downloads both EC3 and EC4, regardless of the block selected above. "
+            "Includes only raw CV overlays for every channel. "
+            "Each block has one folder containing all plots, with electrode-based filenames in electrode mode."
+        )
+        batch_c1, batch_c2 = st.columns(2)
+        cv_batch_format = batch_c1.selectbox("Batch format", ["png", "pdf", "svg"], key="cv_batch_format")
+        cv_batch_dpi = batch_c2.slider("Batch PNG DPI", 72, 300, 150, key="cv_batch_dpi")
+        cv_batch_selected_only = st.checkbox("Only include channels selected in the sidebar", key="cv_batch_selected_only")
+        batch_channels = channels_to_plot if cv_batch_selected_only else None
+        batch_signature = (
+            st.session_state.get("run_count", 0), tuple(folders),
+            tuple(sorted({r.get("file_path", "") for r in cv_all_block_results})),
+            tuple(electrode_mapping.items()), organize_by_electrode,
+            tuple(batch_channels) if batch_channels is not None else None,
+            cv_batch_format, cv_batch_dpi, "raw-only-block-folders-v3",
+            st.session_state["cv_show_peak_markers"],
+            st.session_state["cv_show_peak_reference_vlines"],
+            st.session_state.get("cv_overlay_cmap", "plasma"),
+            st.session_state.get("cv_overlay_line_alpha", 0.9),
+        )
+        if st.button("Build all EC3 / EC4 plots ZIP", key="cv_batch_build", use_container_width=True):
+            batch_progress = st.progress(0, text="Building CV plots…")
+            batch_bytes = build_cv_figures_zip(
+                cv_all_block_results, mapping=electrode_mapping, by_electrode=organize_by_electrode,
+                channels=batch_channels, figure_format=cv_batch_format, dpi=cv_batch_dpi,
+                colormap=st.session_state.get("cv_overlay_cmap", "plasma"),
+                alpha=st.session_state.get("cv_overlay_line_alpha", 0.9),
+                show_peak_markers=st.session_state["cv_show_peak_markers"],
+                show_peak_reference_vlines=st.session_state["cv_show_peak_reference_vlines"],
+                progress_callback=lambda done, total: batch_progress.progress(
+                    done / total, text=f"Building CV plots: {done}/{total}"),
+            )
+            st.session_state["_cv_batch_zip"] = (batch_signature, batch_bytes)
+            batch_progress.empty()
+        batch_saved = st.session_state.get("_cv_batch_zip")
+        if batch_saved and batch_saved[0] == batch_signature:
+            st.download_button(
+                "Download all EC3 / EC4 plots ZIP", data=batch_saved[1],
+                file_name=f"cv_all_blocks_by_{'electrode' if organize_by_electrode else 'channel'}.zip",
+                mime="application/zip", key="cv_batch_download", use_container_width=True,
+            )
 
 if view == "Figure Composer":
     render_captured_figure_composer()
@@ -10587,6 +10729,8 @@ if view == "Paper Figures":
 # 
 if view == "Overlays":
     st.subheader("Overlaid traces per channel")
+    overlay_download_slot = st.container()
+    overlay_downloads: List[Tuple[str, bytes]] = []
 
     if analysis_mode == "CV":
         ov_c1, ov_c2, ov_c3, ov_c4, ov_c5 = st.columns([2, 2, 1, 1, 1])
@@ -10603,7 +10747,7 @@ if view == "Overlays":
         )
         show_peak_markers = ov_c3.checkbox(
             "Show peak points",
-            value=True,
+            key="cv_show_peak_markers",
             help="Marks the oxidation and reduction peaks detected for each cycle.",
         )
         show_baseline = ov_c4.checkbox(
@@ -10613,7 +10757,7 @@ if view == "Overlays":
         )
         show_peak_reference_vlines = ov_c5.checkbox(
             "Peak vlines",
-            value=True,
+            key="cv_show_peak_reference_vlines",
             help="Adds vertical lines for initial, average, and final oxidation/reduction peak voltages in the displayed cycles.",
         )
         overlay_line_alpha = st.slider(
@@ -10641,11 +10785,11 @@ if view == "Overlays":
             ch_res = overlay_results_by_channel.get(ch, [])
             if not ch_res:
                 continue
-            with st.expander(f"Channel {ch}  ({len(ch_res)} cycles)", expanded=len(plot_channels_display) <= 4):
+            with st.expander(f"{_display_channel_label(ch)}  ({len(ch_res)} cycles)", expanded=len(plot_channels_display) <= 4):
                 fig = plot_cv_overlaid_cycles(
                     ch_res,
                     y_key=y_key,
-                    title=f"{trace_type}  Ch{ch}",
+                    title=f"{trace_type}  {_display_channel_label(ch)}",
                     ylabel="Current (uA)",
                     colormap_name=cmap_name,
                     alpha=overlay_line_alpha,
@@ -10659,7 +10803,8 @@ if view == "Overlays":
                         st,
                         fig,
                         key=f"cv_overlay_{ch}_{y_key}",
-                        file_stem=f"cv_overlay_ch{ch}_{trace_type}",
+                        download_bundle=overlay_downloads,
+                        file_stem=f"{selected_cv_label}_{cv_channel_file_stem(ch, _electrode_display_mapping())}_{trace_type.lower()}",
                     )
                 else:
                     st.warning("No plottable traces for this channel.")
@@ -10779,7 +10924,7 @@ if view == "Overlays":
             if overlay_channels_by_group:
                 channel_cmap = plt.get_cmap(cmap_name)
                 channel_colors = {
-                    f"Channel {channel}": channel_cmap(
+                    _display_channel_label(channel): channel_cmap(
                         position % channel_cmap.N
                         if cmap_name in ("tab10", "tab20")
                         else 0.1 + 0.75 * position / max(len(channel_order) - 1, 1)
@@ -10802,7 +10947,7 @@ if view == "Overlays":
                     first_row = group_rows[0]
                     if overlay_channels_by_group:
                         channel = first_row["original_channel"]
-                        group_label = f"Channel {channel}"
+                        group_label = _display_channel_label(channel)
                         group_position = channel_order.index(channel)
                     elif use_swv_settings_grouping:
                         group_label = str(first_row.get("swv_settings_label") or display_group)
@@ -10831,7 +10976,7 @@ if view == "Overlays":
                     if overlay_channels_by_group
                     else format_swv_overlay_title(original_ch, all_group_rows)
                 )
-                plot_heading = plot_title if overlay_channels_by_group else f"Channel {original_ch}"
+                plot_heading = plot_title if overlay_channels_by_group else _display_channel_label(original_ch)
                 member_label = "channels" if overlay_channels_by_group else "groups"
                 with st.expander(
                     f"{plot_heading} ({len(grouped_trace_sets)} {member_label}, {total_trace_count} traces)",
@@ -10880,6 +11025,7 @@ if view == "Overlays":
                                 if overlay_channels_by_group
                                 else f"swv_grouped_overlay_ch{original_ch}_{trace_type}"
                             ),
+                            download_bundle=overlay_downloads,
                             plot_kind="swv_trace",
                             trace_modulo_key=trace_modulo_key,
                             trace_alpha_key=trace_alpha_key,
@@ -10893,7 +11039,7 @@ if view == "Overlays":
                 ch_res = overlay_results_by_channel.get(ch, [])
                 if not ch_res:
                     continue
-                with st.expander(f"Channel {ch}  ({len(ch_res)} traces)", expanded=len(plot_channels_display) <= 4):
+                with st.expander(f"{_display_channel_label(ch)}  ({len(ch_res)} traces)", expanded=len(plot_channels_display) <= 4):
                     fig = plot_overlaid_traces(
                         ch_res, y_key=y_key,
                         trace_modulo=int(st.session_state.get(trace_modulo_key, 1)),
@@ -10922,12 +11068,31 @@ if view == "Overlays":
                                 f"{offset_to_baseline}"
                             ),
                             file_stem=f"swv_overlay_ch{ch}_{trace_type}",
+                            download_bundle=overlay_downloads,
                             plot_kind="swv_trace",
                             trace_modulo_key=trace_modulo_key,
                             trace_alpha_key=trace_alpha_key,
                         )
                     else:
                         st.warning("No plottable traces for this channel.")
+
+
+    if overlay_downloads:
+        overlay_zip = io.BytesIO()
+        with zipfile.ZipFile(overlay_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+            for index, (filename, data) in enumerate(overlay_downloads, 1):
+                archive.writestr(f"{index:03d}_{filename}", data)
+        with overlay_download_slot:
+            st.download_button(
+                "Download all overlay plots (ZIP)",
+                data=overlay_zip.getvalue(),
+                file_name=f"{analysis_mode.lower()}_overlay_plots.zip",
+                mime="application/zip",
+                key="all_overlay_plots_download",
+                on_click="ignore",
+                use_container_width=True,
+                help="Downloads every overlay below as a PNG with its current plot settings.",
+            )
 
 
 # 
@@ -11136,7 +11301,7 @@ if view == "Metrics":
     ch_options   = ["All channels"] + [f"Ch{ch}" for ch in highlight_channel_options]
     if st.session_state.get("metric_ch_sel") not in ch_options:
         st.session_state["metric_ch_sel"] = "All channels"
-    ch_selection = m_c2.selectbox("Highlight channel", ch_options, key="metric_ch_sel",
+    ch_selection = m_c2.selectbox("Highlight channel", ch_options, key="metric_ch_sel", format_func=_display_channel_option,
                                    help="Selecting one channel dims the others.")
     highlight_ch = None
     if ch_selection != "All channels":
@@ -12153,7 +12318,7 @@ if view == "Drift":
     )
     if st.session_state.get("drift_ch_sel") not in ch_options:
         st.session_state["drift_ch_sel"] = "All channels"
-    dr_ch_sel = dr_c2.selectbox("Highlight channel", ch_options, key="drift_ch_sel")
+    dr_ch_sel = dr_c2.selectbox("Highlight channel", ch_options, key="drift_ch_sel", format_func=_display_channel_option)
     drift_highlight = None
     if dr_ch_sel != "All channels":
         drift_highlight = _channel_option_value(dr_ch_sel)
@@ -12187,7 +12352,7 @@ if view == "Drift":
             for i, ch in enumerate(plot_channels_display):
                 fig = plot_drift_vs_scan(
                     plot_results, drift_metric=drift_key, channels=[ch],
-                    title=f"Ch{ch}", ylabel=ylabel, vlines=plot_active_vlines,
+                    title=f"{_display_channel_label(ch)}", ylabel=ylabel, vlines=plot_active_vlines,
                     scan_range=plot_display_scan_range, figsize=(5, 3), xlabel=plot_x_axis_label,
                     channel_colors=consistent_channel_colors,
                 )
@@ -12234,7 +12399,7 @@ if view == "Failures":
                 ch_failed = plot_failed_results_by_channel.get(ch, [])
                 if not ch_failed:
                     continue
-                with st.expander(f"Ch{ch}  {len(ch_failed)} failed cycles", expanded=False):
+                with st.expander(f"{_display_channel_label(ch)}  {len(ch_failed)} failed cycles", expanded=False):
                     for yk, title_suffix in (
                         ("raw_current", "Raw"),
                         ("smoothed_current", "Smoothed"),
@@ -12243,7 +12408,7 @@ if view == "Failures":
                         fig = plot_cv_overlaid_cycles(
                             ch_failed,
                             y_key=yk,
-                            title=f"Ch{ch} failed cycles | {title_suffix}",
+                            title=f"{_display_channel_label(ch)} failed cycles | {title_suffix}",
                             ylabel="Current (uA)",
                             show_peak_markers=False,
                             show_zero_baseline=(yk == "detrended_current"),
@@ -12300,7 +12465,7 @@ if view == "Failures":
                 if not ch_failed:
                     continue
                 to_plot = ch_failed[:int(max_failed)]
-                with st.expander(f"Ch{ch}  {len(ch_failed)} failures", expanded=False):
+                with st.expander(f"{_display_channel_label(ch)}  {len(ch_failed)} failures", expanded=False):
                     for yk, yl in (
                         ("raw_current",       "Raw Current (uA)"),
                         ("smoothed_current",  "Smoothed Current (uA)"),
@@ -12312,7 +12477,7 @@ if view == "Failures":
                             continue
                         fig = plot_failed_traces(
                             to_plot, y_key=yk, ylabel=yl,
-                            title=f"Ch{ch}  {yl}",
+                            title=f"{_display_channel_label(ch)}  {yl}",
                             show_peak_markers=(yk not in ("raw_current", "wavelet_denoised_current")),
                             show_zero_baseline=(yk in ("corrected_current", "smoothed_corrected_current")),
                             show_local_baselines=(yk == "smoothed_current"),
@@ -12383,12 +12548,16 @@ if view == "Data Table":
             "background_current_median_reference", "background_current_offset_uA", "background_drift_percent",
             "peak_voltage_drift", "bracket_width_drift", "skew_drift", "peak_offset_norm_drift", "error",
         ]
+    if electrode_mapping:
+        scalar_keys.insert(1, "electrode")
     df = pd.DataFrame([{k: r.get(k) for k in scalar_keys} for r in results])
 
     tf1, tf2 = st.columns(2)
     status_filter = tf1.multiselect("Status",  ["OK", "FAILED"], default=["OK", "FAILED"])
-    ch_filter     = tf2.multiselect("Channel", sorted(df["channel"].dropna().unique().tolist()),
-                                    default=sorted(df["channel"].dropna().unique().tolist()))
+    table_channels = sorted(df["channel"].dropna().unique().tolist(), key=_channel_display_sort_key)
+    ch_filter = tf2.multiselect("Electrode / channel" if organize_by_electrode else "Channel",
+                               table_channels, default=table_channels,
+                               format_func=_display_channel_label)
     mask = df["status"].isin(status_filter) & df["channel"].isin(ch_filter)
     filtered_df = df[mask].reset_index(drop=True)
     filtered_results = [
@@ -13081,13 +13250,13 @@ if view == "Export":
                         fig = plot_cv_overlaid_cycles(
                             ch_res,
                             y_key=yk,
-                            title=f"Ch{ch}  {lbl}",
-                            show_peak_markers=True,
+                            title=f"{_display_channel_label(ch)}  {lbl}",
+                            show_peak_markers=st.session_state["cv_show_peak_markers"],
                             show_zero_baseline=(yk == "detrended_current"),
-                            show_peak_reference_vlines=True,
+                            show_peak_reference_vlines=st.session_state["cv_show_peak_reference_vlines"],
                         )
                         if fig:
-                            _save(fig, f"overlays/ch{ch}_{lbl}.{fig_format}")
+                            _save(fig, f"overlays/{cv_channel_file_stem(ch, _electrode_display_mapping())}_{lbl}.{fig_format}")
                 else:
                     export_overlay_keys = [
                         ("corrected_current", "corrected", False, "Current (uA)"),
@@ -13104,7 +13273,7 @@ if view == "Export":
                         export_overlay_keys.append(("wavelet_denoised_current", "wavelet_denoised", False, "Current (uA)"))
                     for yk, lbl, normalize_to_peak, ylabel in export_overlay_keys:
                         fig = plot_overlaid_traces(ch_res, y_key=yk,
-                                                   title=f"Ch{ch}  {lbl}",
+                                                   title=f"{_display_channel_label(ch)}  {lbl}",
                                                    ylabel=ylabel,
                                                    show_anchors=(yk == "corrected_current"),
                                                    show_zero_baseline=(yk in ("corrected_current", "smoothed_corrected_current")),

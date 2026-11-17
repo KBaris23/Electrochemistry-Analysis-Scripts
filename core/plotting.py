@@ -17,6 +17,7 @@ from scipy.interpolate import PchipInterpolator
 from scipy.optimize import OptimizeWarning, curve_fit, minimize_scalar
 import warnings
 
+from .electrode_mapping import result_electrode_label
 from .processing import find_peak_candidates
 
 
@@ -3251,6 +3252,7 @@ def plot_metric_vs_scan(
             ch,
             normalized_directions if use_direction_colors else None,
         )
+        trace_label = result_electrode_label(ch_res[0]) or trace_label
         trace_label = (channel_labels or {}).get(ch, trace_label)
         if show_measurement_rate:
             measurement_times = sorted(
@@ -5544,7 +5546,7 @@ def plot_drift_vs_scan(
 
                 alpha=0.15 if dimmed else 0.9,
 
-                label=f"Channel {ch}")
+                label=result_electrode_label(ch_res[0]) or f"Channel {ch}")
 
 
 

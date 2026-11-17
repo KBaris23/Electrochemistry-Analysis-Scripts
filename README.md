@@ -44,6 +44,24 @@ is opened.
 
 ### SWV and titration analysis
 
+In the **Channels** sidebar section (SWV or CV), enter an **Electrode → channel
+mapping array**, such as `[8, 6, 1]`: electrode 1 is channel 8, electrode 2 is
+channel 6, and electrode 3 is channel 1. Choose **Organize by electrode** to order
+the analysis views by electrode and show electrode/channel labels, or **Organize
+by channel** to return to channel order. Unmapped channels follow the mapped
+electrodes. The channel selection input always uses acquisition channel numbers.
+Tables and result CSVs retain those channel IDs and include an `electrode` column
+when a mapping is supplied. Switching the display does not require reanalysis;
+the mapping and organization choice are included in saved sessions.
+
+For CV, open **Overlays** or **Export**, then use **Build all EC3 / EC4 plots ZIP**
+and download the archive. It includes all loaded blocks and channels by default,
+with only raw CV overlays. Each block has one folder containing all plots,
+without channel subfolders. Choose PNG, PDF, or SVG; optionally restrict the archive to the
+sidebar's selected channels. Electrode mode uses electrode-first
+filenames and plot titles, for example
+`EC3/EC3_electrode_01_ch08_raw.png`.
+
 1. Select **SWV**, choose the measurement folders, and verify the detected or
    manually selected BO analysis settings.
 2. Run the analysis. Missing or failed scans remain missing/failed; the app does

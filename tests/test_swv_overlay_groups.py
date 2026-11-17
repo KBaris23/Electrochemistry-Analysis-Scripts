@@ -11,7 +11,8 @@ def _group_channels(rows, selected, by_settings=True):
     names = {"group_swv_channels_by_display_group", "_channel_display_sort_key"}
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     namespace = dict(Any=Any, Dict=Dict, List=List, re=re,
-                     swv_settings_signature=lambda row: row["settings"])
+                     swv_settings_signature=lambda row: row["settings"],
+                     _electrode_display_mapping=lambda: {})
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["group_swv_channels_by_display_group"](rows, selected, by_settings)
 

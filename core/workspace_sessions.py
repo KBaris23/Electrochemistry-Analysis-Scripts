@@ -66,6 +66,7 @@ _EXCLUDED_PREFIXES = (
     "bo_composer_validation_clear_exclusions",
 )
 _EXCLUDED_KEYS = {
+    '_cv_batch_zip',
     '_paper_save_settings',
     'paper_titration_format_preset_overwrite', 'paper_titration_format_preset_reload',
     'paper_titration_format_preset_apply_named',
